@@ -26,20 +26,40 @@ async def stream_handler(request):
     if not message:
         return web.Response(text="Link Expired or Invalid", status=404)
 
-    file_name = "download.file"
-    for attr in message.file.attributes:
-        if hasattr(attr, 'file_name'):
-            file_name = attr.file_name
+    # --- FIX START: ROBUST FILENAME EXTRACTION ---
+    file_name = "downloaded_file.mp4" # Default fallback
+    file_size = 0
+
+    try:
+        # 1. Try to get details from the Raw Document (Best for Files/Videos)
+        if hasattr(message, 'document') and message.document:
+            file_size = message.document.size
+            for attr in message.document.attributes:
+                # Check if this attribute holds the filename
+                if hasattr(attr, 'file_name'):
+                    file_name = attr.file_name
+        
+        # 2. If it's a Photo or something else, use the wrapper fallback
+        elif message.file:
+            file_size = message.file.size
+            if hasattr(message.file, 'name') and message.file.name:
+                file_name = message.file.name
+                
+    except Exception as e:
+        print(f"Error extracting attributes: {e}")
+        # If extraction fails, we continue anyway with the default name
+    # --- FIX END ---
 
     headers = {
         'Content-Disposition': f'attachment; filename="{file_name}"',
         'Content-Type': 'application/octet-stream',
-        'Content-Length': str(message.file.size)
+        'Content-Length': str(file_size)
     }
 
     response = web.StreamResponse(headers=headers)
     await response.prepare(request)
 
+    # Stream the file
     async for chunk in client.download_media(message, file=bytes, offset=0):
         await response.write(chunk)
 
@@ -74,7 +94,7 @@ async def handle_new_message(event):
         )
 
 async def main():
-    # Start Web Server (Required for Render)
+    # Start Web Server
     app = web.Application()
     app.add_routes(routes)
     runner = web.AppRunner(app)
@@ -92,7 +112,6 @@ async def main():
     await client.run_until_disconnected()
 
 if __name__ == '__main__':
-    # This specifically fixes the 'DeprecationWarning' in your logs
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
