@@ -10,14 +10,13 @@ API_HASH = os.environ.get("API_HASH")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
 # --- SETUP ---
-# Use a relative path for the session file so it works on Render
 client = TelegramClient('bot_session', int(API_ID), API_HASH)
 routes = web.RouteTableDef()
 link_storage = {} 
 
 @routes.get('/')
 async def root(request):
-    return web.Response(text="✅ Bot is Running")
+    return web.Response(text="✅ Bot is Online")
 
 @routes.get('/{code}')
 async def stream_handler(request):
@@ -48,44 +47,52 @@ async def stream_handler(request):
 
 @client.on(events.NewMessage(incoming=True))
 async def handle_new_message(event):
+    # 1. Handle /start command
+    if event.text == '/start':
+        await event.reply(
+            "👋 **Hello!**\n\n"
+            "I am your **Big File Streamer** running on Render.\n"
+            "Send me a file to get a link!",
+            parse_mode='markdown'
+        )
+        return
+
+    # 2. Handle Files
     if event.file:
         code = secrets.token_urlsafe(8)
         link_storage[code] = event.message
         
-        # Get Render URL or localhost for testing
+        # Get Render URL
         base_url = os.environ.get("RENDER_EXTERNAL_URL", "http://localhost:8080")
         download_link = f"{base_url}/{code}"
         
         await event.reply(
-            f"✅ <b>File Ready!</b>\n"
-            f"💾 {event.file.size / 1024 / 1024:.2f} MB\n"
+            f"✅ **File Ready!**\n"
+            f"💾 `{event.file.size / 1024 / 1024:.2f} MB`\n"
             f"🔗 {download_link}",
-            parse_mode='html'
+            parse_mode='markdown'
         )
 
 async def main():
-    # 1. Start the Web Server first (Crucial for Render)
+    # Start Web Server (Required for Render)
     app = web.Application()
     app.add_routes(routes)
     runner = web.AppRunner(app)
     await runner.setup()
-    
-    # Render tells us which port to use via os.environ
     port = int(os.environ.get("PORT", 8080))
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
     print(f"✅ Web Server started on port {port}")
 
-    # 2. Start the Telegram Bot
-    print("Connecting to Telegram...")
+    # Start Telegram Client
     await client.start(bot_token=BOT_TOKEN)
-    print("✅ Telegram Client Connected")
+    print("✅ Bot Connected to Telegram")
     
-    # 3. Keep running
+    # Run forever
     await client.run_until_disconnected()
 
 if __name__ == '__main__':
-    # This fixes the DeprecationWarning on Python 3.13
+    # This specifically fixes the 'DeprecationWarning' in your logs
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
