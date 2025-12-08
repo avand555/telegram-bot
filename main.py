@@ -5,11 +5,9 @@ from telethon import TelegramClient, events
 from aiohttp import web
 
 # --- CONFIGURATION (Load from Environment Variables) ---
-# You will set these in Render Dashboard settings later
-API_ID = int(os.environ.get("18523213", 0))
-API_HASH = os.environ.get("c510774d05fbb47d1a6b222500940ee2
-", "")
-BOT_TOKEN = os.environ.get("7806492319:AAEPVCiqYZgsVe81cxP4o1X7XGhM_6mlTVk", "")
+API_ID = os.environ.get("API_ID")
+API_HASH = os.environ.get("API_HASH")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
 # --- SETUP ---
 # We use a file-based session. On free Render, you will need to login 
