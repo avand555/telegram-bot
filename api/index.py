@@ -2,15 +2,19 @@ from flask import Flask, request, redirect, abort
 import telebot
 from telebot.types import Update
 from itsdangerous import URLSafeTimedSerializer, SignatureExpired, BadSignature
-import time
 
 # --- CONFIGURATION ---
-BOT_TOKEN = '7806492319:AAEPVCiqYZgsVe81cxP4o1X7XGhM_6mlTVk' 
-SECRET_KEY = 'ok' # Used to sign the links securely
+# I have inserted your specific token below:
+BOT_TOKEN = '7806492319:AAEPVCiqYZgsVe81cxP4o1X7XGhM_6mlTVk'
+
+# I generated a random secret key for you (keeps links secure):
+SECRET_KEY = 'super_secret_key_x92_vm3_kLQ_992' 
+
 EXPIRATION_SECONDS = 24 * 60 * 60 # 24 Hours
 
 # --- SETUP ---
 app = Flask(__name__)
+# threaded=False is important for Vercel/Serverless
 bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
 
 # Serializer to encode/decode data into the URL
@@ -18,13 +22,13 @@ s = URLSafeTimedSerializer(SECRET_KEY)
 
 @app.route('/')
 def home():
-    return "Bot is running on Vercel.", 200
+    return "Bot is running.", 200
 
 # --- DOWNLOAD ROUTE ---
 @app.route('/d/<token>')
 def download(token):
     try:
-        # Verify token and expiration (max_age checks the 24h limit automatically)
+        # Verify token and expiration
         file_id = s.loads(token, max_age=EXPIRATION_SECONDS)
         
         # Get fresh link from Telegram
@@ -41,7 +45,7 @@ def download(token):
     except Exception as e:
         return f"Error: {str(e)}", 500
 
-# --- WEBHOOK ROUTE (Telegram sends messages here) ---
+# --- WEBHOOK ROUTE ---
 @app.route('/webhook', methods=['POST'])
 def webhook():
     if request.headers.get('content-type') == 'application/json':
@@ -74,19 +78,20 @@ def handle_file(message):
             file_name = "photo.jpg"
             
         if not file_id:
+            bot.reply_to(message, "Could not identify file content.")
             return
 
-        # 2. Create the stateless token (contains file_id inside it)
+        # 2. Create the stateless token
         token = s.dumps(file_id)
         
-        # 3. Get the Vercel URL (Dynamic)
+        # 3. Get the Vercel URL
         host_url = request.host_url.rstrip('/')
         download_link = f"{host_url}/d/{token}"
         
         reply_text = (
             f"✅ <b>File Ready!</b>\n"
             f"📂 {file_name}\n\n"
-            f"🔗 <b>Download:</b> {download_link}\n\n"
+            f"🔗 <b>Link:</b> {download_link}\n\n"
             f"⏳ <i>Expires in 24 hours.</i>"
         )
         
@@ -97,4 +102,4 @@ def handle_file(message):
 
 @bot.message_handler(commands=['start'])
 def start(message):
-    bot.reply_to(message, "Send me a file to get a 24h direct link.")
+    bot.reply_to(message, "Send me a file to get a direct download link.")
