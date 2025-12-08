@@ -4,21 +4,20 @@ import asyncio
 from telethon import TelegramClient, events
 from aiohttp import web
 
-# --- CONFIGURATION (Load from Environment Variables) ---
+# --- CONFIGURATION ---
 API_ID = os.environ.get("API_ID")
 API_HASH = os.environ.get("API_HASH")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
 # --- SETUP ---
-# We use a file-based session. On free Render, you will need to login 
-# once locally and upload the session file, OR use a StringSession.
-client = TelegramClient('bot_session', API_ID, API_HASH)
+# Use a relative path for the session file so it works on Render
+client = TelegramClient('bot_session', int(API_ID), API_HASH)
 routes = web.RouteTableDef()
 link_storage = {} 
 
 @routes.get('/')
 async def root(request):
-    return web.Response(text="Render Bot is Running")
+    return web.Response(text="✅ Bot is Running")
 
 @routes.get('/{code}')
 async def stream_handler(request):
@@ -26,15 +25,13 @@ async def stream_handler(request):
     message = link_storage.get(code)
 
     if not message:
-        return web.Response(text="Link Expired", status=404)
+        return web.Response(text="Link Expired or Invalid", status=404)
 
-    file_name = "video.mp4"
-    # Try to find real filename
+    file_name = "download.file"
     for attr in message.file.attributes:
         if hasattr(attr, 'file_name'):
             file_name = attr.file_name
 
-    # Headers to force download
     headers = {
         'Content-Disposition': f'attachment; filename="{file_name}"',
         'Content-Type': 'application/octet-stream',
@@ -44,7 +41,6 @@ async def stream_handler(request):
     response = web.StreamResponse(headers=headers)
     await response.prepare(request)
 
-    # Stream file chunk by chunk
     async for chunk in client.download_media(message, file=bytes, offset=0):
         await response.write(chunk)
 
@@ -56,31 +52,41 @@ async def handle_new_message(event):
         code = secrets.token_urlsafe(8)
         link_storage[code] = event.message
         
-        # Get the Render URL (We will get this later)
+        # Get Render URL or localhost for testing
         base_url = os.environ.get("RENDER_EXTERNAL_URL", "http://localhost:8080")
         download_link = f"{base_url}/{code}"
         
         await event.reply(
-            f"✅ <b>Link Generated!</b>\n"
-            f"💾 Size: {event.file.size / 1024 / 1024:.2f} MB\n"
+            f"✅ <b>File Ready!</b>\n"
+            f"💾 {event.file.size / 1024 / 1024:.2f} MB\n"
             f"🔗 {download_link}",
             parse_mode='html'
         )
 
-async def start_server():
+async def main():
+    # 1. Start the Web Server first (Crucial for Render)
     app = web.Application()
     app.add_routes(routes)
     runner = web.AppRunner(app)
     await runner.setup()
-    # Render requires us to listen on port 10000 or the PORT env var
+    
+    # Render tells us which port to use via os.environ
     port = int(os.environ.get("PORT", 8080))
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
-    
-    # Start the Bot
+    print(f"✅ Web Server started on port {port}")
+
+    # 2. Start the Telegram Bot
+    print("Connecting to Telegram...")
     await client.start(bot_token=BOT_TOKEN)
+    print("✅ Telegram Client Connected")
+    
+    # 3. Keep running
     await client.run_until_disconnected()
 
 if __name__ == '__main__':
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(start_server())
+    # This fixes the DeprecationWarning on Python 3.13
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
