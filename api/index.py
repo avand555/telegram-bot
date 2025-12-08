@@ -5,8 +5,8 @@ from itsdangerous import URLSafeTimedSerializer, SignatureExpired, BadSignature
 import time
 
 # --- CONFIGURATION ---
-BOT_TOKEN = 'YOUR_BOT_TOKEN_HERE' 
-SECRET_KEY = 'change_this_to_random_secret_words' # Used to sign the links securely
+BOT_TOKEN = '7806492319:AAEPVCiqYZgsVe81cxP4o1X7XGhM_6mlTVk' 
+SECRET_KEY = 'ok' # Used to sign the links securely
 EXPIRATION_SECONDS = 24 * 60 * 60 # 24 Hours
 
 # --- SETUP ---
