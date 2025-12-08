@@ -26,41 +26,41 @@ async def stream_handler(request):
     if not message:
         return web.Response(text="Link Expired or Invalid", status=404)
 
-    # --- FIX START: ROBUST FILENAME EXTRACTION ---
-    file_name = "downloaded_file.mp4" # Default fallback
-    file_size = 0
+    # --- FILENAME EXTRACTION ---
+    file_name = "downloaded_file.mp4" 
+    file_size = None
 
     try:
-        # 1. Try to get details from the Raw Document (Best for Files/Videos)
+        # 1. Try Document attributes (Best for Movies/Files)
         if hasattr(message, 'document') and message.document:
             file_size = message.document.size
             for attr in message.document.attributes:
-                # Check if this attribute holds the filename
                 if hasattr(attr, 'file_name'):
                     file_name = attr.file_name
         
-        # 2. If it's a Photo or something else, use the wrapper fallback
+        # 2. Try File attributes (Fallback)
         elif message.file:
             file_size = message.file.size
             if hasattr(message.file, 'name') and message.file.name:
                 file_name = message.file.name
                 
     except Exception as e:
-        print(f"Error extracting attributes: {e}")
-        # If extraction fails, we continue anyway with the default name
-    # --- FIX END ---
+        print(f"Error getting filename: {e}")
 
+    # --- HEADERS ---
     headers = {
         'Content-Disposition': f'attachment; filename="{file_name}"',
-        'Content-Type': 'application/octet-stream',
-        'Content-Length': str(file_size)
+        'Content-Type': 'application/octet-stream'
     }
+    if file_size:
+        headers['Content-Length'] = str(file_size)
 
     response = web.StreamResponse(headers=headers)
     await response.prepare(request)
 
-    # Stream the file
-    async for chunk in client.download_media(message, file=bytes, offset=0):
+    # --- FIX: USE ITER_DOWNLOAD FOR STREAMING ---
+    # This sends the file chunk-by-chunk without filling memory
+    async for chunk in client.iter_download(message):
         await response.write(chunk)
 
     return response
@@ -86,9 +86,15 @@ async def handle_new_message(event):
         base_url = os.environ.get("RENDER_EXTERNAL_URL", "http://localhost:8080")
         download_link = f"{base_url}/{code}"
         
+        # Safe size calculation
+        size_mb = 0
+        if event.file.size:
+            size_mb = event.file.size / 1024 / 1024
+        
         await event.reply(
             f"✅ **File Ready!**\n"
-            f"💾 `{event.file.size / 1024 / 1024:.2f} MB`\n"
+            f"📂 `{event.file.name}`\n"
+            f"💾 `{size_mb:.2f} MB`\n"
             f"🔗 {download_link}",
             parse_mode='markdown'
         )
