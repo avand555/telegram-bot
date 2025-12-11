@@ -5,7 +5,7 @@ import mimetypes
 import time
 import re
 from urllib.parse import quote, unquote
-from telethon import TelegramClient, events, types
+from telethon import TelegramClient, events, types, Button
 from aiohttp import web, ClientSession
 
 # --- CONFIGURATION ---
@@ -16,17 +16,28 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 # Expiration: 24 Hours
 EXPIRATION_TIME = 24 * 60 * 60 
 
-# --- HELPER CLASS (FIXED FOR UPLOAD ERRORS) ---
+# Global Dictionary to track cancel events
+# Format: { chat_id: asyncio.Event() }
+cancel_tasks = {}
+
+# --- HELPER CLASS WITH CANCEL SUPPORT ---
 class CustomStreamReader:
-    def __init__(self, response):
+    def __init__(self, response, cancel_event):
         self.response = response
+        self.cancel_event = cancel_event
 
     async def read(self, size):
-        # Telethon expects exact chunk sizes (e.g., 512KB).
-        # Standard aiohttp.read(size) might return less, which causes the crash.
-        # We must loop until we get the full 'size' or reach the End of File.
+        # 1. Check if user pressed Cancel
+        if self.cancel_event.is_set():
+            raise asyncio.CancelledError("Task Cancelled")
+
+        # 2. Read Data
         data = b''
         while len(data) < size:
+            # Check cancel again inside the loop for responsiveness
+            if self.cancel_event.is_set():
+                raise asyncio.CancelledError("Task Cancelled")
+                
             chunk = await self.response.content.read(size - len(data))
             if not chunk:
                 break
@@ -59,13 +70,15 @@ async def progress_callback(current, total, event, start_time, filename):
     uploaded = current / 1024 / 1024
     total_size = total / 1024 / 1024
 
+    # Add Cancel Button to the Progress Message
     try:
         await event.edit(
             f"📥 **Leeching in progress...**\n\n"
             f"📂 `{filename}`\n"
             f"📊 `{percentage:.2f}%`\n"
             f"🚀 `{speed:.2f} MB/s`\n"
-            f"💾 `{uploaded:.2f} MB / {total_size:.2f} MB`"
+            f"💾 `{uploaded:.2f} MB / {total_size:.2f} MB`",
+            buttons=[[Button.inline("❌ Cancel Task", data="cancel_leech")]]
         )
     except Exception:
         pass
@@ -108,7 +121,18 @@ async def stream_handler(request):
         pass
     return response
 
-# --- TELEGRAM HANDLERS ---
+# --- CANCEL BUTTON HANDLER ---
+@client.on(events.CallbackQuery(pattern="cancel_leech"))
+async def cancel_handler(event):
+    # Check if this user has a running task
+    if event.chat_id in cancel_tasks:
+        cancel_tasks[event.chat_id].set() # Signal the task to stop
+        await event.answer("Cancelling task...", alert=False)
+        await event.edit("🛑 **Task Cancelled by User.**")
+    else:
+        await event.answer("No active task to cancel.", alert=True)
+
+# --- TELEGRAM MESSAGE HANDLERS ---
 @client.on(events.NewMessage(incoming=True))
 async def handle_new_message(event):
     
@@ -116,21 +140,31 @@ async def handle_new_message(event):
     if event.text == '/start':
         await event.reply(
             "👋 **Combined Bot Ready**\n\n"
-            "1️⃣ **Send Link:** I will upload the file here.\n"
-            "2️⃣ **Send File:** I will create a Direct Download Link."
+            "1️⃣ **Send Link:** Upload file here (with Cancel button).\n"
+            "2️⃣ **Send File:** Get Direct Download Link."
         )
         return
 
     # 2. LEECHER (Link -> Telegram)
     if event.text and event.text.startswith(("http://", "https://")):
+        # Check if user already has a task running
+        if event.chat_id in cancel_tasks:
+            await event.reply("⚠️ **You already have a process running.**\nPlease wait or cancel it.")
+            return
+
         url = event.text.strip()
         msg = await event.reply("🔗 **Connecting...**")
         
+        # Create Cancellation Signal
+        cancel_event = asyncio.Event()
+        cancel_tasks[event.chat_id] = cancel_event
+
         async with ClientSession() as session:
             try:
                 async with session.get(url, timeout=None) as response:
                     if response.status != 200:
                         await msg.edit(f"❌ HTTP Error: {response.status}")
+                        del cancel_tasks[event.chat_id]
                         return
 
                     # Detect Filename
@@ -148,27 +182,44 @@ async def handle_new_message(event):
                     
                     if file_size > 2000 * 1024 * 1024:
                         await msg.edit("❌ Error: File > 2GB.")
+                        del cancel_tasks[event.chat_id]
                         return
 
-                    await msg.edit(f"⬇️ **Downloading...**\n`{filename}`")
+                    await msg.edit(
+                        f"⬇️ **Downloading...**\n`{filename}`",
+                        buttons=[[Button.inline("❌ Cancel Task", data="cancel_leech")]]
+                    )
 
-                    # Use Fixed Reader Class
-                    stream_reader = CustomStreamReader(response)
+                    # Pass the Cancel Event to the Reader
+                    stream_reader = CustomStreamReader(response, cancel_event)
 
                     start_time = {'start': time.time(), 'last_update': 0}
                     
-                    await client.send_file(
-                        event.chat_id,
-                        file=stream_reader,
-                        caption=f"✅ **Done:** `{filename}`",
-                        file_size=file_size,
-                        attributes=[types.DocumentAttributeFilename(file_name=filename)],
-                        progress_callback=lambda c, t: progress_callback(c, t, msg, start_time, filename)
-                    )
-                    await msg.delete()
+                    try:
+                        await client.send_file(
+                            event.chat_id,
+                            file=stream_reader,
+                            caption=f"✅ **Done:** `{filename}`",
+                            file_size=file_size,
+                            attributes=[types.DocumentAttributeFilename(file_name=filename)],
+                            progress_callback=lambda c, t: progress_callback(c, t, msg, start_time, filename)
+                        )
+                        await msg.delete()
+                    
+                    except asyncio.CancelledError:
+                        await msg.edit("🛑 **Task Cancelled.**")
+                    except Exception as e:
+                        if "Task Cancelled" in str(e):
+                            await msg.edit("🛑 **Task Cancelled.**")
+                        else:
+                            await msg.edit(f"❌ Error: {str(e)}")
 
             except Exception as e:
-                await msg.edit(f"❌ Error: {str(e)}")
+                await msg.edit(f"❌ Network Error: {str(e)}")
+            finally:
+                # Cleanup cancellation flag
+                if event.chat_id in cancel_tasks:
+                    del cancel_tasks[event.chat_id]
         return
 
     # 3. STREAMER (File -> Link)
