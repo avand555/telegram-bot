@@ -16,15 +16,22 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 # Expiration: 24 Hours
 EXPIRATION_TIME = 24 * 60 * 60 
 
-# --- HELPER CLASS FOR STREAMING UPLOAD ---
-# This fixes the "Cannot use async_generator" error
+# --- HELPER CLASS (FIXED FOR UPLOAD ERRORS) ---
 class CustomStreamReader:
     def __init__(self, response):
         self.response = response
 
     async def read(self, size):
-        # Read the specified chunk size from the aiohttp stream
-        return await self.response.content.read(size)
+        # Telethon expects exact chunk sizes (e.g., 512KB).
+        # Standard aiohttp.read(size) might return less, which causes the crash.
+        # We must loop until we get the full 'size' or reach the End of File.
+        data = b''
+        while len(data) < size:
+            chunk = await self.response.content.read(size - len(data))
+            if not chunk:
+                break
+            data += chunk
+        return data
 
 # --- SETUP ---
 client = TelegramClient('bot_session', int(API_ID), API_HASH, connection_retries=None)
@@ -36,10 +43,7 @@ async def cleanup_loop():
     while True:
         await asyncio.sleep(600)
         current_time = time.time()
-        keys_to_delete = []
-        for code, data in link_storage.items():
-            if current_time - data['timestamp'] > EXPIRATION_TIME:
-                keys_to_delete.append(code)
+        keys_to_delete = [k for k, v in link_storage.items() if current_time - v['timestamp'] > EXPIRATION_TIME]
         for key in keys_to_delete:
             del link_storage[key]
 
@@ -124,7 +128,6 @@ async def handle_new_message(event):
         
         async with ClientSession() as session:
             try:
-                # We do NOT use 'timeout' here so large files don't fail
                 async with session.get(url, timeout=None) as response:
                     if response.status != 200:
                         await msg.edit(f"❌ HTTP Error: {response.status}")
@@ -149,15 +152,14 @@ async def handle_new_message(event):
 
                     await msg.edit(f"⬇️ **Downloading...**\n`{filename}`")
 
-                    # --- FIX IS HERE ---
-                    # Instead of a generator, we wrap response in a Class
+                    # Use Fixed Reader Class
                     stream_reader = CustomStreamReader(response)
 
                     start_time = {'start': time.time(), 'last_update': 0}
                     
                     await client.send_file(
                         event.chat_id,
-                        file=stream_reader,  # <--- Now passing the Class object
+                        file=stream_reader,
                         caption=f"✅ **Done:** `{filename}`",
                         file_size=file_size,
                         attributes=[types.DocumentAttributeFilename(file_name=filename)],
