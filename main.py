@@ -16,34 +16,42 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 # Expiration: 24 Hours
 EXPIRATION_TIME = 24 * 60 * 60 
 
+# --- HELPER CLASS FOR STREAMING UPLOAD ---
+# This fixes the "Cannot use async_generator" error
+class CustomStreamReader:
+    def __init__(self, response):
+        self.response = response
+
+    async def read(self, size):
+        # Read the specified chunk size from the aiohttp stream
+        return await self.response.content.read(size)
+
 # --- SETUP ---
 client = TelegramClient('bot_session', int(API_ID), API_HASH, connection_retries=None)
 routes = web.RouteTableDef()
 link_storage = {} 
 
-# --- BACKGROUND CLEANER (Frees up RAM) ---
+# --- BACKGROUND CLEANER ---
 async def cleanup_loop():
     while True:
-        await asyncio.sleep(600) # Check every 10 mins
+        await asyncio.sleep(600)
         current_time = time.time()
         keys_to_delete = []
         for code, data in link_storage.items():
             if current_time - data['timestamp'] > EXPIRATION_TIME:
                 keys_to_delete.append(code)
-        
         for key in keys_to_delete:
             del link_storage[key]
 
-# --- PROGRESS BAR FOR LEECHING ---
+# --- PROGRESS BAR ---
 async def progress_callback(current, total, event, start_time, filename):
     now = time.time()
-    # Update every 5 seconds to avoid Telegram FloodWait
     if now - start_time['last_update'] < 5:
         return
 
     start_time['last_update'] = now
     percentage = current * 100 / total
-    speed = (current / (now - start_time['start'])) / 1024 / 1024 # MB/s
+    speed = (current / (now - start_time['start'])) / 1024 / 1024
     uploaded = current / 1024 / 1024
     total_size = total / 1024 / 1024
 
@@ -61,7 +69,7 @@ async def progress_callback(current, total, event, start_time, filename):
 # --- WEB SERVER (STREAMER) ---
 @routes.get('/')
 async def root(request):
-    return web.Response(text="✅ Bot is Online (Stream + Leech)")
+    return web.Response(text="✅ Bot is Online")
 
 @routes.get('/{code}/{filename}')
 async def stream_handler(request):
@@ -96,33 +104,33 @@ async def stream_handler(request):
         pass
     return response
 
-# --- TELEGRAM BOT LOGIC ---
+# --- TELEGRAM HANDLERS ---
 @client.on(events.NewMessage(incoming=True))
 async def handle_new_message(event):
     
-    # 1. HELP MESSAGE
+    # 1. HELP
     if event.text == '/start':
         await event.reply(
-            "👋 **I can do BOTH:**\n\n"
-            "1️⃣ **Link ➡️ File:** Send me a direct URL, and I will upload it here.\n"
-            "2️⃣ **File ➡️ Link:** Send me a file, and I will give you a Direct Download Link."
+            "👋 **Combined Bot Ready**\n\n"
+            "1️⃣ **Send Link:** I will upload the file here.\n"
+            "2️⃣ **Send File:** I will create a Direct Download Link."
         )
         return
 
-    # 2. LEECH LOGIC (Link -> File)
+    # 2. LEECHER (Link -> Telegram)
     if event.text and event.text.startswith(("http://", "https://")):
         url = event.text.strip()
-        msg = await event.reply("🔗 **Analyzing Link...**")
+        msg = await event.reply("🔗 **Connecting...**")
         
         async with ClientSession() as session:
             try:
-                # Open connection to URL
+                # We do NOT use 'timeout' here so large files don't fail
                 async with session.get(url, timeout=None) as response:
                     if response.status != 200:
-                        await msg.edit(f"❌ Error: Server returned code {response.status}")
+                        await msg.edit(f"❌ HTTP Error: {response.status}")
                         return
 
-                    # Get Filename
+                    # Detect Filename
                     filename = "downloaded_file"
                     if "Content-Disposition" in response.headers:
                         fname = re.findall('filename="?([^"]+)"?', response.headers["Content-Disposition"])
@@ -132,29 +140,25 @@ async def handle_new_message(event):
                     if not filename: filename = "file.bin"
 
                     # Get Size
-                    file_size = int(response.headers.get("Content-Length", 0))
+                    content_length = response.headers.get("Content-Length")
+                    file_size = int(content_length) if content_length else 0
                     
-                    # 2GB Limit Check
                     if file_size > 2000 * 1024 * 1024:
-                        await msg.edit("❌ **Error:** File > 2GB. Telegram bots cannot upload this.")
+                        await msg.edit("❌ Error: File > 2GB.")
                         return
 
                     await msg.edit(f"⬇️ **Downloading...**\n`{filename}`")
 
-                    # Stream Generator (Website -> RAM -> Telegram)
-                    async def file_generator():
-                        while True:
-                            chunk = await response.content.read(1024 * 1024) # 1MB chunks
-                            if not chunk: break
-                            yield chunk
+                    # --- FIX IS HERE ---
+                    # Instead of a generator, we wrap response in a Class
+                    stream_reader = CustomStreamReader(response)
 
-                    # Start Upload
                     start_time = {'start': time.time(), 'last_update': 0}
                     
                     await client.send_file(
                         event.chat_id,
-                        file=file_generator(),
-                        caption=f"✅ **Leech Complete**\n📂 `{filename}`",
+                        file=stream_reader,  # <--- Now passing the Class object
+                        caption=f"✅ **Done:** `{filename}`",
                         file_size=file_size,
                         attributes=[types.DocumentAttributeFilename(file_name=filename)],
                         progress_callback=lambda c, t: progress_callback(c, t, msg, start_time, filename)
@@ -162,10 +166,10 @@ async def handle_new_message(event):
                     await msg.delete()
 
             except Exception as e:
-                await msg.edit(f"❌ **Failed:** {str(e)}")
+                await msg.edit(f"❌ Error: {str(e)}")
         return
 
-    # 3. STREAM LOGIC (File -> Link)
+    # 3. STREAMER (File -> Link)
     if event.file:
         code = secrets.token_urlsafe(8)
         link_storage[code] = {'msg': event.message, 'timestamp': time.time()}
@@ -182,13 +186,11 @@ async def handle_new_message(event):
             f"✅ **Link Generated!**\n"
             f"📂 `{original_name}`\n"
             f"💾 `{size_mb:.2f} MB`\n\n"
-            f"🔗 `{hotlink}`\n\n"
-            f"⏳ _Expires in 24h_",
+            f"🔗 `{hotlink}`",
             parse_mode='markdown'
         )
 
 async def main():
-    # Start Tasks
     asyncio.create_task(cleanup_loop())
     
     app = web.Application()
