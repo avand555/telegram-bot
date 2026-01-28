@@ -17,9 +17,9 @@ BOT_START_TIME = time.time()
 # IMPORTANT: Replace these with the actual integer User IDs.
 # You can get any user's ID by forwarding their message to @userinfobot.
 # The set should contain the IDs of the two users allowed to use the bot.
-ALLOWED_USERS = {716887656, 1053544356} 
+ALLOWED_USERS = {7168876565, 1053544356} 
 # This is your User ID for receiving notifications.
-ADMIN_ID = 716887656  
+ADMIN_ID = 7168876565  
 
 # Expiration: 24 Hours
 EXPIRATION_TIME = 24 * 60 * 60 
