@@ -13,6 +13,14 @@ API_ID = os.environ.get("API_ID")
 API_HASH = os.environ.get("API_HASH")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
+# --- USER AND ADMIN MANAGEMENT ---
+# IMPORTANT: Replace these with the actual integer User IDs.
+# You can get any user's ID by forwarding their message to @userinfobot.
+# The set should contain the IDs of the two users allowed to use the bot.
+ALLOWED_USERS = {123456789, 987654321} 
+# This is your User ID for receiving notifications.
+ADMIN_ID = 123456789  
+
 # Expiration: 24 Hours
 EXPIRATION_TIME = 24 * 60 * 60 
 
@@ -27,14 +35,11 @@ class CustomStreamReader:
         self.cancel_event = cancel_event
 
     async def read(self, size):
-        # 1. Check if user pressed Cancel
         if self.cancel_event.is_set():
             raise asyncio.CancelledError("Task Cancelled")
 
-        # 2. Read Data
         data = b''
         while len(data) < size:
-            # Check cancel again inside the loop for responsiveness
             if self.cancel_event.is_set():
                 raise asyncio.CancelledError("Task Cancelled")
                 
@@ -70,7 +75,6 @@ async def progress_callback(current, total, event, start_time, filename):
     uploaded = current / 1024 / 1024
     total_size = total / 1024 / 1024
 
-    # Add Cancel Button to the Progress Message
     try:
         await event.edit(
             f"📥 **Leeching in progress...**\n\n"
@@ -124,9 +128,13 @@ async def stream_handler(request):
 # --- CANCEL BUTTON HANDLER ---
 @client.on(events.CallbackQuery(pattern="cancel_leech"))
 async def cancel_handler(event):
-    # Check if this user has a running task
+    # --- AUTHORIZATION CHECK ---
+    if event.sender_id not in ALLOWED_USERS:
+        await event.answer("🚫 You are not authorized to perform this action.", alert=True)
+        return
+
     if event.chat_id in cancel_tasks:
-        cancel_tasks[event.chat_id].set() # Signal the task to stop
+        cancel_tasks[event.chat_id].set()
         await event.answer("Cancelling task...", alert=False)
         await event.edit("🛑 **Task Cancelled by User.**")
     else:
@@ -136,6 +144,30 @@ async def cancel_handler(event):
 @client.on(events.NewMessage(incoming=True))
 async def handle_new_message(event):
     
+    sender = await event.get_sender()
+    sender_username = f"@{sender.username}" if sender.username else f"User ID: {sender.id}"
+
+    # --- AUTHORIZATION CHECK ---
+    if event.sender_id not in ALLOWED_USERS:
+        # Notify Admin of unauthorized access attempt
+        await client.send_message(
+            ADMIN_ID,
+            f"⚠️ **Unauthorized Access Denied**\n\n"
+            f"👤 **User:** {sender_username} (`{event.sender_id}`)\n"
+            f"📝 **Message:** `{event.text}`"
+        )
+        await event.reply("🚫 **Access Denied!**\n\nI am a private bot and you are not authorized to use me.")
+        return
+
+    # --- ADMIN ACTIVITY NOTIFICATION ---
+    if event.sender_id != ADMIN_ID:
+        await client.send_message(
+            ADMIN_ID,
+            f"🔔 **Bot Activity**\n\n"
+            f"👤 **User:** {sender_username}\n"
+            f"💬 **Action:** User sent a message/command."
+        )
+
     # 1. HELP
     if event.text == '/start':
         await event.reply(
@@ -147,7 +179,6 @@ async def handle_new_message(event):
 
     # 2. LEECHER (Link -> Telegram)
     if event.text and event.text.startswith(("http://", "https://")):
-        # Check if user already has a task running
         if event.chat_id in cancel_tasks:
             await event.reply("⚠️ **You already have a process running.**\nPlease wait or cancel it.")
             return
@@ -155,7 +186,6 @@ async def handle_new_message(event):
         url = event.text.strip()
         msg = await event.reply("🔗 **Connecting...**")
         
-        # Create Cancellation Signal
         cancel_event = asyncio.Event()
         cancel_tasks[event.chat_id] = cancel_event
 
@@ -167,7 +197,6 @@ async def handle_new_message(event):
                         del cancel_tasks[event.chat_id]
                         return
 
-                    # Detect Filename
                     filename = "downloaded_file"
                     if "Content-Disposition" in response.headers:
                         fname = re.findall('filename="?([^"]+)"?', response.headers["Content-Disposition"])
@@ -176,7 +205,6 @@ async def handle_new_message(event):
                         filename = unquote(url.split("/")[-1].split("?")[0])
                     if not filename: filename = "file.bin"
 
-                    # Get Size
                     content_length = response.headers.get("Content-Length")
                     file_size = int(content_length) if content_length else 0
                     
@@ -190,9 +218,7 @@ async def handle_new_message(event):
                         buttons=[[Button.inline("❌ Cancel Task", data="cancel_leech")]]
                     )
 
-                    # Pass the Cancel Event to the Reader
                     stream_reader = CustomStreamReader(response, cancel_event)
-
                     start_time = {'start': time.time(), 'last_update': 0}
                     
                     try:
@@ -217,7 +243,6 @@ async def handle_new_message(event):
             except Exception as e:
                 await msg.edit(f"❌ Network Error: {str(e)}")
             finally:
-                # Cleanup cancellation flag
                 if event.chat_id in cancel_tasks:
                     del cancel_tasks[event.chat_id]
         return
@@ -241,6 +266,15 @@ async def handle_new_message(event):
             f"💾 `{size_mb:.2f} MB`\n\n"
             f"🔗 `{hotlink}`",
             parse_mode='markdown'
+        )
+        
+        # --- ADMIN NOTIFICATION FOR LINK GENERATION ---
+        await client.send_message(
+            ADMIN_ID,
+            f"✅ **Admin Log: Link Generated**\n\n"
+            f"👤 **User:** {sender_username}\n"
+            f"📂 **File:** `{original_name}`\n"
+            f"🔗 **Link:** `{hotlink}`"
         )
 
 async def main():
