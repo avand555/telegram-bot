@@ -12,7 +12,7 @@ from aiohttp import web, ClientSession
 API_ID = os.environ.get("API_ID")
 API_HASH = os.environ.get("API_HASH")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-
+BOT_START_TIME = time.time()
 # --- USER AND ADMIN MANAGEMENT ---
 # IMPORTANT: Replace these with the actual integer User IDs.
 # You can get any user's ID by forwarding their message to @userinfobot.
@@ -54,6 +54,25 @@ client = TelegramClient('bot_session', int(API_ID), API_HASH, connection_retries
 routes = web.RouteTableDef()
 link_storage = {} 
 
+# --- HELPER FUNCTION FOR UPTIME ---
+def get_readable_time(seconds: int) -> str:
+    result = ""
+    (days, remainder) = divmod(seconds, 86400)
+    days = int(days)
+    if days != 0:
+        result += f"{days}d "
+    (hours, remainder) = divmod(remainder, 3600)
+    hours = int(hours)
+    if hours != 0:
+        result += f"{hours}h "
+    (minutes, seconds) = divmod(remainder, 60)
+    minutes = int(minutes)
+    if minutes != 0:
+        result += f"{minutes}m "
+    seconds = int(seconds)
+    result += f"{seconds}s"
+    return result
+    
 # --- BACKGROUND CLEANER ---
 async def cleanup_loop():
     while True:
@@ -168,6 +187,7 @@ async def handle_new_message(event):
             f"💬 **Action:** User sent a message/command."
         )
 
+
     # 1. HELP
     if event.text == '/start':
         await event.reply(
@@ -175,6 +195,25 @@ async def handle_new_message(event):
             "1️⃣ **Send Link:** Upload file here (with Cancel button).\n"
             "2️⃣ **Send File:** Get Direct Download Link."
         )
+        return
+
+    # --- ADD THE NEW /status COMMAND HERE ---
+    # 2. STATUS (Admin Only)
+    if event.text == '/status' and event.sender_id == ADMIN_ID:
+        current_time = time.time()
+        uptime_seconds = int(current_time - BOT_START_TIME)
+        uptime = get_readable_time(uptime_seconds)
+
+        # Count active leeching tasks
+        active_tasks = len(cancel_tasks)
+
+        status_message = (
+            f"🤖 **Bot Status**\n\n"
+            f"**• Status:** `Online` ✅\n"
+            f"**• Uptime:** `{uptime}` ⏳\n"
+            f"**• Active Processes:** `{active_tasks}` ⚙️"
+        )
+        await event.reply(status_message)
         return
 
     # 2. LEECHER (Link -> Telegram)
