@@ -8,7 +8,8 @@ from urllib.parse import quote, unquote
 
 # Telegram Imports
 from telethon import TelegramClient, events, types, Button
-from telethon.network import ConnectionTcp
+# --- FIX: Use ConnectionTcpFull instead of ConnectionTcp ---
+from telethon.network import ConnectionTcpFull
 
 # Web Server Imports
 from aiohttp import web, ClientSession
@@ -69,7 +70,7 @@ client = TelegramClient(
     'bot_session', 
     int(API_ID), 
     API_HASH, 
-    connection=ConnectionTcp,
+    connection=ConnectionTcpFull, # <--- FIXED HERE
     use_ipv6=False, 
     device_model="Koyeb Server",
     system_version="Linux",
