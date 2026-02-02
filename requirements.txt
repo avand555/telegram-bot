@@ -1,3 +1,5 @@
 telethon
 aiohttp
 cryptg
+hachoir
+pysocks
