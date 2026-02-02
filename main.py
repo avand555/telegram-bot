@@ -148,16 +148,21 @@ async def cancel_handler(event):
 async def handle_new_message(event):
     if event.sender_id not in ALLOWED_USERS: return
     
+    sender = await event.get_sender()
+    sender_username = f"@{sender.username}" if sender.username else f"User ID: {sender.id}"
+
+    # 1. HELP
     if event.text == '/start':
         await event.reply("👋 **Koyeb Bot Ready**")
         return
 
+    # 2. STATUS
     if event.text == '/status' and event.sender_id == ADMIN_ID:
         uptime = get_readable_time(int(time.time() - BOT_START_TIME))
         await event.reply(f"🤖 **Status**\n✅ Online\n⏳ Uptime: `{uptime}`\n⚙️ Tasks: `{len(cancel_tasks)}`")
         return
 
-    # LEECH
+    # 3. LEECH
     if event.text.startswith("http"):
         if event.chat_id in cancel_tasks:
             await event.reply("⚠️ Wait for current task.")
@@ -199,30 +204,41 @@ async def handle_new_message(event):
                 if event.chat_id in cancel_tasks: del cancel_tasks[event.chat_id]
         return
 
-    # STREAM
+    # 4. STREAM
     if event.file:
         code = secrets.token_urlsafe(8)
         link_storage[code] = {'msg': event.message, 'timestamp': time.time()}
+        
         # AUTOMATICALLY GET KOYEB URL
-        app_url = os.environ.get("KOYEB_PUBLIC_URL", "http://localhost:8000")
+        app_url = os.environ.get("KOYEB_PUBLIC_URL", "")
+        if not app_url:
+             # Fallback: construct it manually if env var is missing
+             app_name = os.environ.get("KOYEB_APP_NAME", "your-app-name")
+             app_url = f"https://{app_name}.koyeb.app"
+
         hotlink = f"{app_url}/{code}/{quote(event.file.name or 'file')}"
         await event.reply(f"✅ **Link:**\n`{hotlink}`")
 
 # --- MAIN EXECUTION ---
 async def main():
     asyncio.create_task(cleanup_loop())
+    
     app = web.Application()
     app.add_routes(routes)
     runner = web.AppRunner(app)
     await runner.setup()
-    # Koyeb passes PORT env var, defaults to 8000
+    
+    # CRITICAL: Koyeb assigns a port dynamically
     port = int(os.environ.get("PORT", 8000)) 
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
-    print(f"✅ Server on port {port}")
+    print(f"✅ Server started on port {port}")
+
     await client.start(bot_token=BOT_TOKEN)
     await client.run_until_disconnected()
 
 if __name__ == '__main__':
-    try: asyncio.run(main())
-    except KeyboardInterrupt: pass
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
