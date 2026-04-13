@@ -4,11 +4,15 @@ import asyncio
 import mimetypes
 import time
 import re
+import math
+import random
 from urllib.parse import quote, unquote
 
 # Telegram Imports
 from telethon import TelegramClient, events, types, Button
 from telethon.network import ConnectionTcpFull
+from telethon.tl.functions.upload import SaveBigFilePartRequest, SaveFilePartRequest
+from telethon.tl.types import InputFileBig, InputFile
 
 # Web Server Imports
 from aiohttp import web, ClientSession
@@ -36,9 +40,9 @@ client = TelegramClient(
     API_HASH, 
     connection=ConnectionTcpFull,
     use_ipv6=False, 
-    device_model="Koyeb Server",
+    device_model="Koyeb Fast Server",
     system_version="Linux",
-    app_version="2.0.0 (IDM Engine)"
+    app_version="3.0.0 (IDM + FastUpload)"
 )
 
 # --- HELPER FUNCTIONS ---
@@ -61,7 +65,7 @@ async def cleanup_loop():
     while True:
         await asyncio.sleep(600)
         current_time = time.time()
-        keys_to_delete = [k for k, v in link_storage.items() if current_time - v['timestamp'] > EXPIRATION_TIME]
+        keys_to_delete =[k for k, v in link_storage.items() if current_time - v['timestamp'] > EXPIRATION_TIME]
         for key in keys_to_delete: del link_storage[key]
 
 # --- UI PROGRESS BAR ---
@@ -103,13 +107,53 @@ async def update_download_progress(msg, progress, total, filename, start_time, c
         if cancel_event.is_set(): break
         await progress_callback(progress['downloaded'], total, msg, start_time, filename, "⬇️ **Downloading (IDM Engine)**")
         await asyncio.sleep(4)
-    # Ensure it says 100% at the end
     await progress_callback(total, total, msg, start_time, filename, "⬇️ **Downloading (IDM Engine)**")
+
+# --- FAST UPLOAD ENGINE ---
+async def upload_file_fast(client, file_path, msg, start_time, filename, cancel_event):
+    file_size = os.path.getsize(file_path)
+    part_size = 512 * 1024 # 512 KB
+    total_parts = math.ceil(file_size / part_size)
+    is_big = file_size > 10 * 1024 * 1024
+    file_id = random.getrandbits(63)
+    
+    uploaded_bytes = 0
+    
+    async def upload_part(part_index, chunk):
+        nonlocal uploaded_bytes
+        if cancel_event.is_set(): raise asyncio.CancelledError()
+        if is_big:
+            await client(SaveBigFilePartRequest(file_id, part_index, total_parts, chunk))
+        else:
+            await client(SaveFilePartRequest(file_id, part_index, chunk))
+        uploaded_bytes += len(chunk)
+
+    tasks =[]
+    with open(file_path, 'rb') as f:
+        for i in range(total_parts):
+            if cancel_event.is_set(): raise asyncio.CancelledError()
+            chunk = f.read(part_size)
+            tasks.append(upload_part(i, chunk))
+            
+            # Send 12 chunks concurrently (Massive speed boost)
+            if len(tasks) >= 12:
+                await asyncio.gather(*tasks)
+                tasks =[]
+                await progress_callback(uploaded_bytes, file_size, msg, start_time, filename, "⬆️ **Uploading (Fast Engine)**")
+        
+        # Finish remaining tasks
+        if tasks:
+            await asyncio.gather(*tasks)
+            await progress_callback(uploaded_bytes, file_size, msg, start_time, filename, "⬆️ **Uploading (Fast Engine)**")
+            
+    name = os.path.basename(file_path)
+    return InputFileBig(file_id, total_parts, name) if is_big else InputFile(file_id, total_parts, name, '')
+
 
 # --- WEB SERVER ROUTES ---
 @routes.get('/')
 async def root(request):
-    return web.Response(text="✅ IDM Bot is Online on Koyeb")
+    return web.Response(text="✅ Fast Bot is Online on Koyeb")
 
 @routes.get('/{code}/{filename}')
 async def stream_handler(request):
@@ -153,7 +197,7 @@ async def handle_new_message(event):
     
     # 1. HELP
     if event.text == '/start':
-        await event.reply("👋 **Koyeb IDM Bot Ready**\n\nSend a link to download fast and upload as Video.")
+        await event.reply("👋 **Koyeb Fast Bot Ready**\n\nSend a link to download fast and upload as Video.")
         return
 
     # 2. STATUS
@@ -185,14 +229,12 @@ async def handle_new_message(event):
                         file_size = int(resp.headers.get("Content-Length", 0))
                         accept_ranges = resp.headers.get("Accept-Ranges") == "bytes"
                         
-                        # Get filename
                         if "Content-Disposition" in resp.headers:
                             fname = re.findall('filename="?([^"]+)"?', resp.headers["Content-Disposition"])
                             if fname: filename = fname[0]
                         else:
                             filename = unquote(url.split("/")[-1].split("?")[0]) or "video"
-                except:
-                    pass
+                except: pass
             
             # Clean filename and FORCE .mp4 extension for Video Upload
             filename = re.sub(r'[\\/*?:"<>|]', "", filename)
@@ -207,12 +249,11 @@ async def handle_new_message(event):
             progress = {'downloaded': 0}
             start_time = {'start': time.time(), 'last_update': 0}
 
-            # MULTI-PART DOWNLOAD
+            # MULTI-PART DOWNLOAD (IDM)
             if accept_ranges and file_size > (5 * 1024 * 1024):
                 CONNECTIONS = 8
                 chunk_size = file_size // CONNECTIONS
                 
-                # Pre-allocate file on disk
                 with open(filename, 'wb') as f:
                     f.seek(file_size - 1)
                     f.write(b'\0')
@@ -242,19 +283,24 @@ async def handle_new_message(event):
 
             if cancel_event.is_set(): raise asyncio.CancelledError()
 
-            # UPLOAD TO TELEGRAM AS VIDEO
-            await msg.edit(f"⬆️ **Uploading to Telegram...**\n🎬 `{filename}`", buttons=[[Button.inline("❌ Cancel", data="cancel_leech")]])
+            # FAST MULTI-PART UPLOAD
+            await msg.edit(f"⬆️ **Starting Fast Upload...**\n🎬 `{filename}`", buttons=[[Button.inline("❌ Cancel", data="cancel_leech")]])
             start_time = {'start': time.time(), 'last_update': 0}
 
+            # Upload the file using the custom Fast Engine
+            uploaded_file = await upload_file_fast(client, filename, msg, start_time, filename, cancel_event)
+            
+            await msg.edit(f"⏳ **Finalizing Video processing...**\n🎬 `{filename}`")
+            
+            # Send the completed file to Telegram
             await client.send_file(
                 event.chat_id,
-                file=filename,
+                file=uploaded_file,
                 caption=f"✅ `{filename}`",
                 supports_streaming=True, # MAKES IT A PLAYABLE VIDEO
                 attributes=[types.DocumentAttributeVideo(
                     duration=0, w=1280, h=720, supports_streaming=True
-                )],
-                progress_callback=lambda c, t: progress_callback(c, t, msg, start_time, filename, "⬆️ **Uploading**")
+                )]
             )
             await msg.delete()
 
