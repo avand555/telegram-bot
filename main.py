@@ -42,7 +42,7 @@ client = TelegramClient(
     use_ipv6=False, 
     device_model="Koyeb Fast Server",
     system_version="Linux",
-    app_version="3.0.0 (IDM + FastUpload)"
+    app_version="4.0.0 (FastUpload + Rename)"
 )
 
 # --- HELPER FUNCTIONS ---
@@ -135,7 +135,7 @@ async def upload_file_fast(client, file_path, msg, start_time, filename, cancel_
             chunk = f.read(part_size)
             tasks.append(upload_part(i, chunk))
             
-            # Send 12 chunks concurrently (Massive speed boost)
+            # Send 12 chunks concurrently
             if len(tasks) >= 12:
                 await asyncio.gather(*tasks)
                 tasks =[]
@@ -159,18 +159,23 @@ async def root(request):
 async def stream_handler(request):
     code = request.match_info['code']
     data = link_storage.get(code)
+    
     if not data or (time.time() - data['timestamp'] > EXPIRATION_TIME):
         if data: del link_storage[code]
         return web.Response(text="❌ Link Expired", status=410)
     
     message = data['msg']
-    file_name = request.match_info['filename']
+    
+    # Safely unquote the filename so IDM gets spaces instead of %20
+    file_name = unquote(request.match_info['filename']) 
     file_size = message.file.size if message.file else 0
+    
     mime_type, _ = mimetypes.guess_type(file_name)
     if not mime_type: mime_type = 'application/octet-stream'
 
     headers = {
-        'Content-Disposition': f'inline; filename="{file_name}"',
+        # Forces the browser/IDM to name the file exactly what is in the URL
+        'Content-Disposition': f'inline; filename="{file_name}"', 
         'Content-Type': mime_type,
         'Content-Length': str(file_size),
         'Accept-Ranges': 'none'
@@ -197,7 +202,7 @@ async def handle_new_message(event):
     
     # 1. HELP
     if event.text == '/start':
-        await event.reply("👋 **Koyeb Fast Bot Ready**\n\nSend a link to download fast and upload as Video.")
+        await event.reply("👋 **Koyeb Fast Bot Ready**\n\nSend a link to leech, forward a file to stream, or reply to a file with `/rename new_name.mp4`")
         return
 
     # 2. STATUS
@@ -207,7 +212,7 @@ async def handle_new_message(event):
         return
 
     # 3. LEECH (URL to Telegram)
-    if event.text.startswith("http"):
+    if event.text and event.text.startswith("http"):
         if event.chat_id in cancel_tasks:
             await event.reply("⚠️ You already have an active process. Wait or cancel it.")
             return
@@ -287,17 +292,15 @@ async def handle_new_message(event):
             await msg.edit(f"⬆️ **Starting Fast Upload...**\n🎬 `{filename}`", buttons=[[Button.inline("❌ Cancel", data="cancel_leech")]])
             start_time = {'start': time.time(), 'last_update': 0}
 
-            # Upload the file using the custom Fast Engine
             uploaded_file = await upload_file_fast(client, filename, msg, start_time, filename, cancel_event)
             
             await msg.edit(f"⏳ **Finalizing Video processing...**\n🎬 `{filename}`")
             
-            # Send the completed file to Telegram
             await client.send_file(
                 event.chat_id,
                 file=uploaded_file,
                 caption=f"✅ `{filename}`",
-                supports_streaming=True, # MAKES IT A PLAYABLE VIDEO
+                supports_streaming=True, 
                 attributes=[types.DocumentAttributeVideo(
                     duration=0, w=1280, h=720, supports_streaming=True
                 )]
@@ -310,23 +313,55 @@ async def handle_new_message(event):
             await msg.edit(f"❌ Error: {e}")
         finally:
             if os.path.exists(filename):
-                os.remove(filename) # Clean up server memory
+                os.remove(filename) 
             if event.chat_id in cancel_tasks:
                 del cancel_tasks[event.chat_id]
         return
 
-    # 4. STREAM (File -> URL)
-    if event.file:
+    # 4. STREAM / RENAME (File -> URL)
+    # Triggers if a file is sent, OR if a user replies to a file with /rename
+    if event.file or (event.is_reply and event.text and event.text.startswith('/rename')):
+        target_msg = event
+        custom_name = None
+
+        # Check if it's a rename command
+        if event.text and event.text.startswith('/rename'):
+            target_msg = await event.get_reply_message()
+            if not target_msg or not target_msg.file:
+                await event.reply("⚠️ Please reply to a video/file to rename it.")
+                return
+            
+            # Extract new name from command
+            custom_name = event.text.split(' ', 1)[1].strip() if ' ' in event.text else 'video.mp4'
+            if not '.' in custom_name: custom_name += '.mp4' # auto-add extension if missing
+
+        # Generate Link
         code = secrets.token_urlsafe(8)
-        link_storage[code] = {'msg': event.message, 'timestamp': time.time()}
+        link_storage[code] = {'msg': target_msg, 'timestamp': time.time()}
         
         app_url = os.environ.get("KOYEB_PUBLIC_URL", "")
         if not app_url:
              app_name = os.environ.get("KOYEB_APP_NAME", "your-app-name")
              app_url = f"https://{app_name}.koyeb.app"
 
-        hotlink = f"{app_url}/{code}/{quote(event.file.name or 'video.mp4')}"
-        await event.reply(f"✅ **Link:**\n`{hotlink}`")
+        # Apply renaming logic
+        original_name = target_msg.file.name or 'video.mp4'
+        final_name = custom_name if custom_name else original_name
+        
+        # Quote the filename so special characters and spaces work in URLs
+        hotlink = f"{app_url}/{code}/{quote(final_name)}"
+        
+        # Build Response Message
+        text = f"✅ **Link Generated!**\n\n"
+        if custom_name:
+            text += f"✏️ **Renamed to:** `{final_name}`\n\n"
+        else:
+            text += f"📂 `{final_name}`\n💡 *Tip: Reply to this file with `/rename new_name.mp4` to change its name!*\n\n"
+            
+        text += f"🔗 `{hotlink}`"
+        
+        await event.reply(text)
+
 
 # --- MAIN EXECUTION ---
 async def main():
