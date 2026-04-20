@@ -42,7 +42,7 @@ client = TelegramClient(
     use_ipv6=False, 
     device_model="Koyeb Fast Server",
     system_version="Linux",
-    app_version="4.0.0 (FastUpload + Rename)"
+    app_version="5.0.0 (IDM Stream Fix)"
 )
 
 # --- HELPER FUNCTIONS ---
@@ -135,13 +135,11 @@ async def upload_file_fast(client, file_path, msg, start_time, filename, cancel_
             chunk = f.read(part_size)
             tasks.append(upload_part(i, chunk))
             
-            # Send 12 chunks concurrently
             if len(tasks) >= 12:
                 await asyncio.gather(*tasks)
                 tasks =[]
                 await progress_callback(uploaded_bytes, file_size, msg, start_time, filename, "⬆️ **Uploading (Fast Engine)**")
         
-        # Finish remaining tasks
         if tasks:
             await asyncio.gather(*tasks)
             await progress_callback(uploaded_bytes, file_size, msg, start_time, filename, "⬆️ **Uploading (Fast Engine)**")
@@ -150,7 +148,7 @@ async def upload_file_fast(client, file_path, msg, start_time, filename, cancel_
     return InputFileBig(file_id, total_parts, name) if is_big else InputFile(file_id, total_parts, name, '')
 
 
-# --- WEB SERVER ROUTES ---
+# --- WEB SERVER ROUTES (FIXED FOR IDM & VIDEO STREAMING) ---
 @routes.get('/')
 async def root(request):
     return web.Response(text="✅ Fast Bot is Online on Koyeb")
@@ -162,30 +160,68 @@ async def stream_handler(request):
     
     if not data or (time.time() - data['timestamp'] > EXPIRATION_TIME):
         if data: del link_storage[code]
-        return web.Response(text="❌ Link Expired", status=410)
+        return web.Response(text="❌ Link Expired or Bot Restarted", status=410)
     
     message = data['msg']
-    
-    # Safely unquote the filename so IDM gets spaces instead of %20
     file_name = unquote(request.match_info['filename']) 
     file_size = message.file.size if message.file else 0
     
     mime_type, _ = mimetypes.guess_type(file_name)
     if not mime_type: mime_type = 'application/octet-stream'
 
+    # --- HTTP RANGE SUPPORT (Required for IDM & Video Players) ---
+    range_header = request.headers.get('Range')
+    start = 0
+    end = file_size - 1
+
+    if range_header:
+        match = re.match(r'bytes=(\d+)-(\d*)', range_header)
+        if match:
+            start = int(match.group(1))
+            if match.group(2):
+                end = int(match.group(2))
+                
+    if start >= file_size or end >= file_size:
+        return web.Response(status=416, headers={'Content-Range': f'bytes */{file_size}'})
+
+    content_length = end - start + 1
+    
     headers = {
-        # Forces the browser/IDM to name the file exactly what is in the URL
         'Content-Disposition': f'inline; filename="{file_name}"', 
         'Content-Type': mime_type,
-        'Content-Length': str(file_size),
-        'Accept-Ranges': 'none'
+        'Content-Length': str(content_length),
+        'Accept-Ranges': 'bytes'
     }
-    response = web.StreamResponse(headers=headers)
+
+    if range_header:
+        headers['Content-Range'] = f'bytes {start}-{end}/{file_size}'
+        response = web.StreamResponse(status=206, headers=headers)
+    else:
+        response = web.StreamResponse(status=200, headers=headers)
+        
     await response.prepare(request)
+
+    # Telethon offset must be a multiple of 4096 bytes
+    align = 4096
+    offset = (start // align) * align
+    skip = start - offset
+    bytes_to_send = content_length
+
     try:
-        async for chunk in client.iter_download(message, chunk_size=512 * 1024):
-            await response.write(chunk)
-    except Exception: pass
+        async for chunk in client.iter_download(message, offset=offset, chunk_size=1024 * 512):
+            if skip > 0:
+                chunk = chunk[skip:]
+                skip = 0
+            
+            if bytes_to_send <= len(chunk):
+                await response.write(chunk[:bytes_to_send])
+                break
+            else:
+                await response.write(chunk)
+                bytes_to_send -= len(chunk)
+    except Exception:
+        pass # Ignore errors if user cancels IDM download mid-way
+        
     return response
 
 # --- TELEGRAM EVENTS ---
@@ -227,7 +263,6 @@ async def handle_new_message(event):
         accept_ranges = False
 
         try:
-            # Check Headers
             async with ClientSession() as session:
                 try:
                     async with session.head(url, allow_redirects=True, timeout=10) as resp:
@@ -241,7 +276,6 @@ async def handle_new_message(event):
                             filename = unquote(url.split("/")[-1].split("?")[0]) or "video"
                 except: pass
             
-            # Clean filename and FORCE .mp4 extension for Video Upload
             filename = re.sub(r'[\\/*?:"<>|]', "", filename)
             if not any(filename.lower().endswith(ext) for ext in['.mp4', '.mkv', '.avi', '.mov', '.webm']):
                 filename += ".mp4"
@@ -254,7 +288,7 @@ async def handle_new_message(event):
             progress = {'downloaded': 0}
             start_time = {'start': time.time(), 'last_update': 0}
 
-            # MULTI-PART DOWNLOAD (IDM)
+            # MULTI-PART DOWNLOAD
             if accept_ranges and file_size > (5 * 1024 * 1024):
                 CONNECTIONS = 8
                 chunk_size = file_size // CONNECTIONS
@@ -273,8 +307,6 @@ async def handle_new_message(event):
                 
                 await asyncio.gather(*tasks)
                 updater_task.cancel()
-
-            # SINGLE PART FALLBACK
             else:
                 updater_task = asyncio.create_task(update_download_progress(msg, progress, file_size or 1, filename, start_time, cancel_event))
                 async with ClientSession() as session:
@@ -288,7 +320,6 @@ async def handle_new_message(event):
 
             if cancel_event.is_set(): raise asyncio.CancelledError()
 
-            # FAST MULTI-PART UPLOAD
             await msg.edit(f"⬆️ **Starting Fast Upload...**\n🎬 `{filename}`", buttons=[[Button.inline("❌ Cancel", data="cancel_leech")]])
             start_time = {'start': time.time(), 'last_update': 0}
 
@@ -319,39 +350,35 @@ async def handle_new_message(event):
         return
 
     # 4. STREAM / RENAME (File -> URL)
-    # Triggers if a file is sent, OR if a user replies to a file with /rename
     if event.file or (event.is_reply and event.text and event.text.startswith('/rename')):
         target_msg = event
         custom_name = None
 
-        # Check if it's a rename command
         if event.text and event.text.startswith('/rename'):
             target_msg = await event.get_reply_message()
             if not target_msg or not target_msg.file:
                 await event.reply("⚠️ Please reply to a video/file to rename it.")
                 return
             
-            # Extract new name from command
             custom_name = event.text.split(' ', 1)[1].strip() if ' ' in event.text else 'video.mp4'
-            if not '.' in custom_name: custom_name += '.mp4' # auto-add extension if missing
+            if not '.' in custom_name: custom_name += '.mp4' 
 
-        # Generate Link
         code = secrets.token_urlsafe(8)
         link_storage[code] = {'msg': target_msg, 'timestamp': time.time()}
         
+        # FIX: Ensure there is no double slash (//) when generating the URL
         app_url = os.environ.get("KOYEB_PUBLIC_URL", "")
         if not app_url:
              app_name = os.environ.get("KOYEB_APP_NAME", "your-app-name")
              app_url = f"https://{app_name}.koyeb.app"
+             
+        app_url = app_url.rstrip('/') # Removes accidental trailing slashes
 
-        # Apply renaming logic
         original_name = target_msg.file.name or 'video.mp4'
         final_name = custom_name if custom_name else original_name
         
-        # Quote the filename so special characters and spaces work in URLs
         hotlink = f"{app_url}/{code}/{quote(final_name)}"
         
-        # Build Response Message
         text = f"✅ **Link Generated!**\n\n"
         if custom_name:
             text += f"✏️ **Renamed to:** `{final_name}`\n\n"
@@ -361,7 +388,6 @@ async def handle_new_message(event):
         text += f"🔗 `{hotlink}`"
         
         await event.reply(text)
-
 
 # --- MAIN EXECUTION ---
 async def main():
