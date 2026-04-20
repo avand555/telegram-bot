@@ -16,11 +16,16 @@ from telethon.tl.types import InputFileBig, InputFile
 
 # Web Server Imports
 from aiohttp import web, ClientSession
+import aiohttp
 
 # --- CONFIGURATION ---
 API_ID = os.environ.get("API_ID")
 API_HASH = os.environ.get("API_HASH")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
+
+# ADDED YOUR VIDMOLY API KEY
+VIDMOLY_API_KEY = os.environ.get("VIDMOLY_API_KEY", "547285kdjw3pg3e303au64")
+
 BOT_START_TIME = time.time()
 
 # --- USER AND ADMIN MANAGEMENT ---
@@ -42,7 +47,7 @@ client = TelegramClient(
     use_ipv6=False, 
     device_model="Koyeb Fast Server",
     system_version="Linux",
-    app_version="7.0.0 (IDM Bulletproof)"
+    app_version="8.0.0 (Vidmoly Integration)"
 )
 
 # --- HELPER FUNCTIONS ---
@@ -148,7 +153,7 @@ async def upload_file_fast(client, file_path, msg, start_time, filename, cancel_
     return InputFileBig(file_id, total_parts, name) if is_big else InputFile(file_id, total_parts, name, '')
 
 
-# --- WEB SERVER ROUTES (COMPLETELY REWRITTEN FOR IDM) ---
+# --- WEB SERVER ROUTES (FIXED FOR IDM) ---
 @routes.get('/')
 async def root(request):
     return web.Response(text="✅ Fast Bot is Online on Koyeb")
@@ -188,7 +193,6 @@ async def stream_handler(request):
 
     content_length = end - start + 1
     
-    # "attachment" forces IDM and Browsers to treat it as a pure download
     headers = {
         'Content-Disposition': f'attachment; filename="{file_name}"', 
         'Content-Type': mime_type,
@@ -207,14 +211,12 @@ async def stream_handler(request):
     except Exception:
         return response
 
-    # --- PERFECT TELEGRAM 1MB ALIGNMENT ---
     request_size = 1048576 # Exactly 1 MB
     offset = (start // request_size) * request_size
     skip = start - offset
     bytes_to_send = content_length
 
     try:
-        # Pass request_size directly to Telegram API
         async for chunk in client.iter_download(message.media, offset=offset, request_size=request_size):
             if skip > 0:
                 chunk = chunk[skip:]
@@ -228,7 +230,6 @@ async def stream_handler(request):
                 bytes_to_send -= len(chunk)
                 
     except (asyncio.CancelledError, ConnectionResetError):
-        # IDM opens multiple connections and closes them constantly. This is normal, do not crash.
         pass 
     except Exception as e:
         print(f"Stream Download Error: {e}") 
@@ -247,16 +248,24 @@ async def cancel_handler(event):
 async def handle_new_message(event):
     if event.sender_id not in ALLOWED_USERS: return
     
+    # 1. HELP
     if event.text == '/start':
-        await event.reply("👋 **Koyeb Fast Bot Ready**\n\nSend a link to leech, forward a file to stream, or reply to a file with `/rename new_name.mp4`")
+        await event.reply(
+            "👋 **Combined IDM & Vidmoly Bot Ready!**\n\n"
+            "🔗 **Send a link:** Leech & upload to Telegram.\n"
+            "📁 **Forward a file:** Get a direct IDM download link.\n"
+            "✏️ **Reply with `/rename[name]`:** Get a renamed IDM link.\n"
+            "☁️ **Reply with `/vidmoly`:** Upload file to Vidmoly."
+        )
         return
 
+    # 2. STATUS
     if event.text == '/status' and event.sender_id == ADMIN_ID:
         uptime = get_readable_time(int(time.time() - BOT_START_TIME))
         await event.reply(f"🤖 **Status**\n✅ Online\n⏳ Uptime: `{uptime}`\n⚙️ Active Tasks: `{len(cancel_tasks)}`")
         return
 
-    # LEECH 
+    # 3. LEECH (URL to Telegram)
     if event.text and event.text.startswith("http"):
         if event.chat_id in cancel_tasks:
             await event.reply("⚠️ You already have an active process. Wait or cancel it.")
@@ -353,19 +362,109 @@ async def handle_new_message(event):
                 del cancel_tasks[event.chat_id]
         return
 
-    # STREAM / RENAME 
-    if event.file or (event.is_reply and event.text and event.text.startswith('/rename')):
-        target_msg = event
-        custom_name = None
+    # 4. VIDMOLY UPLOAD (Reply to file with /vidmoly)
+    if event.text and event.text.startswith('/vidmoly'):
+        if not event.is_reply:
+            await event.reply("⚠️ **Please reply to a video/file with `/vidmoly` to upload it.**")
+            return
+            
+        target_msg = await event.get_reply_message()
+        if not target_msg or not target_msg.file:
+            await event.reply("⚠️ **Please reply to a valid video/file.**")
+            return
 
+        msg = await event.reply("⬇️ **Downloading file from Telegram...**")
+        
+        filename = target_msg.file.name or f"vidmoly_video_{int(time.time())}.mp4"
+        filename = re.sub(r'[\\/*?:"<>|]', "", filename)
+        if not '.' in filename: filename += '.mp4'
+
+        progress = {'downloaded': 0}
+        start_time = {'start': time.time(), 'last_update': 0}
+        file_size = target_msg.file.size or 1
+
+        try:
+            # 1. Download from Telegram to server safely
+            with open(filename, 'wb') as f:
+                async for chunk in client.iter_download(target_msg.media, request_size=1048576):
+                    f.write(chunk)
+                    progress['downloaded'] += len(chunk)
+                    
+                    now = time.time()
+                    if now - start_time['last_update'] >= 4:
+                        start_time['last_update'] = now
+                        percentage = (progress['downloaded'] / file_size) * 100
+                        speed = (progress['downloaded'] / (now - start_time['start'])) / 1024 / 1024 if (now - start_time['start']) > 0 else 0
+                        uploaded = progress['downloaded'] / 1024 / 1024
+                        total_size = file_size / 1024 / 1024
+                        await msg.edit(
+                            f"⬇️ **Downloading from Telegram...**\n\n"
+                            f"🎬 `{filename}`\n"
+                            f"📊 `{percentage:.2f}%`\n"
+                            f"🚀 `{speed:.2f} MB/s`\n"
+                            f"💾 `{uploaded:.2f} / {total_size:.2f} MB`"
+                        )
+
+            await msg.edit(f"⬆️ **Uploading to Vidmoly...**\n🎬 `{filename}`\n\n*(This is very fast, please wait)*")
+            
+            # 2. Communicate with Vidmoly API
+            async with ClientSession() as session:
+                async with session.get(f"https://vidmoly.me/api/upload/server?key={VIDMOLY_API_KEY}") as r:
+                    res = await r.json(content_type=None)
+                    if res.get('status') != 200:
+                        await msg.edit(f"❌ **Vidmoly Error:** Failed to get upload server.")
+                        return
+                    upload_url = res['result']
+                
+                # 3. Upload file to Vidmoly Server
+                data = aiohttp.FormData()
+                data.add_field('api_key', VIDMOLY_API_KEY)
+                data.add_field('file', open(filename, 'rb'), filename=filename)
+                
+                async with session.post(upload_url, data=data) as r:
+                    try:
+                        upload_res = await r.json(content_type=None)
+                        if isinstance(upload_res, list) and len(upload_res) > 0 and 'file_code' in upload_res[0]:
+                            file_code = upload_res[0]['file_code']
+                            vidmoly_link = f"https://vidmoly.me/{file_code}.html"
+                            await msg.edit(f"✅ **Successfully Uploaded to Vidmoly!**\n\n🎬 `{filename}`\n🔗 {vidmoly_link}")
+                        else:
+                            await msg.edit(f"❌ **Vidmoly Upload Error:** Unrecognized response.\n`{upload_res}`")
+                    except Exception as parse_e:
+                        text_res = await r.text()
+                        match = re.search(r'name="fn">([a-zA-Z0-9]+)<', text_res)
+                        if match:
+                            file_code = match.group(1)
+                            vidmoly_link = f"https://vidmoly.me/{file_code}.html"
+                            await msg.edit(f"✅ **Successfully Uploaded to Vidmoly!**\n\n🎬 `{filename}`\n🔗 {vidmoly_link}")
+                        else:
+                            await msg.edit(f"❌ **Vidmoly Upload Error:** Failed to parse.\n`{text_res[:100]}`")
+
+        except Exception as e:
+            await msg.edit(f"❌ **Error:** {e}")
+        finally:
+            if os.path.exists(filename):
+                os.remove(filename)
+        return
+
+    # 5. STREAM / RENAME (File -> URL)
+    if event.file or (event.text and event.text.startswith('/rename')):
+        
         if event.text and event.text.startswith('/rename'):
+            if not event.is_reply:
+                await event.reply("⚠️ **Please reply to a video/file with `/rename new_name.mp4` to rename it.**")
+                return
+                
             target_msg = await event.get_reply_message()
             if not target_msg or not target_msg.file:
-                await event.reply("⚠️ Please reply to a video/file to rename it.")
+                await event.reply("⚠️ **Please reply to a valid video/file to rename it.**")
                 return
             
             custom_name = event.text.split(' ', 1)[1].strip() if ' ' in event.text else 'video.mp4'
             if not '.' in custom_name: custom_name += '.mp4' 
+        else:
+            target_msg = event
+            custom_name = None
 
         code = secrets.token_urlsafe(8)
         link_storage[code] = {'msg': target_msg, 'timestamp': time.time()}
