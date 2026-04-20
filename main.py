@@ -289,4 +289,125 @@ async def handle_new_message(event):
             if not any(filename.lower().endswith(ext) for ext in['.mp4', '.mkv', '.avi', '.mov', '.webm']):
                 filename += ".mp4"
 
-            if file_size > 4000 * 10
+            if file_size > 4000 * 1024 * 1024:
+                await msg.edit("❌ Error: File is larger than 4GB.")
+                del cancel_tasks[event.chat_id]
+                return
+
+            progress = {'downloaded': 0}
+            start_time = {'start': time.time(), 'last_update': 0}
+
+            if accept_ranges and file_size > (5 * 1024 * 1024):
+                CONNECTIONS = 8
+                chunk_size = file_size // CONNECTIONS
+                
+                with open(filename, 'wb') as f:
+                    f.seek(file_size - 1)
+                    f.write(b'\0')
+
+                tasks =[]
+                for i in range(CONNECTIONS):
+                    start = i * chunk_size
+                    end = start + chunk_size - 1 if i < CONNECTIONS - 1 else file_size - 1
+                    tasks.append(download_chunk(url, start, end, filename, progress, cancel_event))
+
+                updater_task = asyncio.create_task(update_download_progress(msg, progress, file_size, filename, start_time, cancel_event))
+                await asyncio.gather(*tasks)
+                updater_task.cancel()
+            else:
+                updater_task = asyncio.create_task(update_download_progress(msg, progress, file_size or 1, filename, start_time, cancel_event))
+                async with ClientSession() as session:
+                    async with session.get(url) as resp:
+                        with open(filename, 'wb') as f:
+                            async for chunk in resp.content.iter_chunked(1024 * 1024):
+                                if cancel_event.is_set(): raise asyncio.CancelledError()
+                                f.write(chunk)
+                                progress['downloaded'] += len(chunk)
+                updater_task.cancel()
+
+            if cancel_event.is_set(): raise asyncio.CancelledError()
+
+            await msg.edit(f"⬆️ **Starting Fast Upload...**\n🎬 `{filename}`", buttons=[[Button.inline("❌ Cancel", data="cancel_leech")]])
+            start_time = {'start': time.time(), 'last_update': 0}
+
+            uploaded_file = await upload_file_fast(client, filename, msg, start_time, filename, cancel_event)
+            await msg.edit(f"⏳ **Finalizing Video processing...**\n🎬 `{filename}`")
+            
+            await client.send_file(
+                event.chat_id,
+                file=uploaded_file,
+                caption=f"✅ `{filename}`",
+                supports_streaming=True, 
+                attributes=[types.DocumentAttributeVideo(duration=0, w=1280, h=720, supports_streaming=True)]
+            )
+            await msg.delete()
+
+        except asyncio.CancelledError:
+            await msg.edit("🛑 **Task Cancelled.**")
+        except Exception as e:
+            await msg.edit(f"❌ Error: {e}")
+        finally:
+            if os.path.exists(filename):
+                os.remove(filename) 
+            if event.chat_id in cancel_tasks:
+                del cancel_tasks[event.chat_id]
+        return
+
+    # STREAM / RENAME 
+    if event.file or (event.is_reply and event.text and event.text.startswith('/rename')):
+        target_msg = event
+        custom_name = None
+
+        if event.text and event.text.startswith('/rename'):
+            target_msg = await event.get_reply_message()
+            if not target_msg or not target_msg.file:
+                await event.reply("⚠️ Please reply to a video/file to rename it.")
+                return
+            
+            custom_name = event.text.split(' ', 1)[1].strip() if ' ' in event.text else 'video.mp4'
+            if not '.' in custom_name: custom_name += '.mp4' 
+
+        code = secrets.token_urlsafe(8)
+        link_storage[code] = {'msg': target_msg, 'timestamp': time.time()}
+        
+        app_url = os.environ.get("KOYEB_PUBLIC_URL", "")
+        if not app_url:
+             app_name = os.environ.get("KOYEB_APP_NAME", "your-app-name")
+             app_url = f"https://{app_name}.koyeb.app"
+             
+        app_url = app_url.rstrip('/')
+
+        original_name = target_msg.file.name or 'video.mp4'
+        final_name = custom_name if custom_name else original_name
+        
+        hotlink = f"{app_url}/{code}/{quote(final_name)}"
+        
+        text = f"✅ **Link Generated!**\n\n"
+        if custom_name:
+            text += f"✏️ **Renamed to:** `{final_name}`\n\n"
+        else:
+            text += f"📂 `{final_name}`\n💡 *Tip: Reply to this file with `/rename new_name.mp4` to change its name!*\n\n"
+            
+        text += f"🔗 `{hotlink}`"
+        
+        await event.reply(text)
+
+# --- MAIN EXECUTION ---
+async def main():
+    asyncio.create_task(cleanup_loop())
+    app = web.Application()
+    app.add_routes(routes)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    
+    port = int(os.environ.get("PORT", 8000)) 
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    print(f"✅ Server started on port {port}")
+
+    await client.start(bot_token=BOT_TOKEN)
+    await client.run_until_disconnected()
+
+if __name__ == '__main__':
+    try: asyncio.run(main())
+    except KeyboardInterrupt: pass
