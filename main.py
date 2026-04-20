@@ -42,7 +42,7 @@ client = TelegramClient(
     use_ipv6=False, 
     device_model="Koyeb Fast Server",
     system_version="Linux",
-    app_version="5.0.0 (IDM Stream Fix)"
+    app_version="6.0.0 (IDM Offset Fix)"
 )
 
 # --- HELPER FUNCTIONS ---
@@ -112,7 +112,7 @@ async def update_download_progress(msg, progress, total, filename, start_time, c
 # --- FAST UPLOAD ENGINE ---
 async def upload_file_fast(client, file_path, msg, start_time, filename, cancel_event):
     file_size = os.path.getsize(file_path)
-    part_size = 512 * 1024 # 512 KB
+    part_size = 512 * 1024 
     total_parts = math.ceil(file_size / part_size)
     is_big = file_size > 10 * 1024 * 1024
     file_id = random.getrandbits(63)
@@ -148,7 +148,7 @@ async def upload_file_fast(client, file_path, msg, start_time, filename, cancel_
     return InputFileBig(file_id, total_parts, name) if is_big else InputFile(file_id, total_parts, name, '')
 
 
-# --- WEB SERVER ROUTES (FIXED FOR IDM & VIDEO STREAMING) ---
+# --- WEB SERVER ROUTES (FIXED FOR IDM) ---
 @routes.get('/')
 async def root(request):
     return web.Response(text="✅ Fast Bot is Online on Koyeb")
@@ -169,7 +169,6 @@ async def stream_handler(request):
     mime_type, _ = mimetypes.guess_type(file_name)
     if not mime_type: mime_type = 'application/octet-stream'
 
-    # --- HTTP RANGE SUPPORT (Required for IDM & Video Players) ---
     range_header = request.headers.get('Range')
     start = 0
     end = file_size - 1
@@ -201,14 +200,14 @@ async def stream_handler(request):
         
     await response.prepare(request)
 
-    # Telethon offset must be a multiple of 4096 bytes
-    align = 4096
-    offset = (start // align) * align
+    # --- CRITICAL FIX FOR IDM: 1MB STRICT ALIGNMENT ---
+    chunk_size = 1024 * 1024 # Exactly 1 MB
+    offset = (start // chunk_size) * chunk_size
     skip = start - offset
     bytes_to_send = content_length
 
     try:
-        async for chunk in client.iter_download(message, offset=offset, chunk_size=1024 * 512):
+        async for chunk in client.iter_download(message, offset=offset, chunk_size=chunk_size):
             if skip > 0:
                 chunk = chunk[skip:]
                 skip = 0
@@ -219,8 +218,8 @@ async def stream_handler(request):
             else:
                 await response.write(chunk)
                 bytes_to_send -= len(chunk)
-    except Exception:
-        pass # Ignore errors if user cancels IDM download mid-way
+    except Exception as e:
+        print(f"IDM Stream Error: {e}") 
         
     return response
 
@@ -236,18 +235,16 @@ async def cancel_handler(event):
 async def handle_new_message(event):
     if event.sender_id not in ALLOWED_USERS: return
     
-    # 1. HELP
     if event.text == '/start':
         await event.reply("👋 **Koyeb Fast Bot Ready**\n\nSend a link to leech, forward a file to stream, or reply to a file with `/rename new_name.mp4`")
         return
 
-    # 2. STATUS
     if event.text == '/status' and event.sender_id == ADMIN_ID:
         uptime = get_readable_time(int(time.time() - BOT_START_TIME))
         await event.reply(f"🤖 **Status**\n✅ Online\n⏳ Uptime: `{uptime}`\n⚙️ Active Tasks: `{len(cancel_tasks)}`")
         return
 
-    # 3. LEECH (URL to Telegram)
+    # LEECH 
     if event.text and event.text.startswith("http"):
         if event.chat_id in cancel_tasks:
             await event.reply("⚠️ You already have an active process. Wait or cancel it.")
@@ -280,15 +277,15 @@ async def handle_new_message(event):
             if not any(filename.lower().endswith(ext) for ext in['.mp4', '.mkv', '.avi', '.mov', '.webm']):
                 filename += ".mp4"
 
-            if file_size > 2000 * 1024 * 1024:
-                await msg.edit("❌ Error: File is larger than 2GB.")
+            # 4GB limit for Premium, 2GB for normal
+            if file_size > 4000 * 1024 * 1024:
+                await msg.edit("❌ Error: File is larger than 4GB.")
                 del cancel_tasks[event.chat_id]
                 return
 
             progress = {'downloaded': 0}
             start_time = {'start': time.time(), 'last_update': 0}
 
-            # MULTI-PART DOWNLOAD
             if accept_ranges and file_size > (5 * 1024 * 1024):
                 CONNECTIONS = 8
                 chunk_size = file_size // CONNECTIONS
@@ -304,7 +301,6 @@ async def handle_new_message(event):
                     tasks.append(download_chunk(url, start, end, filename, progress, cancel_event))
 
                 updater_task = asyncio.create_task(update_download_progress(msg, progress, file_size, filename, start_time, cancel_event))
-                
                 await asyncio.gather(*tasks)
                 updater_task.cancel()
             else:
@@ -324,7 +320,6 @@ async def handle_new_message(event):
             start_time = {'start': time.time(), 'last_update': 0}
 
             uploaded_file = await upload_file_fast(client, filename, msg, start_time, filename, cancel_event)
-            
             await msg.edit(f"⏳ **Finalizing Video processing...**\n🎬 `{filename}`")
             
             await client.send_file(
@@ -332,9 +327,7 @@ async def handle_new_message(event):
                 file=uploaded_file,
                 caption=f"✅ `{filename}`",
                 supports_streaming=True, 
-                attributes=[types.DocumentAttributeVideo(
-                    duration=0, w=1280, h=720, supports_streaming=True
-                )]
+                attributes=[types.DocumentAttributeVideo(duration=0, w=1280, h=720, supports_streaming=True)]
             )
             await msg.delete()
 
@@ -349,7 +342,7 @@ async def handle_new_message(event):
                 del cancel_tasks[event.chat_id]
         return
 
-    # 4. STREAM / RENAME (File -> URL)
+    # STREAM / RENAME 
     if event.file or (event.is_reply and event.text and event.text.startswith('/rename')):
         target_msg = event
         custom_name = None
@@ -366,13 +359,12 @@ async def handle_new_message(event):
         code = secrets.token_urlsafe(8)
         link_storage[code] = {'msg': target_msg, 'timestamp': time.time()}
         
-        # FIX: Ensure there is no double slash (//) when generating the URL
         app_url = os.environ.get("KOYEB_PUBLIC_URL", "")
         if not app_url:
              app_name = os.environ.get("KOYEB_APP_NAME", "your-app-name")
              app_url = f"https://{app_name}.koyeb.app"
              
-        app_url = app_url.rstrip('/') # Removes accidental trailing slashes
+        app_url = app_url.rstrip('/')
 
         original_name = target_msg.file.name or 'video.mp4'
         final_name = custom_name if custom_name else original_name
