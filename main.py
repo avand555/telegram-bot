@@ -14,41 +14,43 @@ from telethon.network import ConnectionTcpFull
 from telethon.tl.functions.upload import SaveBigFilePartRequest, SaveFilePartRequest
 from telethon.tl.types import InputFileBig, InputFile
 
-# Web Server Imports
-from aiohttp import web, ClientSession
+# Web Server & Vidmoly Imports
+from aiohttp import web, ClientSession, FormData, MultipartWriter
 import aiohttp
 
 # --- CONFIGURATION ---
 API_ID = os.environ.get("API_ID")
 API_HASH = os.environ.get("API_HASH")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-
-# ADDED YOUR VIDMOLY API KEY
 VIDMOLY_API_KEY = os.environ.get("VIDMOLY_API_KEY", "547285kdjw3pg3e303au64")
 
 BOT_START_TIME = time.time()
-
-# --- USER AND ADMIN MANAGEMENT ---
 ALLOWED_USERS = {716887656, 1053544356} 
 ADMIN_ID = 716887656  
 EXPIRATION_TIME = 24 * 60 * 60 
 
-# Global Dictionary
 cancel_tasks = {}
 routes = web.RouteTableDef()
 link_storage = {}
 
-# --- SETUP ---
-client = TelegramClient(
-    'bot_session', 
-    int(API_ID), 
-    API_HASH, 
-    connection=ConnectionTcpFull,
-    use_ipv6=False, 
-    device_model="Koyeb Fast Server",
-    system_version="Linux",
-    app_version="8.0.0 (Vidmoly Integration)"
-)
+# --- CUSTOM TRACKER FOR VIDMOLY UPLOAD SPEED ---
+class ProgressFile(object):
+    def __init__(self, filename, callback):
+        self._filename = filename
+        self._size = os.path.getsize(filename)
+        self._read_bytes = 0
+        self._callback = callback
+
+    def __len__(self):
+        return self._size
+
+    def read(self, size):
+        chunk = open(self._filename, 'rb')
+        chunk.seek(self._read_bytes)
+        data = chunk.read(size)
+        self._read_bytes += len(data)
+        asyncio.create_task(self._callback(self._read_bytes, self._size))
+        return data
 
 # --- HELPER FUNCTIONS ---
 def get_readable_time(seconds: int) -> str:
@@ -95,7 +97,19 @@ async def progress_callback(current, total, event, start_time, filename, action=
         )
     except Exception: pass
 
-# --- IDM MULTI-PART DOWNLOAD ENGINE ---
+# --- SETUP CLIENT ---
+client = TelegramClient(
+    'bot_session', 
+    int(API_ID), 
+    API_HASH, 
+    connection=ConnectionTcpFull,
+    use_ipv6=False, 
+    device_model="Koyeb Fast Server",
+    system_version="Linux",
+    app_version="9.0.0"
+)
+
+# --- IDM MULTI-PART DOWNLOAD ENGINE (Leech) ---
 async def download_chunk(url, start, end, filename, progress, cancel_event):
     headers = {'Range': f'bytes={start}-{end}'}
     async with ClientSession() as session:
@@ -107,30 +121,20 @@ async def download_chunk(url, start, end, filename, progress, cancel_event):
                     f.write(chunk)
                     progress['downloaded'] += len(chunk)
 
-async def update_download_progress(msg, progress, total, filename, start_time, cancel_event):
-    while progress['downloaded'] < total:
-        if cancel_event.is_set(): break
-        await progress_callback(progress['downloaded'], total, msg, start_time, filename, "⬇️ **Downloading (IDM Engine)**")
-        await asyncio.sleep(4)
-    await progress_callback(total, total, msg, start_time, filename, "⬇️ **Downloading (IDM Engine)**")
-
-# --- FAST UPLOAD ENGINE ---
+# --- FAST UPLOAD ENGINE (Telegram) ---
 async def upload_file_fast(client, file_path, msg, start_time, filename, cancel_event):
     file_size = os.path.getsize(file_path)
     part_size = 512 * 1024 
     total_parts = math.ceil(file_size / part_size)
     is_big = file_size > 10 * 1024 * 1024
     file_id = random.getrandbits(63)
-    
     uploaded_bytes = 0
     
     async def upload_part(part_index, chunk):
         nonlocal uploaded_bytes
         if cancel_event.is_set(): raise asyncio.CancelledError()
-        if is_big:
-            await client(SaveBigFilePartRequest(file_id, part_index, total_parts, chunk))
-        else:
-            await client(SaveFilePartRequest(file_id, part_index, chunk))
+        if is_big: await client(SaveBigFilePartRequest(file_id, part_index, total_parts, chunk))
+        else: await client(SaveFilePartRequest(file_id, part_index, chunk))
         uploaded_bytes += len(chunk)
 
     tasks =[]
@@ -139,107 +143,57 @@ async def upload_file_fast(client, file_path, msg, start_time, filename, cancel_
             if cancel_event.is_set(): raise asyncio.CancelledError()
             chunk = f.read(part_size)
             tasks.append(upload_part(i, chunk))
-            
             if len(tasks) >= 12:
                 await asyncio.gather(*tasks)
                 tasks =[]
-                await progress_callback(uploaded_bytes, file_size, msg, start_time, filename, "⬆️ **Uploading (Fast Engine)**")
-        
-        if tasks:
-            await asyncio.gather(*tasks)
-            await progress_callback(uploaded_bytes, file_size, msg, start_time, filename, "⬆️ **Uploading (Fast Engine)**")
-            
-    name = os.path.basename(file_path)
-    return InputFileBig(file_id, total_parts, name) if is_big else InputFile(file_id, total_parts, name, '')
+                await progress_callback(uploaded_bytes, file_size, msg, start_time, filename, "⬆️ **Uploading**")
+        if tasks: await asyncio.gather(*tasks)
+    return InputFileBig(file_id, total_parts, os.path.basename(file_path)) if is_big else InputFile(file_id, total_parts, os.path.basename(file_path), '')
 
-
-# --- WEB SERVER ROUTES (FIXED FOR IDM) ---
-@routes.get('/')
-async def root(request):
-    return web.Response(text="✅ Fast Bot is Online on Koyeb")
-
+# --- WEB SERVER (Direct Links) ---
 @routes.get('/{code}/{filename}')
 async def stream_handler(request):
     code = request.match_info['code']
     data = link_storage.get(code)
-    
-    if not data or (time.time() - data['timestamp'] > EXPIRATION_TIME):
-        if data: del link_storage[code]
-        return web.Response(text="❌ Link Expired or Bot Restarted", status=410)
+    if not data: return web.Response(text="❌ Expired", status=410)
     
     message = data['msg']
     file_name = unquote(request.match_info['filename']) 
-    file_size = message.file.size if getattr(message, 'file', None) else 0
+    file_size = message.file.size
     
-    if file_size == 0:
-        return web.Response(text="❌ Invalid Telegram File", status=400)
-
-    mime_type, _ = mimetypes.guess_type(file_name)
-    if not mime_type: mime_type = 'application/octet-stream'
-
     range_header = request.headers.get('Range')
-    start = 0
-    end = file_size - 1
-
+    start, end = 0, file_size - 1
     if range_header:
         match = re.match(r'bytes=(\d+)-(\d*)', range_header)
         if match:
             start = int(match.group(1))
-            if match.group(2):
-                end = int(match.group(2))
-                
-    if start >= file_size:
-        return web.Response(status=416, headers={'Content-Range': f'bytes */{file_size}'})
+            if match.group(2): end = int(match.group(2))
 
-    content_length = end - start + 1
-    
     headers = {
         'Content-Disposition': f'attachment; filename="{file_name}"', 
-        'Content-Type': mime_type,
-        'Content-Length': str(content_length),
-        'Accept-Ranges': 'bytes'
+        'Content-Type': mimetypes.guess_type(file_name)[0] or 'application/octet-stream',
+        'Content-Length': str(end - start + 1), 'Accept-Ranges': 'bytes'
     }
-
-    if range_header:
-        headers['Content-Range'] = f'bytes {start}-{end}/{file_size}'
-        response = web.StreamResponse(status=206, headers=headers)
-    else:
-        response = web.StreamResponse(status=200, headers=headers)
-        
-    try:
-        await response.prepare(request)
-    except Exception:
-        return response
-
-    request_size = 1048576 # Exactly 1 MB
-    offset = (start // request_size) * request_size
+    response = web.StreamResponse(status=206 if range_header else 200, headers=headers)
+    await response.prepare(request)
+    
+    offset = (start // 1048576) * 1048576
     skip = start - offset
-    bytes_to_send = content_length
+    bytes_to_send = end - start + 1
 
     try:
-        async for chunk in client.iter_download(message.media, offset=offset, request_size=request_size):
+        async for chunk in client.iter_download(message.media, offset=offset, request_size=1048576):
             if skip > 0:
-                chunk = chunk[skip:]
-                skip = 0
-            
+                chunk = chunk[skip:]; skip = 0
             if bytes_to_send <= len(chunk):
-                await response.write(chunk[:bytes_to_send])
-                break
-            else:
-                await response.write(chunk)
-                bytes_to_send -= len(chunk)
-                
-    except (asyncio.CancelledError, ConnectionResetError):
-        pass 
-    except Exception as e:
-        print(f"Stream Download Error: {e}") 
-        
+                await response.write(chunk[:bytes_to_send]); break
+            await response.write(chunk); bytes_to_send -= len(chunk)
+    except: pass
     return response
 
-# --- TELEGRAM EVENTS ---
+# --- BOT HANDLERS ---
 @client.on(events.CallbackQuery(pattern="cancel_leech"))
 async def cancel_handler(event):
-    if event.sender_id not in ALLOWED_USERS: return
     if event.chat_id in cancel_tasks:
         cancel_tasks[event.chat_id].set()
         await event.edit("🛑 **Task Cancelled.**")
@@ -248,265 +202,118 @@ async def cancel_handler(event):
 async def handle_new_message(event):
     if event.sender_id not in ALLOWED_USERS: return
     
-    # 1. HELP
     if event.text == '/start':
-        await event.reply(
-            "👋 **Combined IDM & Vidmoly Bot Ready!**\n\n"
-            "🔗 **Send a link:** Leech & upload to Telegram.\n"
-            "📁 **Forward a file:** Get a direct IDM download link.\n"
-            "✏️ **Reply with `/rename[name]`:** Get a renamed IDM link.\n"
-            "☁️ **Reply with `/vidmoly`:** Upload file to Vidmoly."
-        )
+        await event.reply("✅ **IDM & Vidmoly Bot Ready!**\nReply to any video with `/vidmoly` or `/rename name.mp4`")
         return
 
-    # 2. STATUS
-    if event.text == '/status' and event.sender_id == ADMIN_ID:
-        uptime = get_readable_time(int(time.time() - BOT_START_TIME))
-        await event.reply(f"🤖 **Status**\n✅ Online\n⏳ Uptime: `{uptime}`\n⚙️ Active Tasks: `{len(cancel_tasks)}`")
-        return
-
-    # 3. LEECH (URL to Telegram)
-    if event.text and event.text.startswith("http"):
-        if event.chat_id in cancel_tasks:
-            await event.reply("⚠️ You already have an active process. Wait or cancel it.")
-            return
-        
-        url = event.text.strip()
-        msg = await event.reply("🔗 **Analyzing Link...**")
-        cancel_event = asyncio.Event()
-        cancel_tasks[event.chat_id] = cancel_event
-
-        filename = "video.mp4"
-        file_size = 0
-        accept_ranges = False
-
-        try:
-            async with ClientSession() as session:
-                try:
-                    async with session.head(url, allow_redirects=True, timeout=10) as resp:
-                        file_size = int(resp.headers.get("Content-Length", 0))
-                        accept_ranges = resp.headers.get("Accept-Ranges") == "bytes"
-                        
-                        if "Content-Disposition" in resp.headers:
-                            fname = re.findall('filename="?([^"]+)"?', resp.headers["Content-Disposition"])
-                            if fname: filename = fname[0]
-                        else:
-                            filename = unquote(url.split("/")[-1].split("?")[0]) or "video"
-                except: pass
-            
-            filename = re.sub(r'[\\/*?:"<>|]', "", filename)
-            if not any(filename.lower().endswith(ext) for ext in['.mp4', '.mkv', '.avi', '.mov', '.webm']):
-                filename += ".mp4"
-
-            if file_size > 4000 * 1024 * 1024:
-                await msg.edit("❌ Error: File is larger than 4GB.")
-                del cancel_tasks[event.chat_id]
-                return
-
-            progress = {'downloaded': 0}
-            start_time = {'start': time.time(), 'last_update': 0}
-
-            if accept_ranges and file_size > (5 * 1024 * 1024):
-                CONNECTIONS = 8
-                chunk_size = file_size // CONNECTIONS
-                
-                with open(filename, 'wb') as f:
-                    f.seek(file_size - 1)
-                    f.write(b'\0')
-
-                tasks =[]
-                for i in range(CONNECTIONS):
-                    start = i * chunk_size
-                    end = start + chunk_size - 1 if i < CONNECTIONS - 1 else file_size - 1
-                    tasks.append(download_chunk(url, start, end, filename, progress, cancel_event))
-
-                updater_task = asyncio.create_task(update_download_progress(msg, progress, file_size, filename, start_time, cancel_event))
-                await asyncio.gather(*tasks)
-                updater_task.cancel()
-            else:
-                updater_task = asyncio.create_task(update_download_progress(msg, progress, file_size or 1, filename, start_time, cancel_event))
-                async with ClientSession() as session:
-                    async with session.get(url) as resp:
-                        with open(filename, 'wb') as f:
-                            async for chunk in resp.content.iter_chunked(1024 * 1024):
-                                if cancel_event.is_set(): raise asyncio.CancelledError()
-                                f.write(chunk)
-                                progress['downloaded'] += len(chunk)
-                updater_task.cancel()
-
-            if cancel_event.is_set(): raise asyncio.CancelledError()
-
-            await msg.edit(f"⬆️ **Starting Fast Upload...**\n🎬 `{filename}`", buttons=[[Button.inline("❌ Cancel", data="cancel_leech")]])
-            start_time = {'start': time.time(), 'last_update': 0}
-
-            uploaded_file = await upload_file_fast(client, filename, msg, start_time, filename, cancel_event)
-            await msg.edit(f"⏳ **Finalizing Video processing...**\n🎬 `{filename}`")
-            
-            await client.send_file(
-                event.chat_id,
-                file=uploaded_file,
-                caption=f"✅ `{filename}`",
-                supports_streaming=True, 
-                attributes=[types.DocumentAttributeVideo(duration=0, w=1280, h=720, supports_streaming=True)]
-            )
-            await msg.delete()
-
-        except asyncio.CancelledError:
-            await msg.edit("🛑 **Task Cancelled.**")
-        except Exception as e:
-            await msg.edit(f"❌ Error: {e}")
-        finally:
-            if os.path.exists(filename):
-                os.remove(filename) 
-            if event.chat_id in cancel_tasks:
-                del cancel_tasks[event.chat_id]
-        return
-
-    # 4. VIDMOLY UPLOAD (Reply to file with /vidmoly)
+    # 1. VIDMOLY UPLOAD (Reply with /vidmoly)
     if event.text and event.text.startswith('/vidmoly'):
         if not event.is_reply:
-            await event.reply("⚠️ **Please reply to a video/file with `/vidmoly` to upload it.**")
-            return
+            return await event.reply("⚠️ Reply to a file with `/vidmoly`")
             
         target_msg = await event.get_reply_message()
-        if not target_msg or not target_msg.file:
-            await event.reply("⚠️ **Please reply to a valid video/file.**")
-            return
-
-        msg = await event.reply("⬇️ **Downloading file from Telegram...**")
+        if not target_msg or not target_msg.file: return
         
-        filename = target_msg.file.name or f"vidmoly_video_{int(time.time())}.mp4"
-        filename = re.sub(r'[\\/*?:"<>|]', "", filename)
-        if not '.' in filename: filename += '.mp4'
-
-        progress = {'downloaded': 0}
+        filename = re.sub(r'[\\/*?:"<>|]', "", target_msg.file.name or "video.mp4")
+        msg = await event.reply(f"⬇️ **Downloading from Telegram...**")
         start_time = {'start': time.time(), 'last_update': 0}
-        file_size = target_msg.file.size or 1
-
+        
         try:
-            # 1. Download from Telegram to server safely
+            # Step 1: TG -> Server
             with open(filename, 'wb') as f:
                 async for chunk in client.iter_download(target_msg.media, request_size=1048576):
                     f.write(chunk)
-                    progress['downloaded'] += len(chunk)
-                    
-                    now = time.time()
-                    if now - start_time['last_update'] >= 4:
-                        start_time['last_update'] = now
-                        percentage = (progress['downloaded'] / file_size) * 100
-                        speed = (progress['downloaded'] / (now - start_time['start'])) / 1024 / 1024 if (now - start_time['start']) > 0 else 0
-                        uploaded = progress['downloaded'] / 1024 / 1024
-                        total_size = file_size / 1024 / 1024
-                        await msg.edit(
-                            f"⬇️ **Downloading from Telegram...**\n\n"
-                            f"🎬 `{filename}`\n"
-                            f"📊 `{percentage:.2f}%`\n"
-                            f"🚀 `{speed:.2f} MB/s`\n"
-                            f"💾 `{uploaded:.2f} / {total_size:.2f} MB`"
-                        )
+                    await progress_callback(f.tell(), target_msg.file.size, msg, start_time, filename, "⬇️ **TG Download**")
 
-            await msg.edit(f"⬆️ **Uploading to Vidmoly...**\n🎬 `{filename}`\n\n*(This is very fast, please wait)*")
+            # Step 2: Server -> Vidmoly
+            await msg.edit(f"⬆️ **Uploading to Vidmoly...**")
+            start_time = {'start': time.time(), 'last_update': 0}
             
-            # 2. Communicate with Vidmoly API
             async with ClientSession() as session:
                 async with session.get(f"https://vidmoly.me/api/upload/server?key={VIDMOLY_API_KEY}") as r:
                     res = await r.json(content_type=None)
-                    if res.get('status') != 200:
-                        await msg.edit(f"❌ **Vidmoly Error:** Failed to get upload server.")
-                        return
                     upload_url = res['result']
                 
-                # 3. Upload file to Vidmoly Server
-                data = aiohttp.FormData()
+                # Wrap file to track upload speed
+                wrapped_file = ProgressFile(filename, lambda c, t: progress_callback(c, t, msg, start_time, filename, "⬆️ **Vidmoly Upload**"))
+                
+                data = FormData()
                 data.add_field('api_key', VIDMOLY_API_KEY)
-                data.add_field('file', open(filename, 'rb'), filename=filename)
+                data.add_field('file', wrapped_file, filename=filename)
                 
                 async with session.post(upload_url, data=data) as r:
-                    try:
-                        upload_res = await r.json(content_type=None)
-                        if isinstance(upload_res, list) and len(upload_res) > 0 and 'file_code' in upload_res[0]:
-                            file_code = upload_res[0]['file_code']
-                            vidmoly_link = f"https://vidmoly.me/{file_code}.html"
-                            await msg.edit(f"✅ **Successfully Uploaded to Vidmoly!**\n\n🎬 `{filename}`\n🔗 {vidmoly_link}")
-                        else:
-                            await msg.edit(f"❌ **Vidmoly Upload Error:** Unrecognized response.\n`{upload_res}`")
-                    except Exception as parse_e:
-                        text_res = await r.text()
-                        match = re.search(r'name="fn">([a-zA-Z0-9]+)<', text_res)
-                        if match:
-                            file_code = match.group(1)
-                            vidmoly_link = f"https://vidmoly.me/{file_code}.html"
-                            await msg.edit(f"✅ **Successfully Uploaded to Vidmoly!**\n\n🎬 `{filename}`\n🔗 {vidmoly_link}")
-                        else:
-                            await msg.edit(f"❌ **Vidmoly Upload Error:** Failed to parse.\n`{text_res[:100]}`")
-
-        except Exception as e:
-            await msg.edit(f"❌ **Error:** {e}")
+                    text_res = await r.text()
+                    match = re.search(r'name="fn">([a-zA-Z0-9]+)<', text_res)
+                    if match:
+                        f_code = match.group(1)
+                        # EXACT EMBED LINK AS REQUESTED
+                        embed = f"https://vidmoly.biz/embed-{f_code}.html"
+                        direct = f"https://vidmoly.me/{f_code}.html"
+                        await msg.edit(f"✅ **Upload Complete!**\n\n🎬 `{filename}`\n\n🔗 **Direct:** {direct}\n🖼 **Embed:** {embed}")
+                    else:
+                        await msg.edit("❌ Upload failed. Check Vidmoly API.")
+        except Exception as e: await msg.edit(f"❌ Error: {e}")
         finally:
-            if os.path.exists(filename):
-                os.remove(filename)
+            if os.path.exists(filename): os.remove(filename)
         return
 
-    # 5. STREAM / RENAME (File -> URL)
+    # 2. LEECH (URL -> TG)
+    if event.text and event.text.startswith("http"):
+        url = event.text.strip()
+        msg = await event.reply("🔗 **Connecting...**")
+        cancel_event = asyncio.Event()
+        cancel_tasks[event.chat_id] = cancel_event
+        
+        try:
+            async with ClientSession() as session:
+                async with session.get(url) as resp:
+                    filename = unquote(url.split("/")[-1].split("?")[0]) or "video.mp4"
+                    file_size = int(resp.headers.get("Content-Length", 0))
+                    
+                    with open(filename, 'wb') as f:
+                        start_time = {'start': time.time(), 'last_update': 0}
+                        async for chunk in resp.content.iter_chunked(1024*1024):
+                            if cancel_event.is_set(): raise asyncio.CancelledError()
+                            f.write(chunk)
+                            await progress_callback(f.tell(), file_size, msg, start_time, filename, "⬇️ **Downloading**")
+            
+            start_time = {'start': time.time(), 'last_update': 0}
+            up_file = await upload_file_fast(client, filename, msg, start_time, filename, cancel_event)
+            await client.send_file(event.chat_id, file=up_file, caption=f"✅ `{filename}`", supports_streaming=True)
+            await msg.delete()
+        except Exception as e: await msg.edit(f"❌ Error: {e}")
+        finally:
+            if os.path.exists(filename): os.remove(filename)
+            cancel_tasks.pop(event.chat_id, None)
+        return
+
+    # 3. STREAM/RENAME (Forward -> Direct Link)
     if event.file or (event.text and event.text.startswith('/rename')):
+        target = await event.get_reply_message() if event.is_reply else event
+        if not target or not target.file: return
         
-        if event.text and event.text.startswith('/rename'):
-            if not event.is_reply:
-                await event.reply("⚠️ **Please reply to a video/file with `/rename new_name.mp4` to rename it.**")
-                return
-                
-            target_msg = await event.get_reply_message()
-            if not target_msg or not target_msg.file:
-                await event.reply("⚠️ **Please reply to a valid video/file to rename it.**")
-                return
-            
-            custom_name = event.text.split(' ', 1)[1].strip() if ' ' in event.text else 'video.mp4'
-            if not '.' in custom_name: custom_name += '.mp4' 
-        else:
-            target_msg = event
-            custom_name = None
-
         code = secrets.token_urlsafe(8)
-        link_storage[code] = {'msg': target_msg, 'timestamp': time.time()}
+        link_storage[code] = {'msg': target, 'timestamp': time.time()}
         
-        app_url = os.environ.get("KOYEB_PUBLIC_URL", "")
-        if not app_url:
-             app_name = os.environ.get("KOYEB_APP_NAME", "your-app-name")
-             app_url = f"https://{app_name}.koyeb.app"
-             
-        app_url = app_url.rstrip('/')
+        name = event.text.split(' ', 1)[1] if event.text.startswith('/rename') else target.file.name or "video.mp4"
+        if not '.' in name: name += ".mp4"
+        
+        base = os.environ.get("KOYEB_PUBLIC_URL", "").rstrip('/')
+        if not base: base = f"https://{os.environ.get('KOYEB_APP_NAME')}.koyeb.app"
+        
+        hotlink = f"{base}/{code}/{quote(name)}"
+        await event.reply(f"✅ **Direct Link Generated!**\n\n📂 `{name}`\n🔗 `{hotlink}`")
 
-        original_name = target_msg.file.name or 'video.mp4'
-        final_name = custom_name if custom_name else original_name
-        
-        hotlink = f"{app_url}/{code}/{quote(final_name)}"
-        
-        text = f"✅ **Link Generated!**\n\n"
-        if custom_name:
-            text += f"✏️ **Renamed to:** `{final_name}`\n\n"
-        else:
-            text += f"📂 `{final_name}`\n💡 *Tip: Reply to this file with `/rename new_name.mp4` to change its name!*\n\n"
-            
-        text += f"🔗 `{hotlink}`"
-        
-        await event.reply(text)
-
-# --- MAIN EXECUTION ---
+# --- STARTUP ---
 async def main():
     asyncio.create_task(cleanup_loop())
     app = web.Application()
     app.add_routes(routes)
     runner = web.AppRunner(app)
     await runner.setup()
-    
-    port = int(os.environ.get("PORT", 8000)) 
-    site = web.TCPSite(runner, '0.0.0.0', port)
-    await site.start()
-    print(f"✅ Server started on port {port}")
-
+    await web.TCPSite(runner, '0.0.0.0', int(os.environ.get("PORT", 8000))).start()
     await client.start(bot_token=BOT_TOKEN)
     await client.run_until_disconnected()
 
 if __name__ == '__main__':
-    try: asyncio.run(main())
-    except KeyboardInterrupt: pass
+    asyncio.run(main())
