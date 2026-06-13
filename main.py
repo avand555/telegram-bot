@@ -33,22 +33,6 @@ cancel_tasks = {}
 routes = web.RouteTableDef()
 link_storage = {}
 
-# --- PROGRESS TRACKER ---
-class ProgressFile(object):
-    def __init__(self, filename, callback):
-        self._filename = filename
-        self._size = os.path.getsize(filename)
-        self._read_bytes = 0
-        self._callback = callback
-    def __len__(self): return self._size
-    def read(self, size):
-        with open(self._filename, 'rb') as f:
-            f.seek(self._read_bytes)
-            data = f.read(size)
-        self._read_bytes += len(data)
-        asyncio.create_task(self._callback(self._read_bytes, self._size))
-        return data
-
 # --- HELPER FUNCTIONS ---
 def get_readable_time(seconds: int) -> str:
     result = ""
@@ -80,7 +64,7 @@ async def progress_callback(current, total, event, start_time, filename, action=
 client = TelegramClient(
     'bot_session', int(API_ID), API_HASH,
     connection=ConnectionTcpFull, use_ipv6=False,
-    device_model="Koyeb Server", system_version="Linux", app_version="9.0.0"
+    device_model="Koyeb Server", system_version="Linux", app_version="10.0.0"
 )
 
 # --- UPLOAD ENGINE ---
@@ -103,7 +87,7 @@ async def upload_file_fast(client, file_path, msg, start_time, filename, cancel_
             if cancel_event.is_set(): raise asyncio.CancelledError()
             chunk = f.read(part_size)
             tasks.append(upload_part(i, chunk))
-            if len(tasks) >= 8: # Reduced for Koyeb Free Tier stability
+            if len(tasks) >= 8:
                 await asyncio.gather(*tasks)
                 tasks = []
                 await progress_callback(uploaded_bytes, file_size, msg, start_time, filename, "⬆️ **Uploading**")
@@ -195,18 +179,43 @@ async def handle_new_message(event):
         cancel_tasks[event.chat_id] = cancel_event
         try:
             async with ClientSession() as session:
-                async with session.get(url) as resp:
+                async with session.get(url, timeout=15) as resp:
+                    # CHECK FOR HTML OR ERRORS
+                    content_type = resp.headers.get("Content-Type", "")
+                    if "text/html" in content_type:
+                        return await msg.edit("❌ **Error:** The link provided is a webpage (HTML), not a direct video file.")
+                    if resp.status != 200:
+                        return await msg.edit(f"❌ **Link Error:** Server returned status `{resp.status}`")
+
                     filename = unquote(url.split("/")[-1].split("?")[0]) or "video.mp4"
+                    # Ensure extension is video for player compatibility
+                    if not any(filename.lower().endswith(x) for x in ['.mp4', '.mkv', '.avi', '.mov']):
+                        filename += ".mp4"
+                    
                     file_size = int(resp.headers.get("Content-Length", 0))
+                    
                     with open(filename, 'wb') as f:
                         start_time = {'start': time.time(), 'last_update': 0}
                         async for chunk in resp.content.iter_chunked(1024*1024):
                             if cancel_event.is_set(): raise asyncio.CancelledError()
                             f.write(chunk)
                             await progress_callback(f.tell(), file_size, msg, start_time, filename, "⬇️ **Downloading**")
+            
+            # UPLOAD AS VIDEO
             start_time = {'start': time.time(), 'last_update': 0}
             up_file = await upload_file_fast(client, filename, msg, start_time, filename, cancel_event)
-            await client.send_file(event.chat_id, file=up_file, caption=f"✅ `{filename}`", supports_streaming=True)
+            
+            await client.send_file(
+                event.chat_id, 
+                file=up_file, 
+                caption=f"✅ `{filename}`", 
+                supports_streaming=True, # Makes it playable
+                attributes=[types.DocumentAttributeVideo(
+                    duration=0, # Duration 0 is fine, Telegram calculates it on play
+                    w=1280, h=720, # Dummy size to trigger video player
+                    supports_streaming=True
+                )]
+            )
             await msg.delete()
         except Exception as e: await msg.edit(f"❌ Error: {e}")
         finally:
@@ -214,13 +223,14 @@ async def handle_new_message(event):
             cancel_tasks.pop(event.chat_id, None)
         return
 
-    # DIRECT LINK
+    # DIRECT LINK / RENAME
     if event.file or (event.text and event.text.startswith('/rename')):
         target = await event.get_reply_message() if event.is_reply else event
         if not target or not target.file: return
         code = secrets.token_urlsafe(8)
         link_storage[code] = {'msg': target, 'timestamp': time.time()}
         name = event.text.split(' ', 1)[1] if event.text.startswith('/rename') else target.file.name or "video.mp4"
+        if not '.' in name: name += ".mp4"
         base = os.environ.get("KOYEB_PUBLIC_URL", "").rstrip('/')
         if not base: base = f"https://{os.environ.get('KOYEB_APP_NAME')}.koyeb.app"
         await event.reply(f"✅ **Link:** `{base}/{code}/{quote(name)}`")
@@ -233,7 +243,6 @@ async def main():
     await runner.setup()
     port = int(os.environ.get("PORT", 8000))
     await web.TCPSite(runner, '0.0.0.0', port).start()
-    print(f"✅ Web Server started on port {port}")
     
     await client.start(bot_token=BOT_TOKEN)
     print("✅ Bot Connected")
