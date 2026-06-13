@@ -8,6 +8,10 @@ import math
 import random
 from urllib.parse import quote, unquote
 
+# Metadata Extraction
+from hachoir.metadata import extractMetadata
+from hachoir.parser import createParser
+
 # Telegram Imports
 from telethon import TelegramClient, events, types, Button
 from telethon.network import ConnectionTcpFull
@@ -33,6 +37,24 @@ cancel_tasks = {}
 routes = web.RouteTableDef()
 link_storage = {}
 
+# --- VIDEO METADATA HELPER ---
+def get_video_info(file_path):
+    metadata = {'duration': 0, 'width': 1280, 'height': 720}
+    try:
+        parser = createParser(file_path)
+        if not parser: return metadata
+        with parser:
+            data = extractMetadata(parser)
+            if data:
+                if data.has('duration'):
+                    metadata['duration'] = int(data.get('duration').seconds)
+                if data.has('width'):
+                    metadata['width'] = int(data.get('width'))
+                if data.has('height'):
+                    metadata['height'] = int(data.get('height'))
+    except: pass
+    return metadata
+
 # --- HELPER FUNCTIONS ---
 def get_readable_time(seconds: int) -> str:
     result = ""
@@ -52,7 +74,7 @@ async def progress_callback(current, total, event, start_time, filename, action=
     percentage = current * 100 / total if total else 0
     speed = (current / (now - start_time['start'])) / 1024 / 1024 if (now - start_time['start']) > 0 else 0
     uploaded = current / 1024 / 1024
-    total_size = total / 1024 / 1024 if total else 0
+    total_size = total / 1024 / 1024
     try:
         await event.edit(
             f"{action}...\n\n🎬 `{filename}`\n📊 `{percentage:.2f}%` 🚀 `{speed:.2f} MB/s`\n💾 `{uploaded:.2f} / {total_size:.2f} MB`",
@@ -96,8 +118,7 @@ async def upload_file_fast(client, file_path, msg, start_time, filename, cancel_
 
 # --- WEB SERVER ROUTES ---
 @routes.get('/')
-async def root(request):
-    return web.Response(text="✅ Bot is Online", status=200)
+async def root(request): return web.Response(text="✅ Online")
 
 @routes.get('/{code}/{filename}')
 async def stream_handler(request):
@@ -136,7 +157,7 @@ async def stream_handler(request):
 async def handle_new_message(event):
     if event.sender_id not in ALLOWED_USERS: return
     if event.text == '/start':
-        await event.reply("✅ **Bot Ready!**\nSend link to Leech or forward file for IDM link.")
+        await event.reply("✅ **Bot Ready!**")
         return
 
     # VIDMOLY
@@ -180,18 +201,11 @@ async def handle_new_message(event):
         try:
             async with ClientSession() as session:
                 async with session.get(url, timeout=15) as resp:
-                    # CHECK FOR HTML OR ERRORS
-                    content_type = resp.headers.get("Content-Type", "")
-                    if "text/html" in content_type:
-                        return await msg.edit("❌ **Error:** The link provided is a webpage (HTML), not a direct video file.")
-                    if resp.status != 200:
-                        return await msg.edit(f"❌ **Link Error:** Server returned status `{resp.status}`")
-
-                    filename = unquote(url.split("/")[-1].split("?")[0]) or "video.mp4"
-                    # Ensure extension is video for player compatibility
-                    if not any(filename.lower().endswith(x) for x in ['.mp4', '.mkv', '.avi', '.mov']):
-                        filename += ".mp4"
+                    if "text/html" in resp.headers.get("Content-Type", ""):
+                        return await msg.edit("❌ Error: Webpage link detected.")
                     
+                    filename = unquote(url.split("/")[-1].split("?")[0]) or "video.mp4"
+                    if not any(filename.lower().endswith(x) for x in ['.mp4', '.mkv', '.avi']): filename += ".mp4"
                     file_size = int(resp.headers.get("Content-Length", 0))
                     
                     with open(filename, 'wb') as f:
@@ -201,18 +215,18 @@ async def handle_new_message(event):
                             f.write(chunk)
                             await progress_callback(f.tell(), file_size, msg, start_time, filename, "⬇️ **Downloading**")
             
-            # UPLOAD AS VIDEO
+            # GET METADATA
+            v_info = get_video_info(filename)
+            
             start_time = {'start': time.time(), 'last_update': 0}
             up_file = await upload_file_fast(client, filename, msg, start_time, filename, cancel_event)
             
             await client.send_file(
-                event.chat_id, 
-                file=up_file, 
-                caption=f"✅ `{filename}`", 
-                supports_streaming=True, # Makes it playable
+                event.chat_id, file=up_file, caption=f"✅ `{filename}`", 
+                supports_streaming=True,
                 attributes=[types.DocumentAttributeVideo(
-                    duration=0, # Duration 0 is fine, Telegram calculates it on play
-                    w=1280, h=720, # Dummy size to trigger video player
+                    duration=v_info['duration'], 
+                    w=v_info['width'], h=v_info['height'], 
                     supports_streaming=True
                 )]
             )
@@ -235,17 +249,13 @@ async def handle_new_message(event):
         if not base: base = f"https://{os.environ.get('KOYEB_APP_NAME')}.koyeb.app"
         await event.reply(f"✅ **Link:** `{base}/{code}/{quote(name)}`")
 
-# --- STARTUP ---
 async def main():
     app = web.Application()
     app.add_routes(routes)
     runner = web.AppRunner(app)
     await runner.setup()
-    port = int(os.environ.get("PORT", 8000))
-    await web.TCPSite(runner, '0.0.0.0', port).start()
-    
+    await web.TCPSite(runner, '0.0.0.0', int(os.environ.get("PORT", 8000))).start()
     await client.start(bot_token=BOT_TOKEN)
-    print("✅ Bot Connected")
     await client.run_until_disconnected()
 
 if __name__ == '__main__':
