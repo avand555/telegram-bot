@@ -6,6 +6,7 @@ import time
 import re
 import math
 import random
+import io
 from urllib.parse import quote, unquote
 
 # Telegram Imports
@@ -15,7 +16,7 @@ from telethon.tl.functions.upload import SaveBigFilePartRequest, SaveFilePartReq
 from telethon.tl.types import InputFileBig, InputFile
 
 # Web & API Imports
-from aiohttp import web, ClientSession, FormData
+from aiohttp import web, ClientSession, FormData, TCPConnector
 import aiohttp
 
 # --- 1. CONFIGURATION ---
@@ -29,16 +30,17 @@ ALLOWED_USERS = {716887656, 1053544356}
 ADMIN_ID = 716887656  
 EXPIRATION_TIME = 24 * 60 * 60 
 
-# --- 2. SETUP CLIENT & STORAGE (Must be before handlers) ---
-client = TelegramClient(
-    'bot_session', int(API_ID), API_HASH,
-    connection=ConnectionTcpFull, use_ipv6=False,
-    device_model="Koyeb Server", system_version="Linux", app_version="10.0.0"
-)
-
+# ANTI-CRASH QUEUE
+global_semaphore = asyncio.Semaphore(2)
 cancel_tasks = {}
 link_storage = {}
 routes = web.RouteTableDef()
+
+# --- 2. SETUP CLIENT ---
+client = TelegramClient(
+    'bot_session', int(API_ID), API_HASH,
+    connection=ConnectionTcpFull, use_ipv6=False
+)
 
 # --- 3. SPEED METER HELPER ---
 def get_status_text(action, filename, current, total, start_time):
@@ -60,36 +62,41 @@ def get_status_text(action, filename, current, total, start_time):
             f"⚡ **Speed:** `{human_size(speed)}/s`\n"
             f"📂 **Size:** `{human_size(current)} / {human_size(total)}`")
 
-# --- 4. VIDMOLY PROGRESS WRAPPER ---
-import io
+# --- 4. SAFE VIDMOLY UPLOADER ---
+async def upload_to_vidmoly(filename, status_msg, vidmoly_api_key):
+    start_t = time.time()
+    file_size = os.path.getsize(filename)
+    
+    async with ClientSession() as sess:
+        # Get Upload Server
+        async with sess.get(f"https://vidmoly.me/api/upload/server?key={vidmoly_api_key}") as r:
+            res = await r.json(content_type=None)
+            upload_url = res['result']
 
-class ProgressFile(io.IOBase):
-    def __init__(self, filename, callback):
-        self._file = open(filename, 'rb')
-        self._size = os.path.getsize(filename)
-        self._read_bytes = 0
-        self._callback = callback
+        # Manual multi-part upload to track progress without the "no running loop" error
+        with open(filename, 'rb') as f:
+            data = FormData()
+            data.add_field('api_key', vidmoly_api_key)
+            data.add_field('file', f, filename=filename)
+            
+            # Use aiohttp built-in way to handle body but we track using a loop check
+            async def progress_check():
+                while not upload_task.done():
+                    await asyncio.sleep(4)
+                    current = f.tell()
+                    try:
+                        await status_msg.edit(get_status_text("Vidmoly Uploading", filename, current, file_size, start_t))
+                    except: pass
 
-    def __len__(self):
-        return self._size
+            upload_task = asyncio.create_task(sess.post(upload_url, data=data))
+            asyncio.create_task(progress_check())
+            
+            response = await upload_task
+            res_text = await response.text()
+            match = re.search(r'name="fn">([a-zA-Z0-9]+)<', res_text)
+            return match.group(1) if match else None
 
-    def read(self, size=-1):
-        data = self._file.read(size)
-        self._read_bytes += len(data)
-        # Run the speed meter update
-        asyncio.create_task(self._callback(self._read_bytes, self._size))
-        return data
-
-    def seek(self, offset, whence=io.SEEK_SET):
-        return self._file.seek(offset, whence)
-
-    def tell(self):
-        return self._file.tell()
-
-    def close(self):
-        self._file.close()
-        super().close()
-# --- 5. UPLOAD ENGINE ---
+# --- 5. FAST TG UPLOAD ENGINE ---
 async def fast_upload(client, file_path, msg, filename):
     file_size = os.path.getsize(file_path)
     part_size = 512 * 1024
@@ -134,76 +141,29 @@ async def stream_handler(request):
     if not data: return web.Response(text="Link Expired", status=410)
     
     msg, url_filename = data['msg'], unquote(request.match_info['filename'])
-    file_size = msg.file.size
     range_header = request.headers.get('Range')
-    start, end = 0, file_size - 1
-    
+    start = 0
     if range_header:
-        match = re.search(r'bytes=(\d+)-(\d*)', range_header)
-        if match:
-            start = int(match.group(1))
-            if match.group(2): end = int(match.group(2))
+        match = re.search(r'bytes=(\d+)-', range_header)
+        if match: start = int(match.group(1))
 
     headers = {
         'Content-Disposition': f'attachment; filename="{url_filename}"',
         'Accept-Ranges': 'bytes', 'Content-Type': 'video/mp4',
-        'Content-Length': str(end - start + 1), 'Connection': 'keep-alive'
+        'Content-Length': str(msg.file.size - start), 'Connection': 'keep-alive'
     }
     if request.method == "HEAD": return web.Response(headers=headers)
     
     resp = web.StreamResponse(status=206 if range_header else 200, headers=headers)
     await resp.prepare(request)
     
-    request_size = 1048576 
-    offset = (start // request_size) * request_size
-    skip, bytes_to_send = start - offset, end - start + 1
     try:
-        async for chunk in client.iter_download(msg.media, offset=offset, request_size=request_size):
-            if skip > 0:
-                chunk = chunk[skip:]; skip = 0
-            if bytes_to_send <= len(chunk):
-                await response.write(chunk[:bytes_to_send]); break
-            await response.write(chunk); bytes_to_send -= len(chunk)
+        async for chunk in client.iter_download(msg.media, offset=(start//1048576)*1048576, request_size=1048576):
+            await resp.write(chunk)
     except: pass
     return resp
 
-# --- 7. VIDMOLY UPLOAD ---
-async def do_vidmoly_upload(event, tg_msg):
-    filename = re.sub(r'[\\/*?:"<>|]', "", tg_msg.file.name or "video.mp4")
-    status = await event.edit(f"⬇️ **Starting TG Download...**")
-    start_t = time.time()
-    try:
-        with open(filename, 'wb') as f:
-            async for chunk in client.iter_download(tg_msg.media, request_size=1048576):
-                f.write(chunk)
-                if f.tell() % (5 * 1024 * 1024) == 0:
-                    await status.edit(get_status_text("Downloading from TG", filename, f.tell(), tg_msg.file.size, start_t))
-
-        await status.edit(f"⬆️ **Uploading to Vidmoly...**")
-        async with ClientSession() as sess:
-            async with sess.get(f"https://vidmoly.me/api/upload/server?key={VIDMOLY_API_KEY}") as r:
-                upload_url = (await r.json(content_type=None))['result']
-            
-            async def moly_cb(curr, tot):
-                if curr % (5 * 1024 * 1024) == 0:
-                    try: await status.edit(get_status_text("Vidmoly Uploading", filename, curr, tot, start_t))
-                    except: pass
-
-            data = FormData()
-            data.add_field('api_key', VIDMOLY_API_KEY)
-            data.add_field('file', ProgressFile(filename, moly_cb), filename=filename)
-            async with sess.post(upload_url, data=data) as r:
-                res = await r.text()
-                match = re.search(r'name="fn">([a-zA-Z0-9]+)<', res)
-                if match:
-                    code = match.group(1)
-                    await status.edit(f"✅ **Vidmoly Uploaded!**\n\n🎬 `{filename}`\n🔗 `https://vidmoly.biz/embed-{code}.html`", buttons=[[Button.url("🖼 Open Player", f"https://vidmoly.biz/embed-{code}.html")]])
-                else: await status.edit("❌ Vidmoly Error: API issue.")
-    except Exception as e: await status.edit(f"❌ Error: {e}")
-    finally:
-        if os.path.exists(filename): os.remove(filename)
-
-# --- 8. BOT HANDLERS ---
+# --- 7. BOT HANDLERS ---
 @client.on(events.NewMessage(incoming=True))
 async def handle_new_message(event):
     if event.sender_id not in ALLOWED_USERS: return
@@ -211,49 +171,69 @@ async def handle_new_message(event):
     if event.file:
         await event.reply(f"📂 **File Detected:** `{event.file.name or 'video.mp4'}`",
             buttons=[[Button.inline("🔗 Get Direct Link", data=f"link_{event.id}")],
-                     [Button.inline("☁️ Vidmoly Upload", data=f"moly_{event.id}")]])
+                     [Button.inline("☁️ Upload to Vidmoly", data=f"moly_{event.id}")]])
         return
 
     if event.text and event.text.startswith("http"):
-        url = event.text.split(" -n ")[0].strip()
-        name = event.text.split(" -n ")[1].strip() if " -n " in event.text else "video.mp4"
-        if not "." in name: name += ".mp4"
-        
-        msg = await event.reply("🔗 **Connecting...**")
-        try:
-            async with ClientSession() as sess:
-                async with sess.get(url) as r:
-                    if "text/html" in r.headers.get("Content-Type", ""): return await msg.edit("❌ Error: Webpage detected.")
-                    f_size = int(r.headers.get("Content-Length", 0))
-                    start_t = time.time()
-                    with open(name, 'wb') as f:
-                        async for chunk in r.content.iter_chunked(1024*1024):
-                            f.write(chunk)
-                            if f.tell() % (5 * 1024 * 1024) == 0:
-                                await msg.edit(get_status_text("Leeching URL", name, f.tell(), f_size, start_t))
+        async with global_semaphore:
+            url = event.text.split(" -n ")[0].strip()
+            name = event.text.split(" -n ")[1].strip() if " -n " in event.text else "video.mp4"
+            if not "." in name: name += ".mp4"
             
-            up_file = await fast_upload(client, name, msg, name)
-            await client.send_file(event.chat_id, file=up_file, caption=f"✅ `{name}`", supports_streaming=True, attributes=[types.DocumentAttributeVideo(duration=0, w=1280, h=720, supports_streaming=True)])
-            await msg.delete()
-        except Exception as e: await event.reply(f"❌ Error: {e}")
-        finally:
-            if os.path.exists(name): os.remove(name)
+            msg = await event.reply("🔗 **Queued: Connecting...**")
+            try:
+                async with ClientSession() as sess:
+                    async with sess.get(url) as r:
+                        if "text/html" in r.headers.get("Content-Type", ""): return await msg.edit("❌ Error: Webpage.")
+                        f_size = int(r.headers.get("Content-Length", 0))
+                        start_t = time.time()
+                        with open(name, 'wb') as f:
+                            async for chunk in r.content.iter_chunked(1024*1024):
+                                f.write(chunk)
+                                if f.tell() % (10 * 1024 * 1024) == 0:
+                                    await msg.edit(get_status_text("Leeching URL", name, f.tell(), f_size, start_t))
+                
+                up_file = await fast_upload(client, name, msg, name)
+                await client.send_file(event.chat_id, file=up_file, caption=f"✅ `{name}`", supports_streaming=True, attributes=[types.DocumentAttributeVideo(duration=0, w=1280, h=720, supports_streaming=True)])
+                await msg.delete()
+            except Exception as e: await event.reply(f"❌ Error: {e}")
+            finally:
+                if os.path.exists(name): os.remove(name)
 
 @client.on(events.CallbackQuery)
 async def on_callback(event):
     data = event.data.decode()
     msg_id = int(data.split("_")[1])
     tg_msg = await client.get_messages(event.chat_id, ids=msg_id)
+    
     if data.startswith("link"):
         code = secrets.token_urlsafe(8)
         link_storage[code] = {'msg': tg_msg, 'timestamp': time.time()}
         base = os.environ.get("KOYEB_PUBLIC_URL", "").rstrip('/')
         if not base: base = f"https://{os.environ.get('KOYEB_APP_NAME')}.koyeb.app"
         await event.respond(f"🚀 **Link:** `{base}/{code}/{quote(tg_msg.file.name or 'video.mp4')}`", list_alerts=True)
+        
     elif data.startswith("moly"):
-        await do_vidmoly_upload(event, tg_msg)
+        async with global_semaphore:
+            filename = re.sub(r'[\\/*?:"<>|]', "", tg_msg.file.name or "video.mp4")
+            status = await event.edit(f"⬇️ **Starting TG Download...**")
+            start_t = time.time()
+            try:
+                with open(filename, 'wb') as f:
+                    async for chunk in client.iter_download(tg_msg.media, request_size=1048576):
+                        f.write(chunk)
+                        if f.tell() % (10 * 1024 * 1024) == 0:
+                            await status.edit(get_status_text("TG Download", filename, f.tell(), tg_msg.file.size, start_t))
 
-# --- 9. STARTUP ---
+                code = await upload_to_vidmoly(filename, status, VIDMOLY_API_KEY)
+                if code:
+                    await status.edit(f"✅ **Vidmoly Done!**\n\n🎬 `{filename}`\n🔗 `https://vidmoly.biz/embed-{code}.html`", buttons=[[Button.url("🖼 Open Player", f"https://vidmoly.biz/embed-{code}.html")]])
+                else: await status.edit("❌ Vidmoly Upload Failed.")
+            except Exception as e: await status.edit(f"❌ Error: {e}")
+            finally:
+                if os.path.exists(filename): os.remove(filename)
+
+# --- 8. STARTUP ---
 async def main():
     app = web.Application(); app.add_routes(routes)
     runner = web.AppRunner(app); await runner.setup()
