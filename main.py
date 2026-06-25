@@ -39,14 +39,14 @@ def get_status_text(action, filename, current, total, start_time):
     if diff <= 0: diff = 0.001
     perc = (current / total) * 100 if total > 0 else 0
     speed = current / diff 
+    
     def human_size(bytes):
         for unit in ['B', 'KB', 'MB', 'GB']:
             if bytes < 1024: return f"{bytes:.2f} {unit}"
             bytes /= 1024
     
-    finished_blocks = int(perc // 10)
-    p_bar = "■" * finished_blocks + "□" * (10 - finished_blocks)
-    
+    done = int(perc // 10)
+    p_bar = "■" * done + "□" * (10 - done)
     return (f"🚀 **{action}**\n📦 `{filename}`\n\n"
             f"🌀 **Progress:** `[{p_bar}] {perc:.2f}%`\n"
             f"⚡ **Speed:** `{human_size(speed)}/s`\n"
@@ -68,7 +68,7 @@ class ProgressFile:
         asyncio.create_task(self._callback(self._read_bytes, self._size))
         return chunk
 
-# --- FAST TG UPLOADER (PARALLEL) ---
+# --- FAST TG UPLOADER ---
 async def fast_upload(client, file_path, msg, filename):
     file_size = os.path.getsize(file_path)
     part_size = 512 * 1024
@@ -102,79 +102,82 @@ async def fast_upload(client, file_path, msg, filename):
     u_task.cancel()
     return InputFileBig(file_id, total_parts, filename) if file_size > 10*1024*1024 else InputFile(file_id, total_parts, filename, '')
 
-# --- WEB SERVER (DIRECT LINKS) ---
+# --- WEB SERVER (IDM BULLETPROOF) ---
 @routes.get('/')
-async def root(request): return web.Response(text="✅ Bot is Online")
+async def root(request): return web.Response(text="✅ Online")
 
 @routes.get('/{code}/{filename}')
 async def stream_handler(request):
     code = request.match_info['code']
     data = link_storage.get(code)
     if not data: return web.Response(text="Link Expired", status=410)
-    msg, file_name = data['msg'], unquote(request.match_info['filename'])
+    
+    msg, url_filename = data['msg'], unquote(request.match_info['filename'])
+    file_size = msg.file.size
     range_header = request.headers.get('Range')
-    start = 0
+    start, end = 0, file_size - 1
+    
     if range_header:
-        match = re.search(r'bytes=(\d+)-', range_header)
-        if match: start = int(match.group(1))
-    resp = web.StreamResponse(status=206 if range_header else 200, 
-                              headers={'Content-Disposition': f'attachment; filename="{file_name}"',
-                                       'Accept-Ranges': 'bytes', 'Content-Type': 'video/mp4',
-                                       'Content-Length': str(msg.file.size - start)})
+        match = re.search(r'bytes=(\d+)-(\d*)', range_header)
+        if match:
+            start = int(match.group(1))
+            if match.group(2): end = int(match.group(2))
+
+    headers = {
+        'Content-Disposition': f'attachment; filename="{url_filename}"',
+        'Accept-Ranges': 'bytes', 'Content-Type': 'video/mp4',
+        'Content-Length': str(end - start + 1), 'Connection': 'keep-alive'
+    }
+    if request.method == "HEAD": return web.Response(headers=headers)
+    
+    resp = web.StreamResponse(status=206 if range_header else 200, headers=headers)
     await resp.prepare(request)
+    
+    request_size = 1048576 # 1MB Alignment
+    offset = (start // request_size) * request_size
+    skip, bytes_to_send = start - offset, end - start + 1
     try:
-        async for chunk in client.iter_download(msg.media, offset=(start//1048576)*1048576, request_size=1048576):
-            await resp.write(chunk)
+        async for chunk in client.iter_download(msg.media, offset=offset, request_size=request_size):
+            if skip > 0:
+                chunk = chunk[skip:]; skip = 0
+            if bytes_to_send <= len(chunk):
+                await resp.write(chunk[:bytes_to_send]); break
+            await resp.write(chunk); bytes_to_send -= len(chunk)
     except: pass
     return resp
 
-# --- VIDMOLY UPLOAD FUNCTION ---
-async def process_vidmoly(client, tg_msg, event):
+# --- VIDMOLY UPLOAD ---
+async def do_vidmoly_upload(event, tg_msg):
     filename = re.sub(r'[\\/*?:"<>|]', "", tg_msg.file.name or "video.mp4")
     status = await event.edit(f"⬇️ **Starting TG Download...**")
     start_t = time.time()
-    
     try:
-        # Phase 1: Download from Telegram
         with open(filename, 'wb') as f:
-            last_up = 0
             async for chunk in client.iter_download(tg_msg.media, request_size=1048576):
                 f.write(chunk)
-                if time.time() - last_up > 4:
+                if f.tell() % (5 * 1024 * 1024) == 0: # UI Update every 5MB
                     await status.edit(get_status_text("Downloading from TG", filename, f.tell(), tg_msg.file.size, start_t))
-                    last_up = time.time()
 
-        # Phase 2: Upload to Vidmoly
-        await status.edit(f"⬆️ **Connecting to Vidmoly...**")
+        await status.edit(f"⬆️ **Uploading to Vidmoly...**")
         async with ClientSession() as sess:
             async with sess.get(f"https://vidmoly.me/api/upload/server?key={VIDMOLY_API_KEY}") as r:
                 upload_url = (await r.json(content_type=None))['result']
             
-            start_t = time.time()
-            last_up = 0
             async def moly_cb(curr, tot):
-                nonlocal last_up
-                if time.time() - last_up > 4:
-                    try:
-                        await status.edit(get_status_text("Vidmoly Uploading", filename, curr, tot, start_t))
-                        last_up = time.time()
+                if curr % (5 * 1024 * 1024) == 0:
+                    try: await status.edit(get_status_text("Vidmoly Uploading", filename, curr, tot, start_t))
                     except: pass
 
             data = FormData()
             data.add_field('api_key', VIDMOLY_API_KEY)
             data.add_field('file', ProgressFile(filename, moly_cb), filename=filename)
-            
             async with sess.post(upload_url, data=data) as r:
-                res_text = await r.text()
-                match = re.search(r'name="fn">([a-zA-Z0-9]+)<', res_text)
+                res = await r.text()
+                match = re.search(r'name="fn">([a-zA-Z0-9]+)<', res)
                 if match:
                     code = match.group(1)
-                    # EXACT EMBED LINK
-                    embed = f"https://vidmoly.biz/embed-{code}.html"
-                    direct = f"https://vidmoly.me/{code}.html"
-                    await status.edit(f"✅ **Vidmoly Upload Complete!**\n\n🎬 `{filename}`\n🔗 **Direct:** {direct}\n🖼 **Embed:** `{embed}`", 
-                                      buttons=[[Button.url("🖼 Open Player", embed)]])
-                else: await status.edit("❌ Vidmoly Error: Upload failed.")
+                    await status.edit(f"✅ **Vidmoly Uploaded!**\n\n🎬 `{filename}`\n🔗 `https://vidmoly.biz/embed-{code}.html`", buttons=[[Button.url("🖼 Open Player", f"https://vidmoly.biz/embed-{code}.html")]])
+                else: await status.edit("❌ Vidmoly Error: API issue.")
     except Exception as e: await status.edit(f"❌ Error: {e}")
     finally:
         if os.path.exists(filename): os.remove(filename)
@@ -186,7 +189,7 @@ async def handle_new_message(event):
     
     if event.file:
         await event.reply(f"📂 **File:** `{event.file.name or 'video.mp4'}`",
-            buttons=[[Button.inline("🔗 Direct Link", data=f"link_{event.id}")],
+            buttons=[[Button.inline("🔗 Get Direct Link", data=f"link_{event.id}")],
                      [Button.inline("☁️ Vidmoly Upload", data=f"moly_{event.id}")]])
         return
 
@@ -194,19 +197,22 @@ async def handle_new_message(event):
         url = event.text.split(" -n ")[0].strip()
         name = event.text.split(" -n ")[1].strip() if " -n " in event.text else "video.mp4"
         if not "." in name: name += ".mp4"
-        msg = await event.reply("🔗 **Leeching...**")
-        start_t = time.time()
+        
+        msg = await event.reply("🔗 **Connecting...**")
         try:
             async with ClientSession() as sess:
                 async with sess.get(url) as r:
+                    if "text/html" in r.headers.get("Content-Type", ""): return await msg.edit("❌ Error: Webpage detected.")
                     f_size = int(r.headers.get("Content-Length", 0))
+                    start_t = time.time()
                     with open(name, 'wb') as f:
                         async for chunk in r.content.iter_chunked(1024*1024):
                             f.write(chunk)
-                            if time.time() - start_t > 4: # basic throttle
-                                await msg.edit(get_status_text("URL Downloading", name, f.tell(), f_size, start_t))
+                            if f.tell() % (5 * 1024 * 1024) == 0:
+                                await msg.edit(get_status_text("Leeching URL", name, f.tell(), f_size, start_t))
+            
             up_file = await fast_upload(client, name, msg, name)
-            await client.send_file(event.chat_id, file=up_file, caption=f"✅ `{name}`", supports_streaming=True)
+            await client.send_file(event.chat_id, file=up_file, caption=f"✅ `{name}`", supports_streaming=True, attributes=[types.DocumentAttributeVideo(duration=0, w=1280, h=720, supports_streaming=True)])
             await msg.delete()
         except Exception as e: await event.reply(f"❌ Error: {e}")
         finally:
@@ -217,15 +223,14 @@ async def on_callback(event):
     data = event.data.decode()
     msg_id = int(data.split("_")[1])
     tg_msg = await client.get_messages(event.chat_id, ids=msg_id)
-    
     if data.startswith("link"):
         code = secrets.token_urlsafe(8)
         link_storage[code] = {'msg': tg_msg, 'timestamp': time.time()}
         base = os.environ.get("KOYEB_PUBLIC_URL", "").rstrip('/')
         if not base: base = f"https://{os.environ.get('KOYEB_APP_NAME')}.koyeb.app"
-        await event.respond(f"🚀 **Direct Link:**\n`{base}/{code}/{quote(tg_msg.file.name or 'video.mp4')}`", list_alerts=True)
+        await event.respond(f"🚀 **Link:** `{base}/{code}/{quote(tg_msg.file.name or 'video.mp4')}`", list_alerts=True)
     elif data.startswith("moly"):
-        await process_vidmoly(client, tg_msg, event)
+        await do_vidmoly_upload(event, tg_msg)
 
 async def main():
     app = web.Application(); app.add_routes(routes)
