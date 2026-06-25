@@ -61,21 +61,34 @@ def get_status_text(action, filename, current, total, start_time):
             f"📂 **Size:** `{human_size(current)} / {human_size(total)}`")
 
 # --- 4. VIDMOLY PROGRESS WRAPPER ---
-class ProgressFile:
+import io
+
+class ProgressFile(io.IOBase):
     def __init__(self, filename, callback):
-        self._filename = filename
+        self._file = open(filename, 'rb')
         self._size = os.path.getsize(filename)
         self._read_bytes = 0
         self._callback = callback
-    def __len__(self): return self._size
-    def read(self, size):
-        with open(self._filename, 'rb') as f:
-            f.seek(self._read_bytes)
-            data = f.read(size)
+
+    def __len__(self):
+        return self._size
+
+    def read(self, size=-1):
+        data = self._file.read(size)
         self._read_bytes += len(data)
+        # Run the speed meter update
         asyncio.create_task(self._callback(self._read_bytes, self._size))
         return data
 
+    def seek(self, offset, whence=io.SEEK_SET):
+        return self._file.seek(offset, whence)
+
+    def tell(self):
+        return self._file.tell()
+
+    def close(self):
+        self._file.close()
+        super().close()
 # --- 5. UPLOAD ENGINE ---
 async def fast_upload(client, file_path, msg, filename):
     file_size = os.path.getsize(file_path)
