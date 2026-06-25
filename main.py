@@ -18,21 +18,29 @@ from telethon.tl.types import InputFileBig, InputFile
 from aiohttp import web, ClientSession, FormData
 import aiohttp
 
-# --- CONFIGURATION ---
+# --- 1. CONFIGURATION ---
 API_ID = os.environ.get("API_ID")
 API_HASH = os.environ.get("API_HASH")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 VIDMOLY_API_KEY = "547285kdjw3pg3e303au64"
 
+BOT_START_TIME = time.time()
 ALLOWED_USERS = {716887656, 1053544356} 
 ADMIN_ID = 716887656  
 EXPIRATION_TIME = 24 * 60 * 60 
+
+# --- 2. SETUP CLIENT & STORAGE (Must be before handlers) ---
+client = TelegramClient(
+    'bot_session', int(API_ID), API_HASH,
+    connection=ConnectionTcpFull, use_ipv6=False,
+    device_model="Koyeb Server", system_version="Linux", app_version="10.0.0"
+)
 
 cancel_tasks = {}
 link_storage = {}
 routes = web.RouteTableDef()
 
-# --- SPEED METER HELPER ---
+# --- 3. SPEED METER HELPER ---
 def get_status_text(action, filename, current, total, start_time):
     now = time.time()
     diff = now - start_time
@@ -52,7 +60,7 @@ def get_status_text(action, filename, current, total, start_time):
             f"⚡ **Speed:** `{human_size(speed)}/s`\n"
             f"📂 **Size:** `{human_size(current)} / {human_size(total)}`")
 
-# --- VIDMOLY PROGRESS WRAPPER ---
+# --- 4. VIDMOLY PROGRESS WRAPPER ---
 class ProgressFile:
     def __init__(self, filename, callback):
         self._filename = filename
@@ -63,12 +71,12 @@ class ProgressFile:
     def read(self, size):
         with open(self._filename, 'rb') as f:
             f.seek(self._read_bytes)
-            chunk = f.read(size)
-        self._read_bytes += len(chunk)
+            data = f.read(size)
+        self._read_bytes += len(data)
         asyncio.create_task(self._callback(self._read_bytes, self._size))
-        return chunk
+        return data
 
-# --- FAST TG UPLOADER ---
+# --- 5. UPLOAD ENGINE ---
 async def fast_upload(client, file_path, msg, filename):
     file_size = os.path.getsize(file_path)
     part_size = 512 * 1024
@@ -102,9 +110,9 @@ async def fast_upload(client, file_path, msg, filename):
     u_task.cancel()
     return InputFileBig(file_id, total_parts, filename) if file_size > 10*1024*1024 else InputFile(file_id, total_parts, filename, '')
 
-# --- WEB SERVER (IDM BULLETPROOF) ---
+# --- 6. WEB SERVER (DIRECT LINKS) ---
 @routes.get('/')
-async def root(request): return web.Response(text="✅ Online")
+async def root(request): return web.Response(text="✅ Bot Online", status=200)
 
 @routes.get('/{code}/{filename}')
 async def stream_handler(request):
@@ -133,7 +141,7 @@ async def stream_handler(request):
     resp = web.StreamResponse(status=206 if range_header else 200, headers=headers)
     await resp.prepare(request)
     
-    request_size = 1048576 # 1MB Alignment
+    request_size = 1048576 
     offset = (start // request_size) * request_size
     skip, bytes_to_send = start - offset, end - start + 1
     try:
@@ -141,12 +149,12 @@ async def stream_handler(request):
             if skip > 0:
                 chunk = chunk[skip:]; skip = 0
             if bytes_to_send <= len(chunk):
-                await resp.write(chunk[:bytes_to_send]); break
-            await resp.write(chunk); bytes_to_send -= len(chunk)
+                await response.write(chunk[:bytes_to_send]); break
+            await response.write(chunk); bytes_to_send -= len(chunk)
     except: pass
     return resp
 
-# --- VIDMOLY UPLOAD ---
+# --- 7. VIDMOLY UPLOAD ---
 async def do_vidmoly_upload(event, tg_msg):
     filename = re.sub(r'[\\/*?:"<>|]', "", tg_msg.file.name or "video.mp4")
     status = await event.edit(f"⬇️ **Starting TG Download...**")
@@ -155,7 +163,7 @@ async def do_vidmoly_upload(event, tg_msg):
         with open(filename, 'wb') as f:
             async for chunk in client.iter_download(tg_msg.media, request_size=1048576):
                 f.write(chunk)
-                if f.tell() % (5 * 1024 * 1024) == 0: # UI Update every 5MB
+                if f.tell() % (5 * 1024 * 1024) == 0:
                     await status.edit(get_status_text("Downloading from TG", filename, f.tell(), tg_msg.file.size, start_t))
 
         await status.edit(f"⬆️ **Uploading to Vidmoly...**")
@@ -182,13 +190,13 @@ async def do_vidmoly_upload(event, tg_msg):
     finally:
         if os.path.exists(filename): os.remove(filename)
 
-# --- BOT HANDLERS ---
+# --- 8. BOT HANDLERS ---
 @client.on(events.NewMessage(incoming=True))
 async def handle_new_message(event):
     if event.sender_id not in ALLOWED_USERS: return
     
     if event.file:
-        await event.reply(f"📂 **File:** `{event.file.name or 'video.mp4'}`",
+        await event.reply(f"📂 **File Detected:** `{event.file.name or 'video.mp4'}`",
             buttons=[[Button.inline("🔗 Get Direct Link", data=f"link_{event.id}")],
                      [Button.inline("☁️ Vidmoly Upload", data=f"moly_{event.id}")]])
         return
@@ -232,6 +240,7 @@ async def on_callback(event):
     elif data.startswith("moly"):
         await do_vidmoly_upload(event, tg_msg)
 
+# --- 9. STARTUP ---
 async def main():
     app = web.Application(); app.add_routes(routes)
     runner = web.AppRunner(app); await runner.setup()
