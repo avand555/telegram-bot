@@ -68,18 +68,15 @@ async def upload_to_vidmoly(filename, status_msg, vidmoly_api_key):
     file_size = os.path.getsize(filename)
     
     async with ClientSession() as sess:
-        # Get Upload Server
         async with sess.get(f"https://vidmoly.me/api/upload/server?key={vidmoly_api_key}") as r:
             res = await r.json(content_type=None)
             upload_url = res['result']
 
-        # Manual multi-part upload to track progress without the "no running loop" error
         with open(filename, 'rb') as f:
             data = FormData()
             data.add_field('api_key', vidmoly_api_key)
             data.add_field('file', f, filename=filename)
             
-            # Use aiohttp built-in way to handle body but we track using a loop check
             async def progress_check():
                 while not upload_task.done():
                     await asyncio.sleep(4)
@@ -204,19 +201,44 @@ async def handle_new_message(event):
 async def on_callback(event):
     data = event.data.decode()
     msg_id = int(data.split("_")[1])
-    tg_msg = await client.get_messages(event.chat_id, ids=msg_id)
     
+    # ANSWER THE QUERY TO STOP BUTTON SPINNING
+    await event.answer("Processing...", alert=False)
+
     if data.startswith("link"):
+        tg_msg = await client.get_messages(event.chat_id, ids=msg_id)
+        if not tg_msg or not tg_msg.file:
+            return await event.respond("❌ Error: File not found in history.")
+
+        # Generate unique code
         code = secrets.token_urlsafe(8)
         link_storage[code] = {'msg': tg_msg, 'timestamp': time.time()}
+        
+        # Get base URL for Koyeb
         base = os.environ.get("KOYEB_PUBLIC_URL", "").rstrip('/')
-        if not base: base = f"https://{os.environ.get('KOYEB_APP_NAME')}.koyeb.app"
-        await event.respond(f"🚀 **Link:** `{base}/{code}/{quote(tg_msg.file.name or 'video.mp4')}`", list_alerts=True)
+        if not base:
+            app_name = os.environ.get('KOYEB_APP_NAME')
+            if app_name:
+                base = f"https://{app_name}.koyeb.app"
+            else:
+                base = "https://your-bot-name.koyeb.app" # Fallback hint
+
+        filename = tg_msg.file.name or "video.mp4"
+        hotlink = f"{base}/{code}/{quote(filename)}"
+        
+        # Reply with the link in a copyable format
+        await client.send_message(
+            event.chat_id,
+            f"🚀 **Direct Download Link:**\n\n`{hotlink}`\n\n"
+            f"💡 *Valid for 24 hours. Paste into IDM for max speed.*",
+            reply_to=msg_id
+        )
         
     elif data.startswith("moly"):
+        tg_msg = await client.get_messages(event.chat_id, ids=msg_id)
         async with global_semaphore:
             filename = re.sub(r'[\\/*?:"<>|]', "", tg_msg.file.name or "video.mp4")
-            status = await event.edit(f"⬇️ **Starting TG Download...**")
+            status = await event.respond(f"⬇️ **Starting TG Download...**")
             start_t = time.time()
             try:
                 with open(filename, 'wb') as f:
