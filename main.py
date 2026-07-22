@@ -49,9 +49,47 @@ global_semaphore = asyncio.Semaphore(4)
 link_storage = {}
 routes = web.RouteTableDef()
 
-# --- 2. UNIQUE FILENAME PREVENT CRASH ---
+# --- 2. GOOGLE DRIVE RESOLVER HELPER ---
+def extract_gdrive_id(url):
+    """Extracts File ID from any Google Drive URL format."""
+    match = re.search(r'(?:file/d/|id=|/d/)([a-zA-Z0-9_-]{25,})', url)
+    return match.group(1) if match else None
+
+async def get_gdrive_stream(session, file_id):
+    """Handles Google Drive download and bypasses large-file virus scan warnings."""
+    base_url = "https://drive.google.com/uc?export=download"
+    params = {'id': file_id}
+    
+    resp = await session.get(base_url, params=params, allow_redirects=True)
+    
+    # If Google returns an HTML warning page for large files
+    if "text/html" in resp.headers.get("Content-Type", ""):
+        text = await resp.text()
+        confirm_token = None
+        
+        # Check URL parameters for confirmation token
+        token_match = re.search(r'confirm=([a-zA-Z0-9_-]+)', text)
+        if token_match:
+            confirm_token = token_match.group(1)
+        else:
+            # Check cookies for download warning key
+            for k, v in resp.cookies.items():
+                if k.startswith('download_warning'):
+                    confirm_token = v.value
+                    break
+        
+        resp.close()
+        if confirm_token:
+            params['confirm'] = confirm_token
+            resp = await session.get(base_url, params=params, allow_redirects=True)
+        else:
+            params['confirm'] = 't'
+            resp = await session.get(base_url, params=params, allow_redirects=True)
+            
+    return resp
+
+# --- 3. UNIQUE FILENAME PREVENT CRASH ---
 def get_unique_filename(filepath):
-    """If file exists on server, adds _1, _2, _3 so system does not crash."""
     if not os.path.exists(filepath):
         return filepath
     base, ext = os.path.splitext(filepath)
@@ -60,7 +98,7 @@ def get_unique_filename(filepath):
         counter += 1
     return f"{base}_{counter}{ext}"
 
-# --- 3. C-LEVEL MEMORY PURGE HELPER ---
+# --- 4. C-LEVEL MEMORY PURGE HELPER ---
 def force_system_ram_purge():
     gc.collect()
     try:
@@ -68,10 +106,10 @@ def force_system_ram_purge():
     except Exception:
         pass
 
-# --- 4. SETUP CLIENT ---
+# --- 5. SETUP CLIENT ---
 client = TelegramClient('bot_session', int(API_ID), API_HASH, connection=ConnectionTcpFull, use_ipv6=False)
 
-# --- 5. UI HELPERS ---
+# --- 6. UI HELPERS ---
 def human_size(bytes):
     for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
         if bytes < 1024: return f"{bytes:.2f} {unit}"
@@ -89,7 +127,7 @@ def get_status_text(action, filename, current, total, start_time):
             f"⚡ **Speed:** `{human_size(speed)}/s`\n"
             f"📂 **Size:** `{human_size(current)} / {human_size(total)}`")
 
-# --- 6. R2 CLIENT & SYNC S3 OPERATIONS ---
+# --- 7. R2 CLIENT & SYNC S3 OPERATIONS ---
 def get_r2_client():
     clean_id = R2_ACCOUNT_ID.replace("https://", "").replace("http://", "").split(".")[0].strip('/')
     endpoint = f"https://{clean_id}.r2.cloudflarestorage.com"
@@ -158,7 +196,6 @@ async def upload_to_r2(filename, status_msg):
     loop = asyncio.get_running_loop()
     
     now = datetime.datetime.now()
-    # Ensure final uploaded path matches exact filename
     basename = os.path.basename(filename)
     s3_key = f"{now.year}/{now.month}/{now.day}/{basename}"
     
@@ -171,7 +208,7 @@ async def upload_to_r2(filename, status_msg):
     public_link = f"{R2_PUBLIC_URL}/{quote(s3_key, safe='/')}"
     return public_link, code
 
-# --- 7. SECURED WEB DASHBOARD & ACTION ENDPOINTS ---
+# --- 8. SECURED WEB DASHBOARD & ACTION ENDPOINTS ---
 def check_dashboard_auth(request):
     auth_header = request.headers.get('Authorization')
     if not auth_header or not auth_header.startswith('Basic '):
@@ -304,7 +341,6 @@ async def web_move_handler(request):
     if not check_dashboard_auth(request): return web.Response(status=401, text="Unauthorized")
     old_key = request.query.get('old_key')
     target_folder = request.query.get('target_folder', '').strip().strip('/')
-    
     if old_key and target_folder is not None:
         filename = old_key.split('/')[-1]
         new_key = f"{target_folder}/{filename}" if target_folder else filename
@@ -319,37 +355,12 @@ async def web_move_handler(request):
 async def root(request):
     return web.Response(text="✅ Cloudflare R2 Bot Active.", content_type='text/html')
 
-# --- 8. TG FAST UPLOAD ---
-async def fast_upload(client, file_path, msg, filename):
-    file_size = os.path.getsize(file_path)
-    part_size, file_id = 512 * 1024, random.getrandbits(63)
-    start_time, uploaded_bytes = time.time(), 0
-    sem = asyncio.Semaphore(15) 
-    
-    async def upload_part(idx):
-        nonlocal uploaded_bytes
-        async with sem:
-            with open(file_path, 'rb') as f:
-                f.seek(idx * part_size); chunk = f.read(part_size)
-            if file_size > 10*1024*1024: await client(SaveBigFilePartRequest(file_id, idx, math.ceil(file_size/part_size), chunk))
-            else: await client(SaveFilePartRequest(file_id, idx, chunk))
-            uploaded_bytes += len(chunk)
-            
-    tasks = [upload_part(i) for i in range(math.ceil(file_size/part_size))]
-    async def updater():
-        while uploaded_bytes < file_size:
-            await asyncio.sleep(4)
-            try: await msg.edit(get_status_text("Uploading to TG", filename, uploaded_bytes, file_size, start_time))
-            except: pass
-    u_task = asyncio.create_task(updater())
-    await asyncio.gather(*tasks); u_task.cancel()
-    return InputFileBig(file_id, math.ceil(file_size/part_size), filename) if file_size > 10*1024*1024 else InputFile(file_id, math.ceil(file_size/part_size), filename, '')
-
-# --- 9. BOT HANDLERS ---
+# --- 9. BOT HANDLERS (ADMIN ONLY) ---
 @client.on(events.NewMessage(incoming=True))
 async def handle_new_message(event):
     if event.sender_id != ADMIN_ID: return
 
+    # Forward or send file -> Shows R2 Button
     if event.file:
         await event.reply(
             f"📂 **File Detected:** `{event.file.name or 'video.mp4'}`",
@@ -357,38 +368,66 @@ async def handle_new_message(event):
         )
         return
 
+    # Send URL (Supports Direct Links & Google Drive Links)
     if event.text and event.text.startswith("http"):
         async with global_semaphore:
-            url = event.text.split(" -n ")[0].strip()
-            raw_name = event.text.split(" -n ")[1].strip() if " -n " in event.text else "video.mp4"
-            if not "." in raw_name: raw_name += ".mp4"
+            raw_text = event.text.strip()
+            url = raw_text.split(" -n ")[0].strip()
+            custom_name = raw_text.split(" -n ")[1].strip() if " -n " in raw_text else None
             
-            clean_name = re.sub(r'[\\/*?:"<>|]', "", raw_name)
-            name = get_unique_filename(clean_name) # AUTO UNIQUE NAME
-            
-            msg = await event.reply("🔗 **Downloading from URL...**")
+            gdrive_id = extract_gdrive_id(url)
+            msg = await event.reply("🔗 **Connecting & Resolving Link...**")
             start_t = time.time()
             
             try:
                 async with ClientSession() as sess:
-                    async with sess.get(url) as r:
-                        f_size = int(r.headers.get("Content-Length", 0))
-                        with open(name, 'wb') as f:
-                            async for chunk in r.content.iter_chunked(1024*1024):
-                                f.write(chunk)
-                                if f.tell() % (10 * 1024 * 1024) == 0: 
-                                    await msg.edit(get_status_text("Leeching URL", name, f.tell(), f_size, start_t))
-                
-                r2_url, code = await upload_to_r2(name, msg)
+                    if gdrive_id:
+                        await msg.edit("🅿️ **Google Drive Detected! Bypassing warnings...**")
+                        r = await get_gdrive_stream(sess, gdrive_id)
+                    else:
+                        r = await sess.get(url, allow_redirects=True)
+
+                    if "text/html" in r.headers.get("Content-Type", "") and not gdrive_id:
+                        return await msg.edit("❌ Error: Webpage link detected, not a direct file.")
+
+                    f_size = int(r.headers.get("Content-Length", 0))
+
+                    # Extract or Assign Filename
+                    if custom_name:
+                        filename = custom_name
+                    else:
+                        fname = None
+                        if "Content-Disposition" in r.headers:
+                            matches = re.findall('filename="?([^"]+)"?', r.headers["Content-Disposition"])
+                            if matches: fname = matches[0]
+                        if not fname:
+                            fname = unquote(url.split("/")[-1].split("?")[0]) or "video.mp4"
+                        filename = fname
+
+                    if not "." in filename: filename += ".mp4"
+                    filename = re.sub(r'[\\/*?:"<>|]', "", filename)
+                    filename = get_unique_filename(filename)
+
+                    await msg.edit(f"⬇️ **Leeching to Koyeb Server...**\n🎬 `{filename}`")
+
+                    with open(filename, 'wb') as f:
+                        async for chunk in r.content.iter_chunked(1024*1024):
+                            f.write(chunk)
+                            if f.tell() % (10 * 1024 * 1024) == 0:
+                                await msg.edit(get_status_text("Leeching", filename, f.tell(), f_size, start_t))
+                    r.close()
+
+                r2_url, code = await upload_to_r2(filename, msg)
                 await msg.edit(
-                    f"✅ **Leeched & Uploaded to R2!**\n\n🎬 `{name}`\n🔗 `{r2_url}`",
+                    f"✅ **Leeched & Uploaded to R2!**\n\n🎬 `{filename}`\n🔗 `{r2_url}`",
                     buttons=[[Button.inline("🗑️ Delete from R2", data=f"delr2_{code}")]]
                 )
                 
             except Exception as e: 
                 await msg.edit(f"❌ Error: {e}")
             finally:
-                if os.path.exists(name): os.remove(name)
+                if 'filename' in locals() and os.path.exists(filename): 
+                    os.remove(filename)
                 force_system_ram_purge()
 
 @client.on(events.CallbackQuery)
@@ -419,12 +458,11 @@ async def on_callback(event):
         
         async with global_semaphore:
             raw_filename = re.sub(r'[\\/*?:"<>|]', "", tg_msg.file.name or "video.mp4")
-            filename = get_unique_filename(raw_filename) # AUTO UNIQUE NAME (_1, _2)
+            filename = get_unique_filename(raw_filename)
             
             status = await event.respond(f"⬇️ Downloading from Telegram...")
             start_t = time.time()
             try:
-                # RELIABLE 1MB STREAMING DOWNLOAD (Back to 5+ MB/s)
                 with open(filename, 'wb') as f:
                     async for chunk in client.iter_download(tg_msg.media, request_size=1048576):
                         f.write(chunk)
