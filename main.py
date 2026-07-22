@@ -45,7 +45,6 @@ R2_PUBLIC_URL = os.environ.get("R2_PUBLIC_URL", "").strip().rstrip('/')
 DASHBOARD_USER = os.environ.get("DASHBOARD_USER", "admin").strip()
 DASHBOARD_PASS = os.environ.get("DASHBOARD_PASS", "admin123").strip()
 
-# 4 Parallel Heavy Tasks Allowed on 1GB RAM
 global_semaphore = asyncio.Semaphore(4)
 link_storage = {}
 routes = web.RouteTableDef()
@@ -113,6 +112,11 @@ def sync_r2_upload(filename, s3_key, loop, status_msg, start_t):
     s3 = get_r2_client()
     file_size = os.path.getsize(filename)
     
+    # Guess correct video MIME type
+    mime_type, _ = mimetypes.guess_type(filename)
+    if not mime_type:
+        mime_type = 'video/mp4'
+
     class ProgressCallback:
         def __init__(self):
             self.seen = 0
@@ -127,8 +131,19 @@ def sync_r2_upload(filename, s3_key, loop, status_msg, start_t):
                     asyncio.run_coroutine_threadsafe(status_msg.edit(text), loop)
                 except: pass
 
-    transfer_config = TransferConfig(multipart_threshold=8*1024*1024, multipart_chunksize=8*1024*1024, max_concurrency=4)
-    s3.upload_file(filename, R2_BUCKET_NAME, s3_key, Callback=ProgressCallback(), Config=transfer_config)
+    # 🚀 FIX: Pass ExtraArgs to set ContentType & ContentDisposition for BROWSER STREAMING
+    extra_args = {
+        'ContentType': mime_type,
+        'ContentDisposition': 'inline'
+    }
+
+    s3.upload_file(
+        filename, 
+        R2_BUCKET_NAME, 
+        s3_key, 
+        Callback=ProgressCallback(), 
+        ExtraArgs=extra_args
+    )
 
 async def upload_to_r2(filename, status_msg):
     start_t = time.time()
@@ -146,7 +161,7 @@ async def upload_to_r2(filename, status_msg):
     public_link = f"{R2_PUBLIC_URL}/{quote(s3_key, safe='/')}"
     return public_link, code
 
-# --- 6. 🚀 PARALLEL TELEGRAM DOWNLOAD ENGINE (SPEED BOOST) ---
+# --- 6. PARALLEL TELEGRAM DOWNLOAD ENGINE ---
 async def fast_tg_download(client, message, file_path, msg, filename):
     file_size = message.file.size
     part_size = 1024 * 1024 # 1 MB Chunks
@@ -165,13 +180,11 @@ async def fast_tg_download(client, message, file_path, msg, filename):
         thumb_size=''
     )
 
-    # Pre-allocate file space
     with open(file_path, 'wb') as f:
         if file_size > 0:
             f.seek(file_size - 1)
             f.write(b'\0')
 
-    # 10 Parallel Workers pulling 1MB chunks concurrently
     sem = asyncio.Semaphore(10)
 
     async def download_part(idx):
@@ -233,7 +246,7 @@ async def dashboard_handler(request):
                     <td>{human_size(obj['Size'])}</td>
                     <td>
                         <button class="btn btn-copy" onclick="copyText('{url}')">Copy URL</button>
-                        <a href="{url}" target="_blank" class="btn btn-view">View</a>
+                        <a href="{url}" target="_blank" class="btn btn-view">Play Video</a>
                         <button class="btn btn-rename" onclick="renameFile('{quote(name)}')">Rename</button>
                         <button class="btn btn-delete" onclick="deleteFile('{quote(name)}')">Delete</button>
                     </td>
@@ -259,7 +272,7 @@ async def dashboard_handler(request):
             tr:hover {{ background:#1c232d; }}
             .btn {{ border:none; padding:6px 12px; cursor:pointer; font-weight:bold; border-radius:4px; text-decoration:none; font-size:12px; display:inline-block; margin:2px; }}
             .btn-copy {{ background:#00d2ff; color:#000; }}
-            .btn-view {{ background:#333; color:#fff; }}
+            .btn-view {{ background:#00ff88; color:#000; }}
             .btn-rename {{ background:#ffb703; color:#000; }}
             .btn-delete {{ background:#e63946; color:#fff; }}
         </style>
@@ -325,8 +338,6 @@ async def fast_upload(client, file_path, msg, filename):
     file_size = os.path.getsize(file_path)
     part_size, file_id = 512 * 1024, random.getrandbits(63)
     start_time, uploaded_bytes = time.time(), 0
-    
-    # 15 Parallel Workers for fast uploads on 1GB RAM
     sem = asyncio.Semaphore(15) 
     
     async def upload_part(idx):
@@ -348,7 +359,7 @@ async def fast_upload(client, file_path, msg, filename):
     await asyncio.gather(*tasks); u_task.cancel()
     return InputFileBig(file_id, math.ceil(file_size/part_size), filename) if file_size > 10*1024*1024 else InputFile(file_id, math.ceil(file_size/part_size), filename, '')
 
-# --- 9. BOT HANDLERS (ADMIN ONLY) ---
+# --- 9. BOT HANDLERS ---
 @client.on(events.NewMessage(incoming=True))
 async def handle_new_message(event):
     if event.sender_id != ADMIN_ID: return
@@ -422,7 +433,6 @@ async def on_callback(event):
             filename = re.sub(r'[\\/*?:"<>|]', "", tg_msg.file.name or "video.mp4")
             status = await event.respond(f"⬇️ Downloading from Telegram...")
             try:
-                # 🚀 USE PARALLEL TG DOWNLOAD ENGINE
                 await fast_tg_download(client, tg_msg, filename, status, filename)
                 
                 r2_url, code = await upload_to_r2(filename, status)
