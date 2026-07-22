@@ -17,7 +17,7 @@ from urllib.parse import quote, unquote
 # Telegram Imports
 from telethon import TelegramClient, events, types, Button
 from telethon.network import ConnectionTcpFull
-from telethon.tl.functions.upload import SaveBigFilePartRequest, SaveFilePartRequest, GetFileRequest
+from telethon.tl.functions.upload import SaveBigFilePartRequest, SaveFilePartRequest
 from telethon.tl.types import InputFileBig, InputFile
 
 # Web & Storage Imports
@@ -49,7 +49,18 @@ global_semaphore = asyncio.Semaphore(4)
 link_storage = {}
 routes = web.RouteTableDef()
 
-# --- 2. C-LEVEL MEMORY PURGE HELPER ---
+# --- 2. UNIQUE FILENAME PREVENT CRASH ---
+def get_unique_filename(filepath):
+    """If file exists on server, adds _1, _2, _3 so system does not crash."""
+    if not os.path.exists(filepath):
+        return filepath
+    base, ext = os.path.splitext(filepath)
+    counter = 1
+    while os.path.exists(f"{base}_{counter}{ext}"):
+        counter += 1
+    return f"{base}_{counter}{ext}"
+
+# --- 3. C-LEVEL MEMORY PURGE HELPER ---
 def force_system_ram_purge():
     gc.collect()
     try:
@@ -57,10 +68,10 @@ def force_system_ram_purge():
     except Exception:
         pass
 
-# --- 3. SETUP CLIENT ---
+# --- 4. SETUP CLIENT ---
 client = TelegramClient('bot_session', int(API_ID), API_HASH, connection=ConnectionTcpFull, use_ipv6=False)
 
-# --- 4. UI HELPERS ---
+# --- 5. UI HELPERS ---
 def human_size(bytes):
     for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
         if bytes < 1024: return f"{bytes:.2f} {unit}"
@@ -78,7 +89,7 @@ def get_status_text(action, filename, current, total, start_time):
             f"⚡ **Speed:** `{human_size(speed)}/s`\n"
             f"📂 **Size:** `{human_size(current)} / {human_size(total)}`")
 
-# --- 5. R2 CLIENT & SYNC S3 OPERATIONS ---
+# --- 6. R2 CLIENT & SYNC S3 OPERATIONS ---
 def get_r2_client():
     clean_id = R2_ACCOUNT_ID.replace("https://", "").replace("http://", "").split(".")[0].strip('/')
     endpoint = f"https://{clean_id}.r2.cloudflarestorage.com"
@@ -147,9 +158,11 @@ async def upload_to_r2(filename, status_msg):
     loop = asyncio.get_running_loop()
     
     now = datetime.datetime.now()
-    s3_key = f"{now.year}/{now.month}/{now.day}/{filename}"
+    # Ensure final uploaded path matches exact filename
+    basename = os.path.basename(filename)
+    s3_key = f"{now.year}/{now.month}/{now.day}/{basename}"
     
-    await status_msg.edit(f"⬆️ **Connecting to Cloudflare R2...**\n🎬 `{filename}`")
+    await status_msg.edit(f"⬆️ **Connecting to Cloudflare R2...**\n🎬 `{basename}`")
     await asyncio.to_thread(sync_r2_upload, filename, s3_key, loop, status_msg, start_t)
     
     code = secrets.token_urlsafe(8)
@@ -157,56 +170,6 @@ async def upload_to_r2(filename, status_msg):
     
     public_link = f"{R2_PUBLIC_URL}/{quote(s3_key, safe='/')}"
     return public_link, code
-
-# --- 6. PARALLEL TELEGRAM DOWNLOAD ENGINE ---
-async def fast_tg_download(client, message, file_path, msg, filename):
-    file_size = message.file.size
-    part_size = 1024 * 1024 # 1 MB Chunks
-    total_parts = math.ceil(file_size / part_size)
-    start_time = time.time()
-    downloaded_bytes = 0
-
-    doc = message.document
-    if not doc:
-        raise ValueError("Media is not a valid document.")
-
-    location = types.InputDocumentFileLocation(
-        id=doc.id,
-        access_hash=doc.access_hash,
-        file_reference=doc.file_reference,
-        thumb_size=''
-    )
-
-    with open(file_path, 'wb') as f:
-        if file_size > 0:
-            f.seek(file_size - 1)
-            f.write(b'\0')
-
-    sem = asyncio.Semaphore(10)
-
-    async def download_part(idx):
-        nonlocal downloaded_bytes
-        offset = idx * part_size
-        async with sem:
-            res = await client(GetFileRequest(location=location, offset=offset, limit=part_size))
-            with open(file_path, 'r+b') as f:
-                f.seek(offset)
-                f.write(res.bytes)
-            downloaded_bytes += len(res.bytes)
-
-    tasks = [download_part(i) for i in range(total_parts)]
-
-    async def updater():
-        while downloaded_bytes < file_size:
-            await asyncio.sleep(3)
-            try:
-                await msg.edit(get_status_text("Fast TG Down", filename, downloaded_bytes, file_size, start_time))
-            except Exception: pass
-
-    u_task = asyncio.create_task(updater())
-    await asyncio.gather(*tasks)
-    u_task.cancel()
-    force_system_ram_purge()
 
 # --- 7. SECURED WEB DASHBOARD & ACTION ENDPOINTS ---
 def check_dashboard_auth(request):
@@ -397,10 +360,12 @@ async def handle_new_message(event):
     if event.text and event.text.startswith("http"):
         async with global_semaphore:
             url = event.text.split(" -n ")[0].strip()
-            name = event.text.split(" -n ")[1].strip() if " -n " in event.text else "video.mp4"
-            if not "." in name: name += ".mp4"
+            raw_name = event.text.split(" -n ")[1].strip() if " -n " in event.text else "video.mp4"
+            if not "." in raw_name: raw_name += ".mp4"
             
-            name = re.sub(r'[\\/*?:"<>|]', "", name)
+            clean_name = re.sub(r'[\\/*?:"<>|]', "", raw_name)
+            name = get_unique_filename(clean_name) # AUTO UNIQUE NAME
+            
             msg = await event.reply("🔗 **Downloading from URL...**")
             start_t = time.time()
             
@@ -453,10 +418,18 @@ async def on_callback(event):
         tg_msg = await client.get_messages(event.chat_id, ids=msg_id)
         
         async with global_semaphore:
-            filename = re.sub(r'[\\/*?:"<>|]', "", tg_msg.file.name or "video.mp4")
+            raw_filename = re.sub(r'[\\/*?:"<>|]', "", tg_msg.file.name or "video.mp4")
+            filename = get_unique_filename(raw_filename) # AUTO UNIQUE NAME (_1, _2)
+            
             status = await event.respond(f"⬇️ Downloading from Telegram...")
+            start_t = time.time()
             try:
-                await fast_tg_download(client, tg_msg, filename, status, filename)
+                # RELIABLE 1MB STREAMING DOWNLOAD (Back to 5+ MB/s)
+                with open(filename, 'wb') as f:
+                    async for chunk in client.iter_download(tg_msg.media, request_size=1048576):
+                        f.write(chunk)
+                        if f.tell() % (10 * 1024 * 1024) == 0: 
+                            await status.edit(get_status_text("TG Down", filename, f.tell(), tg_msg.file.size, start_t))
                 
                 r2_url, code = await upload_to_r2(filename, status)
                 await status.edit(
