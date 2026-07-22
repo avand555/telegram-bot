@@ -2,4 +2,4 @@ telethon
 aiohttp
 cryptg
 hachoir
-aioboto3
+boto3
