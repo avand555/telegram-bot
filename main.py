@@ -6,6 +6,8 @@ import time
 import re
 import math
 import random
+import io
+import subprocess
 from urllib.parse import quote, unquote
 
 # Telegram Imports
@@ -43,9 +45,10 @@ link_storage = {}
 routes = web.RouteTableDef()
 
 # --- S3 Config for Cloudflare R2 ---
+# Explicitly forcing path style and s3v4 to prevent Signature errors
 r2_config = Config(
-    region_name='auto',
     signature_version='s3v4',
+    s3={'addressing_style': 'path'},
     retries={'max_attempts': 3, 'mode': 'standard'}
 )
 
@@ -73,11 +76,12 @@ def get_status_text(action, filename, current, total, start_time):
 # --- 4. R2 DASHBOARD (BROWSER VIEW) ---
 @routes.get('/dashboard')
 async def dashboard_handler(request):
-    endpoint = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+    clean_id = R2_ACCOUNT_ID.replace("https://", "").replace("http://", "").split(".")[0]
+    endpoint = f"https://{clean_id}.r2.cloudflarestorage.com"
     session = aioboto3.Session()
     file_rows = ""
     try:
-        async with session.client('s3', endpoint_url=endpoint, aws_access_key_id=R2_ACCESS_KEY_ID, aws_secret_access_key=R2_SECRET_ACCESS_KEY, config=r2_config) as s3:
+        async with session.client('s3', endpoint_url=endpoint, aws_access_key_id=R2_ACCESS_KEY_ID, aws_secret_access_key=R2_SECRET_ACCESS_KEY, region_name='auto', config=r2_config) as s3:
             response = await s3.list_objects_v2(Bucket=R2_BUCKET_NAME)
             if 'Contents' in response:
                 for obj in sorted(response['Contents'], key=lambda x: x['LastModified'], reverse=True):
@@ -94,9 +98,25 @@ async def dashboard_handler(request):
 
 # --- 5. R2 UPLOAD ENGINE ---
 async def upload_to_r2(filename, status_msg):
-    endpoint = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+    # 1. Clean the ID and make the endpoint
+    clean_id = R2_ACCOUNT_ID.replace("https://", "").replace("http://", "").split(".")[0]
+    endpoint = f"https://{clean_id}.r2.cloudflarestorage.com"
+    
+    # 2. FORCE Rename to avoid Signature spacing errors
+    safe_filename = re.sub(r'[^a-zA-Z0-9_\-\.]', '_', filename)
+    if safe_filename != filename:
+        os.rename(filename, safe_filename)
+        filename = safe_filename
+
     session = aioboto3.Session()
-    async with session.client('s3', endpoint_url=endpoint, aws_access_key_id=R2_ACCESS_KEY_ID, aws_secret_access_key=R2_SECRET_ACCESS_KEY, config=r2_config) as s3:
+    
+    # 3. CRITICAL: Pass region_name='auto' to override Koyeb's default AWS_REGION
+    async with session.client('s3', 
+                              endpoint_url=endpoint, 
+                              aws_access_key_id=R2_ACCESS_KEY_ID, 
+                              aws_secret_access_key=R2_SECRET_ACCESS_KEY, 
+                              region_name='auto', 
+                              config=r2_config) as s3:
         await status_msg.edit(f"⬆️ **Uploading to Cloudflare R2...**\n🎬 `{filename}`")
         await s3.upload_file(filename, R2_BUCKET_NAME, filename)
         return f"{R2_PUBLIC_URL}/{quote(filename)}"
@@ -226,6 +246,9 @@ async def on_callback(event):
             except Exception as e: await status.edit(f"❌ Error: {e}")
             finally:
                 if os.path.exists(filename): os.remove(filename)
+                # Cleanup any safe_filename generated during R2 upload
+                safe_filename = re.sub(r'[^a-zA-Z0-9_\-\.]', '_', filename)
+                if os.path.exists(safe_filename): os.remove(safe_filename)
 
 async def main():
     app = web.Application(); app.add_routes(routes)
