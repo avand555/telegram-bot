@@ -50,9 +50,16 @@ global_semaphore = asyncio.Semaphore(4)
 link_storage = {}
 routes = web.RouteTableDef()
 
-# --- 2. UNIQUE FILENAME PREVENT CRASH ---
+# --- 2. FILENAME CLEANERS (FIXES .mp4.mp4) ---
+def clean_double_extension(filename):
+    """Strips double extensions like .mp4.mp4"""
+    while filename.lower().endswith('.mp4.mp4') or filename.lower().endswith('.mkv.mkv'):
+        filename = filename[:-4]
+    return filename
+
 def get_unique_filename(filepath):
     """Generates a unique name BEFORE creating a file if one already exists."""
+    filepath = clean_double_extension(filepath)
     if not os.path.exists(filepath):
         return filepath
     base, ext = os.path.splitext(filepath)
@@ -67,8 +74,6 @@ def sync_yt_dlp_download(url, custom_name=None):
     if custom_name:
         custom_name = get_unique_filename(custom_name)
         out_tmpl = custom_name
-        if not '.' in out_tmpl:
-            out_tmpl += '.%(ext)s'
     else:
         out_tmpl = '%(title)s.%(ext)s'
 
@@ -84,6 +89,13 @@ def sync_yt_dlp_download(url, custom_name=None):
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
         filename = ydl.prepare_filename(info)
+        
+        # Rename if double extension occurred
+        cleaned = clean_double_extension(filename)
+        if cleaned != filename and os.path.exists(filename):
+            os.rename(filename, cleaned)
+            filename = cleaned
+            
         return filename
 
 # --- 4. C-LEVEL MEMORY PURGE HELPER ---
@@ -115,7 +127,7 @@ def get_status_text(action, filename, current, total, start_time):
             f"⚡ **Speed:** `{human_size(speed)}/s`\n"
             f"📂 **Size:** `{human_size(current)} / {human_size(total)}`")
 
-# --- 7. R2 CLIENT & SYNC S3 OPERATIONS ---
+# --- 7. R2 CLIENT & MULTIPART S3 OPERATIONS ---
 def get_r2_client():
     clean_id = R2_ACCOUNT_ID.replace("https://", "").replace("http://", "").split(".")[0].strip('/')
     endpoint = f"https://{clean_id}.r2.cloudflarestorage.com"
@@ -138,11 +150,10 @@ def sync_delete_r2_file(s3_key):
 
 def sync_rename_r2_file(old_key, new_key):
     s3 = get_r2_client()
-    s3.copy_object(
-        Bucket=R2_BUCKET_NAME,
-        CopySource={'Bucket': R2_BUCKET_NAME, 'Key': old_key},
-        Key=new_key
-    )
+    copy_source = {'Bucket': R2_BUCKET_NAME, 'Key': old_key}
+    
+    # 🚀 FIX: s3.copy handles Multipart Copy for large files (> 1GB) automatically!
+    s3.copy(copy_source, R2_BUCKET_NAME, new_key)
     s3.delete_object(Bucket=R2_BUCKET_NAME, Key=old_key)
 
 def sync_r2_upload(filename, s3_key, loop, status_msg, start_t):
@@ -329,21 +340,24 @@ async def web_move_handler(request):
     if not check_dashboard_auth(request): return web.Response(status=401, text="Unauthorized")
     old_key = request.query.get('old_key')
     target_folder = request.query.get('target_folder', '').strip().strip('/')
-    if old_key and target_folder is not None:
+    
+    if old_key:
         filename = old_key.split('/')[-1]
         new_key = f"{target_folder}/{filename}" if target_folder else filename
         if old_key != new_key:
             try: 
                 await asyncio.to_thread(sync_rename_r2_file, old_key, new_key)
                 force_system_ram_purge()
-            except Exception as e: print(f"Web Move Error: {e}")
+            except Exception as e: 
+                print(f"Web Move Error: {e}")
+                return web.Response(text=f"❌ Failed to move large file: {e}", status=500)
     raise web.HTTPFound('/dashboard')
 
 @routes.get('/')
 async def root(request):
     return web.Response(text="✅ Cloudflare R2 Bot Active.", content_type='text/html')
 
-# --- 9. HYBRID DOWNLOADER (YT-DLP + AIOHTTP FALLBACK) ---
+# --- 9. HYBRID DOWNLOADER ---
 async def download_any_url(url, custom_name, msg, start_t):
     # Method 1: Try yt-dlp
     try:
@@ -374,6 +388,7 @@ async def download_any_url(url, custom_name, msg, start_t):
 
             if not "." in filename: filename += ".mp4"
             filename = re.sub(r'[\\/*?:"<>|]', "", filename)
+            filename = clean_double_extension(filename)
             filename = get_unique_filename(filename)
 
             await msg.edit(f"⬇️ **Leeching Direct Link...**\n🎬 `{filename}`")
@@ -408,16 +423,12 @@ async def handle_new_message(event):
             filename = None
             
             try:
-                # Use Hybrid Downloader (yt-dlp + aiohttp)
                 filename = await download_any_url(url, custom_name, msg, start_t)
-                
-                # Upload to Cloudflare R2
                 r2_url, code = await upload_to_r2(filename, msg)
                 await msg.edit(
                     f"✅ **Leeched & Uploaded to R2!**\n\n🎬 `{os.path.basename(filename)}`\n🔗 `{r2_url}`",
                     buttons=[[Button.inline("🗑️ Delete from R2", data=f"delr2_{code}")]]
                 )
-                
             except Exception as e: 
                 await msg.edit(f"❌ Error: {e}")
             finally:
@@ -453,20 +464,18 @@ async def on_callback(event):
         
         async with global_semaphore:
             raw_filename = re.sub(r'[\\/*?:"<>|]', "", tg_msg.file.name or "video.mp4")
-            # Generate unique filename BEFORE creating the file on disk
+            raw_filename = clean_double_extension(raw_filename)
             filename = get_unique_filename(raw_filename)
             
             status = await event.respond(f"⬇️ Downloading from Telegram...")
             start_t = time.time()
             try:
-                # Download from Telegram
                 with open(filename, 'wb') as f:
                     async for chunk in client.iter_download(tg_msg.media, request_size=1048576):
                         f.write(chunk)
                         if f.tell() % (10 * 1024 * 1024) == 0: 
                             await status.edit(get_status_text("TG Down", filename, f.tell(), tg_msg.file.size, start_t))
                 
-                # Upload to Cloudflare R2
                 r2_url, code = await upload_to_r2(filename, status)
                 await status.edit(
                     f"✅ **Cloudflare R2 Complete!**\n\n🎬 `{os.path.basename(filename)}`\n🔗 `{r2_url}`",
