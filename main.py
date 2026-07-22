@@ -8,6 +8,7 @@ import math
 import random
 import io
 import subprocess
+import datetime
 from urllib.parse import quote, unquote
 
 # Telegram Imports
@@ -68,9 +69,9 @@ def get_status_text(action, filename, current, total, start_time):
 
 # --- 4. R2 DASHBOARD (SYNC FETCH) ---
 def sync_get_r2_files():
-    clean_id = R2_ACCOUNT_ID.replace("https://", "").replace("http://", "").split(".")[0]
+    clean_id = R2_ACCOUNT_ID.replace("https://", "").replace("http://", "").split(".")[0].strip('/')
     endpoint = f"https://{clean_id}.r2.cloudflarestorage.com"
-    r2_config = Config(region_name='us-east-1', signature_version='s3v4')
+    r2_config = Config(region_name='auto', signature_version='s3v4')
     s3 = boto3.client('s3', endpoint_url=endpoint, aws_access_key_id=R2_ACCESS_KEY_ID, aws_secret_access_key=R2_SECRET_ACCESS_KEY, config=r2_config)
     return s3.list_objects_v2(Bucket=R2_BUCKET_NAME)
 
@@ -82,7 +83,8 @@ async def dashboard_handler(request):
         if 'Contents' in response:
             for obj in sorted(response['Contents'], key=lambda x: x['LastModified'], reverse=True):
                 name = obj['Key']
-                url = f"{R2_PUBLIC_URL}/{quote(name)}"
+                # safe='/' ensures folders like 2026/7/18 stay as folders in the URL
+                url = f"{R2_PUBLIC_URL}/{quote(name, safe='/')}"
                 file_rows += f"<tr><td>{name}</td><td>{human_size(obj['Size'])}</td><td><button onclick=\"copyText('{url}')\">Copy</button></td></tr>"
         else:
             file_rows = "<tr><td colspan='3' style='text-align:center'>No files found.</td></tr>"
@@ -92,17 +94,21 @@ async def dashboard_handler(request):
     html = f"<html><head><title>R2 Dash</title><style>body{{background:#0f0f0f;color:#eee;font-family:sans-serif;padding:20px;}}table{{width:100%;border-collapse:collapse;}}th,td{{padding:10px;border:1px solid #333;text-align:left;}}th{{background:#00d2ff;color:#000;}}button{{background:#00d2ff;border:none;padding:5px;cursor:pointer;font-weight:bold;}}</style><script>function copyText(t){{navigator.clipboard.writeText(t);alert('Copied!');}}</script></head><body><h2>🛡️ R2 Dashboard</h2><div style='background:#222;padding:10px;margin-bottom:10px;'>Bucket: {R2_BUCKET_NAME}</div><table><thead><tr><th>Name</th><th>Size</th><th>Action</th></tr></thead><tbody>{file_rows}</tbody></table></body></html>"
     return web.Response(text=html, content_type='text/html')
 
-# --- 5. R2 UPLOAD ENGINE (OFFICIAL BOTO3 FIX) ---
-def sync_r2_upload(filename, loop, status_msg, start_t):
-    clean_id = R2_ACCOUNT_ID.replace("https://", "").replace("http://", "").split(".")[0]
+# --- 5. R2 UPLOAD ENGINE (OFFICIAL BOTO3 + FOLDERS) ---
+def sync_r2_upload(filename, s3_key, loop, status_msg, start_t):
+    clean_id = R2_ACCOUNT_ID.replace("https://", "").replace("http://", "").split(".")[0].strip('/')
     endpoint = f"https://{clean_id}.r2.cloudflarestorage.com"
     file_size = os.path.getsize(filename)
     
-    # 1. Strict Config overriding Koyeb default regions
-    r2_config = Config(region_name='us-east-1', signature_version='s3v4', retries={'max_attempts': 3, 'mode': 'standard'})
+    # Official AWS Config for Cloudflare R2
+    r2_config = Config(
+        region_name='auto', 
+        signature_version='s3v4', 
+        s3={'addressing_style': 'path'},
+        retries={'max_attempts': 3, 'mode': 'standard'}
+    )
     s3 = boto3.client('s3', endpoint_url=endpoint, aws_access_key_id=R2_ACCESS_KEY_ID, aws_secret_access_key=R2_SECRET_ACCESS_KEY, config=r2_config)
     
-    # 2. Thread-Safe Progress Callback
     class ProgressCallback:
         def __init__(self):
             self.seen = 0
@@ -117,18 +123,23 @@ def sync_r2_upload(filename, loop, status_msg, start_t):
                     asyncio.run_coroutine_threadsafe(status_msg.edit(text), loop)
                 except: pass
 
-    # 3. Upload Execution (Forced 10MB Chunks for Cloudflare Stability)
+    # Force 10MB chunk threshold to prevent Cloudflare drops
     transfer_config = TransferConfig(multipart_threshold=10*1024*1024, multipart_chunksize=10*1024*1024)
-    s3.upload_file(filename, R2_BUCKET_NAME, filename, Callback=ProgressCallback(), Config=transfer_config)
+    s3.upload_file(filename, R2_BUCKET_NAME, s3_key, Callback=ProgressCallback(), Config=transfer_config)
 
 async def upload_to_r2(filename, status_msg):
     start_t = time.time()
     loop = asyncio.get_running_loop()
+    
+    # Generate Date-Based Folder Structure (YYYY/M/D/Filename.mp4)
+    now = datetime.datetime.now()
+    s3_key = f"{now.year}/{now.month}/{now.day}/{filename}"
+    
     await status_msg.edit(f"⬆️ **Connecting to Cloudflare R2...**\n🎬 `{filename}`")
     
-    # Send the heavy upload task to a background thread to prevent crashing
-    await asyncio.to_thread(sync_r2_upload, filename, loop, status_msg, start_t)
-    return f"{R2_PUBLIC_URL}/{quote(filename)}"
+    # Send task to background thread so it doesn't crash aiohttp
+    await asyncio.to_thread(sync_r2_upload, filename, s3_key, loop, status_msg, start_t)
+    return f"{R2_PUBLIC_URL}/{quote(s3_key, safe='/')}"
 
 # --- 6. VIDMOLY UPLOAD ---
 async def upload_to_vidmoly(filename, status_msg, vidmoly_api_key):
@@ -202,8 +213,10 @@ async def stream_handler(request):
 async def handle_new_message(event):
     if event.file:
         await event.reply(f"📂 **File Detected:** `{event.file.name or 'video.mp4'}`",
-            buttons=[[Button.inline("🔗 Direct Link", data=f"link_{event.id}")],
-                     [Button.inline("☁️ Vidmoly", data=f"moly_{event.id}"), Button.inline("🛡️ Cloudflare R2", data=f"r2_{event.id}")]])
+            buttons=[
+                [Button.inline("🔗 Direct Link", data=f"link_{event.id}")],
+                [Button.inline("☁️ Vidmoly", data=f"moly_{event.id}"), Button.inline("🛡️ Cloudflare R2", data=f"r2_{event.id}")]
+            ])
     elif event.text and event.text.startswith("http"):
         async with global_semaphore:
             url = event.text.split(" -n ")[0].strip()
@@ -243,7 +256,6 @@ async def on_callback(event):
                     async for chunk in client.iter_download(tg_msg.media, request_size=1048576):
                         f.write(chunk)
                         if f.tell() % (10 * 1024 * 1024) == 0: await status.edit(get_status_text("TG Down", filename, f.tell(), tg_msg.file.size, start_t))
-                
                 if data.startswith("r2"):
                     r2_url = await upload_to_r2(filename, status)
                     await status.edit(f"✅ **R2 Upload Complete!**\n\n🔗 `{r2_url}`")
