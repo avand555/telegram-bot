@@ -26,7 +26,7 @@ import aiohttp
 import boto3
 from boto3.s3.transfer import TransferConfig
 from botocore.config import Config
-import yt_dlp # <--- ANASTY17 MIRROR ENGINE
+import yt_dlp
 
 # ============================================
 # --- 1. SECURE CONFIGURATION (FROM KOYEB) ---
@@ -50,10 +50,22 @@ global_semaphore = asyncio.Semaphore(4)
 link_storage = {}
 routes = web.RouteTableDef()
 
-# --- 2. YT-DLP / GDRIVE ENGINE (ANASTY17 METHOD) ---
+# --- 2. UNIQUE FILENAME PREVENT CRASH ---
+def get_unique_filename(filepath):
+    """Generates a unique name BEFORE creating a file if one already exists."""
+    if not os.path.exists(filepath):
+        return filepath
+    base, ext = os.path.splitext(filepath)
+    counter = 1
+    while os.path.exists(f"{base}_{counter}{ext}"):
+        counter += 1
+    return f"{base}_{counter}{ext}"
+
+# --- 3. YT-DLP / GDRIVE ENGINE ---
 def sync_yt_dlp_download(url, custom_name=None):
-    """Extracts real Google Drive / Web titles and downloads file natively."""
+    """Extracts real titles and downloads file natively."""
     if custom_name:
+        custom_name = get_unique_filename(custom_name)
         out_tmpl = custom_name
         if not '.' in out_tmpl:
             out_tmpl += '.%(ext)s'
@@ -66,22 +78,13 @@ def sync_yt_dlp_download(url, custom_name=None):
         'no_warnings': True,
         'nocheckcertificate': True,
         'geo_bypass': True,
+        'overwrites': True,
     }
     
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
         filename = ydl.prepare_filename(info)
         return filename
-
-# --- 3. UNIQUE FILENAME PREVENT CRASH ---
-def get_unique_filename(filepath):
-    if not os.path.exists(filepath):
-        return filepath
-    base, ext = os.path.splitext(filepath)
-    counter = 1
-    while os.path.exists(f"{base}_{counter}{ext}"):
-        counter += 1
-    return f"{base}_{counter}{ext}"
 
 # --- 4. C-LEVEL MEMORY PURGE HELPER ---
 def force_system_ram_purge():
@@ -159,7 +162,7 @@ def sync_r2_upload(filename, s3_key, loop, status_msg, start_t):
             if now - self.last_update > 4:
                 self.last_update = now
                 try:
-                    text = get_status_text("R2 Uploading", filename, self.seen, file_size, start_t)
+                    text = get_status_text("R2 Uploading", os.path.basename(filename), self.seen, file_size, start_t)
                     asyncio.run_coroutine_threadsafe(status_msg.edit(text), loop)
                 except: pass
 
@@ -193,7 +196,7 @@ async def upload_to_r2(filename, status_msg):
     public_link = f"{R2_PUBLIC_URL}/{quote(s3_key, safe='/')}"
     return public_link, code
 
-# --- 8. SECURED WEB DASHBOARD ---
+# --- 8. SECURED WEB DASHBOARD & ACTION ENDPOINTS ---
 def check_dashboard_auth(request):
     auth_header = request.headers.get('Authorization')
     if not auth_header or not auth_header.startswith('Basic '):
@@ -342,12 +345,11 @@ async def root(request):
 
 # --- 9. HYBRID DOWNLOADER (YT-DLP + AIOHTTP FALLBACK) ---
 async def download_any_url(url, custom_name, msg, start_t):
-    # Method 1: Try yt-dlp (ANASTY17 METHOD for GDrive, Youtube, etc.)
+    # Method 1: Try yt-dlp
     try:
         await msg.edit("🅿️ **Extracting File Info via yt-dlp...**")
         filename = await asyncio.to_thread(sync_yt_dlp_download, url, custom_name)
-        if os.path.exists(filename) and os.path.getsize(filename) > 0:
-            filename = get_unique_filename(filename)
+        if filename and os.path.exists(filename) and os.path.getsize(filename) > 0:
             return filename
     except Exception as yt_err:
         print(f"yt-dlp fallback to aiohttp: {yt_err}")
@@ -451,22 +453,23 @@ async def on_callback(event):
         
         async with global_semaphore:
             raw_filename = re.sub(r'[\\/*?:"<>|]', "", tg_msg.file.name or "video.mp4")
+            # Generate unique filename BEFORE creating the file on disk
             filename = get_unique_filename(raw_filename)
             
             status = await event.respond(f"⬇️ Downloading from Telegram...")
             start_t = time.time()
             try:
-                # 1. Download from Telegram
+                # Download from Telegram
                 with open(filename, 'wb') as f:
                     async for chunk in client.iter_download(tg_msg.media, request_size=1048576):
                         f.write(chunk)
                         if f.tell() % (10 * 1024 * 1024) == 0: 
                             await status.edit(get_status_text("TG Down", filename, f.tell(), tg_msg.file.size, start_t))
                 
-                # 2. Upload to Cloudflare R2
+                # Upload to Cloudflare R2
                 r2_url, code = await upload_to_r2(filename, status)
                 await status.edit(
-                    f"✅ **Cloudflare R2 Complete!**\n\n🎬 `{filename}`\n🔗 `{r2_url}`",
+                    f"✅ **Cloudflare R2 Complete!**\n\n🎬 `{os.path.basename(filename)}`\n🔗 `{r2_url}`",
                     buttons=[[Button.inline("🗑️ Delete from R2", data=f"delr2_{code}")]]
                 )
                 
