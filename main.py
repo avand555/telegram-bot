@@ -6,8 +6,6 @@ import time
 import re
 import math
 import random
-import io
-import subprocess
 from urllib.parse import quote, unquote
 
 # Telegram Imports
@@ -23,7 +21,7 @@ import aioboto3
 from botocore.config import Config
 
 # ============================================
-# --- 1. CONFIGURATION (FROM KOYEB ENV) ---
+# --- 1. SECURE CONFIGURATION (FROM KOYEB) ---
 # ============================================
 API_ID = os.environ.get("API_ID")
 API_HASH = os.environ.get("API_HASH")
@@ -31,7 +29,6 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 VIDMOLY_API_KEY = os.environ.get("VIDMOLY_API_KEY", "547285kdjw3pg3e303au64")
 
 # --- CLOUDFLARE R2 CREDENTIALS ---
-# Using .strip() to remove any accidental spaces copied from Cloudflare
 R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID", "").strip()
 R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID", "").strip()
 R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY", "").strip()
@@ -41,21 +38,16 @@ R2_PUBLIC_URL = os.environ.get("R2_PUBLIC_URL", "").strip().rstrip('/')
 ALLOWED_USERS = {716887656, 1053544356} 
 ADMIN_ID = 716887656  
 
-# CONCURRENCY CONTROL (Anti-Crash)
 global_semaphore = asyncio.Semaphore(2)
 link_storage = {}
 routes = web.RouteTableDef()
 
-# --- FIX: CLOUDFLARE S3 CONFIG ---
+# --- S3 Config for Cloudflare R2 ---
 r2_config = Config(
     region_name='auto',
-    s3={'addressing_style': 'virtual'},
-    signature_version='s3v4'
+    signature_version='s3v4',
+    retries={'max_attempts': 3, 'mode': 'standard'}
 )
-
-def get_r2_endpoint():
-    clean_id = R2_ACCOUNT_ID.replace("https://", "").replace("http://", "").split(".")[0]
-    return f"https://{clean_id}.r2.cloudflarestorage.com"
 
 # --- 2. SETUP CLIENT ---
 client = TelegramClient('bot_session', int(API_ID), API_HASH, connection=ConnectionTcpFull, use_ipv6=False)
@@ -81,14 +73,11 @@ def get_status_text(action, filename, current, total, start_time):
 # --- 4. R2 DASHBOARD (BROWSER VIEW) ---
 @routes.get('/dashboard')
 async def dashboard_handler(request):
-    endpoint = get_r2_endpoint()
+    endpoint = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
     session = aioboto3.Session()
     file_rows = ""
     try:
-        async with session.client('s3', endpoint_url=endpoint,
-                                  aws_access_key_id=R2_ACCESS_KEY_ID,
-                                  aws_secret_access_key=R2_SECRET_ACCESS_KEY,
-                                  config=r2_config) as s3:
+        async with session.client('s3', endpoint_url=endpoint, aws_access_key_id=R2_ACCESS_KEY_ID, aws_secret_access_key=R2_SECRET_ACCESS_KEY, config=r2_config) as s3:
             response = await s3.list_objects_v2(Bucket=R2_BUCKET_NAME)
             if 'Contents' in response:
                 for obj in sorted(response['Contents'], key=lambda x: x['LastModified'], reverse=True):
@@ -105,12 +94,9 @@ async def dashboard_handler(request):
 
 # --- 5. R2 UPLOAD ENGINE ---
 async def upload_to_r2(filename, status_msg):
-    endpoint = get_r2_endpoint()
+    endpoint = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
     session = aioboto3.Session()
-    async with session.client('s3', endpoint_url=endpoint,
-                              aws_access_key_id=R2_ACCESS_KEY_ID,
-                              aws_secret_access_key=R2_SECRET_ACCESS_KEY,
-                              config=r2_config) as s3:
+    async with session.client('s3', endpoint_url=endpoint, aws_access_key_id=R2_ACCESS_KEY_ID, aws_secret_access_key=R2_SECRET_ACCESS_KEY, config=r2_config) as s3:
         await status_msg.edit(f"⬆️ **Uploading to Cloudflare R2...**\n🎬 `{filename}`")
         await s3.upload_file(filename, R2_BUCKET_NAME, filename)
         return f"{R2_PUBLIC_URL}/{quote(filename)}"
@@ -161,7 +147,7 @@ async def fast_upload(client, file_path, msg, filename):
     await asyncio.gather(*tasks); u_task.cancel()
     return InputFileBig(file_id, math.ceil(file_size/part_size), filename) if file_size > 10*1024*1024 else InputFile(file_id, math.ceil(file_size/part_size), filename, '')
 
-# --- 8. BOT HANDLERS & WEB SERVER ---
+# --- 8. WEB SERVER (IDM) ---
 @routes.get('/')
 async def root(request):
     html = "<html><body style='background:#000;color:#00d2ff;text-align:center;padding-top:100px;'><h1>✅ Bot is Active</h1><a href='/dashboard' style='color:#fff;'>Go to R2 Dashboard</a></body></html>"
@@ -182,14 +168,13 @@ async def stream_handler(request):
     except: pass
     return resp
 
+# --- 9. BOT HANDLERS ---
 @client.on(events.NewMessage(incoming=True, func=lambda e: e.sender_id in ALLOWED_USERS))
 async def handle_new_message(event):
     if event.file:
         await event.reply(f"📂 **File Detected:** `{event.file.name or 'video.mp4'}`",
-            buttons=[
-                [Button.inline("🔗 Direct Link", data=f"link_{event.id}")],
-                [Button.inline("☁️ Vidmoly", data=f"moly_{event.id}"), Button.inline("🛡️ Cloudflare R2", data=f"r2_{event.id}")]
-            ])
+            buttons=[[Button.inline("🔗 Direct Link", data=f"link_{event.id}")],
+                     [Button.inline("☁️ Vidmoly", data=f"moly_{event.id}"), Button.inline("🛡️ Cloudflare R2", data=f"r2_{event.id}")]])
     elif event.text and event.text.startswith("http"):
         async with global_semaphore:
             url = event.text.split(" -n ")[0].strip()
@@ -219,8 +204,7 @@ async def on_callback(event):
     if data.startswith("link"):
         code = secrets.token_urlsafe(8); link_storage[code] = {'msg': tg_msg}
         base = os.environ.get("KOYEB_PUBLIC_URL", "").rstrip('/') or f"https://{os.environ.get('KOYEB_APP_NAME')}.koyeb.app"
-        await client.send_message(event.chat_id, f"🚀 **Direct Link:**\n\n`{base}/{code}/{quote(tg_msg.file.name or 'video.mp4')}`", reply_to=msg_id)
-        
+        await client.send_message(event.chat_id, f"🚀 **Link:**\n\n`{base}/{code}/{quote(tg_msg.file.name or 'video.mp4')}`")
     elif data.startswith("r2") or data.startswith("moly"):
         async with global_semaphore:
             filename = re.sub(r'[\\/*?:"<>|]', "", tg_msg.file.name or "video.mp4")
@@ -235,7 +219,10 @@ async def on_callback(event):
                     await status.edit(f"✅ **R2 Done!**\n\n🔗 `{r2_url}`")
                 else:
                     code = await upload_to_vidmoly(filename, status, VIDMOLY_API_KEY)
-                    await status.edit(f"✅ **Vidmoly Done!**\n🔗 `https://vidmoly.biz/embed-{code}.html`", buttons=[[Button.url("🖼 Open", f"https://vidmoly.biz/embed-{code}.html")]])
+                    if code:
+                        await status.edit(f"✅ **Vidmoly Done!**\n🔗 `https://vidmoly.biz/embed-{code}.html`", buttons=[[Button.url("🖼 Open", f"https://vidmoly.biz/embed-{code}.html")]])
+                    else:
+                        await status.edit("❌ Vidmoly Error: Failed to parse URL.")
             except Exception as e: await status.edit(f"❌ Error: {e}")
             finally:
                 if os.path.exists(filename): os.remove(filename)
