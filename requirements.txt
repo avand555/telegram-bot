@@ -3,3 +3,4 @@ aiohttp
 cryptg
 hachoir
 boto3
+yt-dlp
