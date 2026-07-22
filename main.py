@@ -112,10 +112,8 @@ def sync_r2_upload(filename, s3_key, loop, status_msg, start_t):
     s3 = get_r2_client()
     file_size = os.path.getsize(filename)
     
-    # Guess correct video MIME type
     mime_type, _ = mimetypes.guess_type(filename)
-    if not mime_type:
-        mime_type = 'video/mp4'
+    if not mime_type: mime_type = 'video/mp4'
 
     class ProgressCallback:
         def __init__(self):
@@ -131,7 +129,6 @@ def sync_r2_upload(filename, s3_key, loop, status_msg, start_t):
                     asyncio.run_coroutine_threadsafe(status_msg.edit(text), loop)
                 except: pass
 
-    # 🚀 FIX: Pass ExtraArgs to set ContentType & ContentDisposition for BROWSER STREAMING
     extra_args = {
         'ContentType': mime_type,
         'ContentDisposition': 'inline'
@@ -211,7 +208,7 @@ async def fast_tg_download(client, message, file_path, msg, filename):
     u_task.cancel()
     force_system_ram_purge()
 
-# --- 7. SECURED WEB DASHBOARD ---
+# --- 7. SECURED WEB DASHBOARD & ACTION ENDPOINTS ---
 def check_dashboard_auth(request):
     auth_header = request.headers.get('Authorization')
     if not auth_header or not auth_header.startswith('Basic '):
@@ -247,6 +244,7 @@ async def dashboard_handler(request):
                     <td>
                         <button class="btn btn-copy" onclick="copyText('{url}')">Copy URL</button>
                         <a href="{url}" target="_blank" class="btn btn-view">Play Video</a>
+                        <button class="btn btn-move" onclick="moveFolder('{quote(name)}')">📁 Move</button>
                         <button class="btn btn-rename" onclick="renameFile('{quote(name)}')">Rename</button>
                         <button class="btn btn-delete" onclick="deleteFile('{quote(name)}')">Delete</button>
                     </td>
@@ -273,6 +271,7 @@ async def dashboard_handler(request):
             .btn {{ border:none; padding:6px 12px; cursor:pointer; font-weight:bold; border-radius:4px; text-decoration:none; font-size:12px; display:inline-block; margin:2px; }}
             .btn-copy {{ background:#00d2ff; color:#000; }}
             .btn-view {{ background:#00ff88; color:#000; }}
+            .btn-move {{ background:#9d4edd; color:#fff; }}
             .btn-rename {{ background:#ffb703; color:#000; }}
             .btn-delete {{ background:#e63946; color:#fff; }}
         </style>
@@ -289,6 +288,14 @@ async def dashboard_handler(request):
                 let newKey = prompt('New filename/path:', decodedKey);
                 if (newKey && newKey !== decodedKey) {{
                     window.location.href = '/rename_file?old_key=' + encodeURIComponent(decodedKey) + '&new_key=' + encodeURIComponent(newKey);
+                }}
+            }}
+            function moveFolder(key) {{
+                let decodedKey = decodeURIComponent(key);
+                let currentDir = decodedKey.includes('/') ? decodedKey.substring(0, decodedKey.lastIndexOf('/')) : '';
+                let targetFolder = prompt('Enter target folder path (e.g. Movies/2026 or Series/S01):', currentDir);
+                if (targetFolder !== null) {{
+                    window.location.href = '/move_file?old_key=' + encodeURIComponent(decodedKey) + '&target_folder=' + encodeURIComponent(targetFolder);
                 }}
             }}
         </script>
@@ -327,6 +334,22 @@ async def web_rename_handler(request):
             await asyncio.to_thread(sync_rename_r2_file, old_key, new_key)
             force_system_ram_purge()
         except Exception as e: print(f"Web Rename Error: {e}")
+    raise web.HTTPFound('/dashboard')
+
+@routes.get('/move_file')
+async def web_move_handler(request):
+    if not check_dashboard_auth(request): return web.Response(status=401, text="Unauthorized")
+    old_key = request.query.get('old_key')
+    target_folder = request.query.get('target_folder', '').strip().strip('/')
+    
+    if old_key and target_folder is not None:
+        filename = old_key.split('/')[-1]
+        new_key = f"{target_folder}/{filename}" if target_folder else filename
+        if old_key != new_key:
+            try: 
+                await asyncio.to_thread(sync_rename_r2_file, old_key, new_key)
+                force_system_ram_purge()
+            except Exception as e: print(f"Web Move Error: {e}")
     raise web.HTTPFound('/dashboard')
 
 @routes.get('/')
