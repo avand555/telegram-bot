@@ -10,6 +10,7 @@ import io
 import base64
 import subprocess
 import datetime
+import gc
 from urllib.parse import quote, unquote
 
 # Telegram Imports
@@ -31,21 +32,19 @@ API_ID = os.environ.get("API_ID")
 API_HASH = os.environ.get("API_HASH")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
-# --- STRICT SINGLE ADMIN ACCESS ---
 ADMIN_ID = 716887656  
 
-# --- CLOUDFLARE R2 CREDENTIALS ---
 R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID", "").strip()
 R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID", "").strip()
 R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY", "").strip()
 R2_BUCKET_NAME = os.environ.get("R2_BUCKET_NAME", "").strip()
 R2_PUBLIC_URL = os.environ.get("R2_PUBLIC_URL", "").strip().rstrip('/')
 
-# --- DASHBOARD AUTHENTICATION ---
 DASHBOARD_USER = os.environ.get("DASHBOARD_USER", "admin").strip()
 DASHBOARD_PASS = os.environ.get("DASHBOARD_PASS", "admin123").strip()
 
-global_semaphore = asyncio.Semaphore(2)
+# 🚀 UPGRADED: 4 SIMULTANEOUS BULK TASKS ALLOWED ON 1GB RAM
+global_semaphore = asyncio.Semaphore(4)
 link_storage = {}
 routes = web.RouteTableDef()
 
@@ -93,7 +92,6 @@ def sync_delete_r2_file(s3_key):
 
 def sync_rename_r2_file(old_key, new_key):
     s3 = get_r2_client()
-    # Copy object to new key then delete old key
     s3.copy_object(
         Bucket=R2_BUCKET_NAME,
         CopySource={'Bucket': R2_BUCKET_NAME, 'Key': old_key},
@@ -131,14 +129,13 @@ async def upload_to_r2(filename, status_msg):
     await status_msg.edit(f"⬆️ **Connecting to Cloudflare R2...**\n🎬 `{filename}`")
     await asyncio.to_thread(sync_r2_upload, filename, s3_key, loop, status_msg, start_t)
     
-    # Store s3_key in link_storage for Telegram deletion button
     code = secrets.token_urlsafe(8)
     link_storage[code] = {'s3_key': s3_key}
     
     public_link = f"{R2_PUBLIC_URL}/{quote(s3_key, safe='/')}"
     return public_link, code
 
-# --- 5. SECURED WEB DASHBOARD & ACTION ENDPOINTS ---
+# --- 5. SECURED WEB DASHBOARD ---
 def check_dashboard_auth(request):
     auth_header = request.headers.get('Authorization')
     if not auth_header or not auth_header.startswith('Basic '):
@@ -157,7 +154,7 @@ async def dashboard_handler(request):
         return web.Response(
             status=401,
             headers={'WWW-Authenticate': 'Basic realm="Cloudflare R2 Dashboard"'},
-            text="🔒 Access Denied: Unauthorized"
+            text="🔒 Access Denied"
         )
 
     file_rows = ""
@@ -204,19 +201,16 @@ async def dashboard_handler(request):
             .btn-delete {{ background:#e63946; color:#fff; }}
         </style>
         <script>
-            function copyText(t) {{
-                navigator.clipboard.writeText(t);
-                alert('Copied to clipboard!');
-            }}
+            function copyText(t) {{ navigator.clipboard.writeText(t); alert('Copied!'); }}
             function deleteFile(key) {{
                 let decodedKey = decodeURIComponent(key);
-                if (confirm('Are you sure you want to delete:\\n' + decodedKey)) {{
+                if (confirm('Delete: ' + decodedKey + '?')) {{
                     window.location.href = '/delete_file?key=' + encodeURIComponent(decodedKey);
                 }}
             }}
             function renameFile(key) {{
                 let decodedKey = decodeURIComponent(key);
-                let newKey = prompt('Enter new filename/path:', decodedKey);
+                let newKey = prompt('New filename/path:', decodedKey);
                 if (newKey && newKey !== decodedKey) {{
                     window.location.href = '/rename_file?old_key=' + encodeURIComponent(decodedKey) + '&new_key=' + encodeURIComponent(newKey);
                 }}
@@ -225,10 +219,10 @@ async def dashboard_handler(request):
     </head>
     <body>
         <div class="container">
-            <h2>🛡️ Cloudflare R2 Management Dashboard</h2>
+            <h2>🛡️ Cloudflare R2 Dashboard</h2>
             <div style="background:#222; padding:10px; border-radius:5px; font-size:13px;"><b>Bucket:</b> {R2_BUCKET_NAME}</div>
             <table>
-                <thead><tr><th>File Path / Name</th><th>Size</th><th>Actions</th></tr></thead>
+                <thead><tr><th>File Path</th><th>Size</th><th>Actions</th></tr></thead>
                 <tbody>{file_rows}</tbody>
             </table>
         </div>
@@ -239,39 +233,35 @@ async def dashboard_handler(request):
 
 @routes.get('/delete_file')
 async def web_delete_handler(request):
-    if not check_dashboard_auth(request):
-        return web.Response(status=401, text="Unauthorized")
+    if not check_dashboard_auth(request): return web.Response(status=401, text="Unauthorized")
     key = request.query.get('key')
     if key:
-        try:
-            await asyncio.to_thread(sync_delete_r2_file, key)
-        except Exception as e:
-            print(f"Web Delete Error: {e}")
+        try: await asyncio.to_thread(sync_delete_r2_file, key)
+        except Exception as e: print(f"Web Delete Error: {e}")
     raise web.HTTPFound('/dashboard')
 
 @routes.get('/rename_file')
 async def web_rename_handler(request):
-    if not check_dashboard_auth(request):
-        return web.Response(status=401, text="Unauthorized")
-    old_key = request.query.get('old_key')
-    new_key = request.query.get('new_key')
+    if not check_dashboard_auth(request): return web.Response(status=401, text="Unauthorized")
+    old_key, new_key = request.query.get('old_key'), request.query.get('new_key')
     if old_key and new_key and old_key != new_key:
-        try:
-            await asyncio.to_thread(sync_rename_r2_file, old_key, new_key)
-        except Exception as e:
-            print(f"Web Rename Error: {e}")
+        try: await asyncio.to_thread(sync_rename_r2_file, old_key, new_key)
+        except Exception as e: print(f"Web Rename Error: {e}")
     raise web.HTTPFound('/dashboard')
 
 @routes.get('/')
 async def root(request):
-    return web.Response(text="✅ Cloudflare R2 Bot Active. Visit /dashboard to manage files.", content_type='text/html')
+    return web.Response(text="✅ Cloudflare R2 Bot Active.", content_type='text/html')
 
 # --- 6. TG FAST UPLOAD ---
 async def fast_upload(client, file_path, msg, filename):
     file_size = os.path.getsize(file_path)
     part_size, file_id = 512 * 1024, random.getrandbits(63)
     start_time, uploaded_bytes = time.time(), 0
-    sem = asyncio.Semaphore(10) 
+    
+    # 🚀 UPGRADED: 15 Parallel Workers for maximum speed on 1GB RAM
+    sem = asyncio.Semaphore(15) 
+    
     async def upload_part(idx):
         nonlocal uploaded_bytes
         async with sem:
@@ -280,6 +270,7 @@ async def fast_upload(client, file_path, msg, filename):
             if file_size > 10*1024*1024: await client(SaveBigFilePartRequest(file_id, idx, math.ceil(file_size/part_size), chunk))
             else: await client(SaveFilePartRequest(file_id, idx, chunk))
             uploaded_bytes += len(chunk)
+            
     tasks = [upload_part(i) for i in range(math.ceil(file_size/part_size))]
     async def updater():
         while uploaded_bytes < file_size:
@@ -290,12 +281,11 @@ async def fast_upload(client, file_path, msg, filename):
     await asyncio.gather(*tasks); u_task.cancel()
     return InputFileBig(file_id, math.ceil(file_size/part_size), filename) if file_size > 10*1024*1024 else InputFile(file_id, math.ceil(file_size/part_size), filename, '')
 
-# --- 7. BOT HANDLERS (STRICT ADMIN ONLY) ---
+# --- 7. BOT HANDLERS (ADMIN ONLY) ---
 @client.on(events.NewMessage(incoming=True))
 async def handle_new_message(event):
     if event.sender_id != ADMIN_ID: return
 
-    # Forward or send file -> Shows R2 Button
     if event.file:
         await event.reply(
             f"📂 **File Detected:** `{event.file.name or 'video.mp4'}`",
@@ -303,7 +293,6 @@ async def handle_new_message(event):
         )
         return
 
-    # Send URL -> Leech directly to Cloudflare R2
     if event.text and event.text.startswith("http"):
         async with global_semaphore:
             url = event.text.split(" -n ")[0].strip()
@@ -334,14 +323,13 @@ async def handle_new_message(event):
                 await msg.edit(f"❌ Error: {e}")
             finally:
                 if os.path.exists(name): os.remove(name)
+                gc.collect()
 
 @client.on(events.CallbackQuery)
 async def on_callback(event):
     if event.sender_id != ADMIN_ID: return
-    
     data = event.data.decode()
     
-    # Handle Telegram Delete Request
     if data.startswith("delr2_"):
         code = data.split("_")[1]
         item = link_storage.get(code)
@@ -354,10 +342,9 @@ async def on_callback(event):
             except Exception as e:
                 await event.edit(f"❌ Delete Error: {e}")
         else:
-            await event.answer("❌ File reference expired or already deleted.", alert=True)
+            await event.answer("❌ Reference expired or already deleted.", alert=True)
         return
 
-    # Handle Upload Request
     if data.startswith("r2_"):
         msg_id = int(data.split("_")[1])
         await event.answer("Processing R2 Upload...")
@@ -384,6 +371,7 @@ async def on_callback(event):
                 await status.edit(f"❌ Error: {e}")
             finally:
                 if os.path.exists(filename): os.remove(filename)
+                gc.collect()
 
 # --- 8. STARTUP ---
 async def main():
