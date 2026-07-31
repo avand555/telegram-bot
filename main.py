@@ -80,7 +80,7 @@ def sync_yt_dlp_download(url, custom_name=None):
         'nocheckcertificate': True,
         'geo_bypass': True,
         'overwrites': True,
-        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best' # Forces mp4 merging
+        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
@@ -196,7 +196,115 @@ async def upload_to_r2(filename, status_msg):
     public_link = f"{R2_PUBLIC_URL}/{quote(s3_key, safe='/')}"
     return public_link, code
 
-# --- 8. SECURED WEB DASHBOARD & ACTION ENDPOINTS ---
+
+# ============================================
+# --- 8. SECURED WEB DASHBOARD & UI ---
+# ============================================
+DASHBOARD_CSS = """
+    :root { --bg: #0f172a; --card: #1e293b; --text: #f8fafc; --muted: #94a3b8; --accent: #38bdf8; --border: #334155; }
+    body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 20px; }
+    .container { max-width: 1200px; margin: auto; }
+    .header-bar { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; margin-bottom: 20px; gap: 15px; }
+    h2 { margin: 0; color: var(--text); font-size: 26px; display: flex; align-items: center; gap: 10px; border-bottom: 2px solid var(--border); padding-bottom: 10px; width: 100%; }
+    
+    /* Stats Cards */
+    .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 25px; }
+    .stat-card { background: var(--card); padding: 15px; border-radius: 10px; border: 1px solid var(--border); box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+    .stat-title { font-size: 12px; color: var(--muted); text-transform: uppercase; font-weight: bold; margin-bottom: 5px; }
+    .stat-val { font-size: 20px; font-weight: bold; color: var(--accent); }
+
+    /* Controls */
+    .controls { display: flex; gap: 10px; margin-bottom: 15px; width: 100%; }
+    .search-box { flex-grow: 1; padding: 14px 20px; border-radius: 8px; border: 1px solid var(--border); background: var(--card); color: var(--text); font-size: 15px; outline: none; transition: 0.2s; }
+    .search-box:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(56, 189, 248, 0.2); }
+
+    /* Table */
+    .table-wrapper { overflow-x: auto; background: var(--card); border-radius: 10px; border: 1px solid var(--border); box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+    table { width: 100%; border-collapse: collapse; min-width: 900px; }
+    th { background: #0f172a; color: var(--muted); padding: 16px; text-align: left; font-size: 13px; font-weight: 600; cursor: pointer; user-select: none; }
+    th:hover { color: var(--text); }
+    td { padding: 16px; border-bottom: 1px solid var(--border); font-size: 14px; word-break: break-all; color: #cbd5e1; }
+    tr:last-child td { border-bottom: none; }
+    tr:hover { background: #334155; }
+
+    /* Actions */
+    .actions { display: flex; gap: 8px; flex-wrap: wrap; }
+    .btn { display: inline-flex; align-items: center; justify-content: center; gap: 5px; padding: 8px 14px; border-radius: 6px; border: none; font-size: 12px; font-weight: 600; cursor: pointer; text-decoration: none; transition: 0.2s; }
+    .btn-copy { background: rgba(56, 189, 248, 0.1); color: var(--accent); }
+    .btn-copy:hover { background: rgba(56, 189, 248, 0.2); }
+    .btn-view { background: rgba(16, 185, 129, 0.1); color: #34d399; }
+    .btn-view:hover { background: rgba(16, 185, 129, 0.2); }
+    .btn-move { background: rgba(167, 139, 250, 0.1); color: #c084fc; }
+    .btn-move:hover { background: rgba(167, 139, 250, 0.2); }
+    .btn-rename { background: rgba(251, 191, 36, 0.1); color: #fbbf24; }
+    .btn-rename:hover { background: rgba(251, 191, 36, 0.2); }
+    .btn-delete { background: rgba(244, 63, 94, 0.1); color: #fb7185; }
+    .btn-delete:hover { background: rgba(244, 63, 94, 0.2); }
+"""
+
+DASHBOARD_JS = """
+    function copyText(t) { navigator.clipboard.writeText(t); alert('✅ URL Copied to clipboard!'); }
+    
+    function deleteFile(key) {
+        let decodedKey = decodeURIComponent(key);
+        if (confirm('⚠️ PERMANENTLY DELETE: \\n' + decodedKey + '\\n\\nAre you sure?')) {
+            window.location.href = '/delete_file?key=' + encodeURIComponent(decodedKey);
+        }
+    }
+    
+    function renameFile(key) {
+        let decodedKey = decodeURIComponent(key);
+        let newKey = prompt('✏️ Rename File (Full Path):', decodedKey);
+        if (newKey && newKey !== decodedKey) {
+            window.location.href = '/rename_file?old_key=' + encodeURIComponent(decodedKey) + '&new_key=' + encodeURIComponent(newKey);
+        }
+    }
+    
+    function moveFolder(key) {
+        let decodedKey = decodeURIComponent(key);
+        let currentDir = decodedKey.includes('/') ? decodedKey.substring(0, decodedKey.lastIndexOf('/')) : '';
+        let targetFolder = prompt('📁 Enter target folder path (e.g. Movies/2026):', currentDir);
+        if (targetFolder !== null) {
+            window.location.href = '/move_file?old_key=' + encodeURIComponent(decodedKey) + '&target_folder=' + encodeURIComponent(targetFolder);
+        }
+    }
+
+    function filterTable() {
+        let input = document.getElementById("searchInput").value.toLowerCase();
+        let rows = document.querySelectorAll("tbody tr");
+        rows.forEach(row => {
+            let filename = row.querySelector(".file-name")?.innerText.toLowerCase() || "";
+            row.style.display = filename.includes(input) ? "" : "none";
+        });
+    }
+
+    let currentSort = { col: -1, dir: 'asc' };
+    function sortTable(colIndex, type) {
+        let table = document.querySelector("tbody");
+        let rows = Array.from(table.querySelectorAll("tr"));
+        if (rows.length === 0 || rows[0].querySelector("td[colspan]")) return;
+
+        let dir = (currentSort.col === colIndex && currentSort.dir === 'asc') ? 'desc' : 'asc';
+        currentSort = { col: colIndex, dir: dir };
+
+        rows.sort((a, b) => {
+            let valA = a.children[colIndex].getAttribute("data-val");
+            let valB = b.children[colIndex].getAttribute("data-val");
+            if (type === 'num') {
+                return dir === 'asc' ? parseFloat(valA) - parseFloat(valB) : parseFloat(valB) - parseFloat(valA);
+            } else {
+                return dir === 'asc' ? valA.localeCompare(valB) : valB.localeCompare(valA);
+            }
+        });
+
+        table.innerHTML = "";
+        rows.forEach(row => table.appendChild(row));
+
+        document.querySelectorAll("th span").forEach(span => span.innerText = "");
+        document.getElementById("th-" + colIndex).querySelector("span").innerText = dir === 'asc' ? ' 🔼' : ' 🔽';
+    }
+"""
+
 def check_dashboard_auth(request):
     auth_header = request.headers.get('Authorization')
     if not auth_header or not auth_header.startswith('Basic '):
@@ -219,83 +327,81 @@ async def dashboard_handler(request):
         )
 
     file_rows = ""
+    total_size_bytes = 0
+    total_files = 0
+    
     try:
         response = await asyncio.to_thread(sync_get_r2_files)
         if 'Contents' in response:
+            total_files = len(response['Contents'])
             for obj in sorted(response['Contents'], key=lambda x: x['LastModified'], reverse=True):
                 name = obj['Key']
+                size_bytes = obj['Size']
+                total_size_bytes += size_bytes
+                
+                size_str = human_size(size_bytes)
+                timestamp = obj['LastModified'].timestamp()
+                date_str = obj['LastModified'].strftime("%Y-%m-%d %H:%M")
                 url = f"{R2_PUBLIC_URL}/{quote(name, safe='/')}"
+                
                 file_rows += f"""
                 <tr>
-                    <td>{name}</td>
-                    <td>{human_size(obj['Size'])}</td>
+                    <td data-val="{name}"><span class="file-name">{name}</span></td>
+                    <td data-val="{size_bytes}">{size_str}</td>
+                    <td data-val="{timestamp}">{date_str}</td>
                     <td>
-                        <button class="btn btn-copy" onclick="copyText('{url}')">Copy URL</button>
-                        <a href="{url}" target="_blank" class="btn btn-view">Play Video</a>
-                        <button class="btn btn-move" onclick="moveFolder('{quote(name)}')">📁 Move</button>
-                        <button class="btn btn-rename" onclick="renameFile('{quote(name)}')">Rename</button>
-                        <button class="btn btn-delete" onclick="deleteFile('{quote(name)}')">Delete</button>
+                        <div class="actions">
+                            <button class="btn btn-copy" onclick="copyText('{url}')" title="Copy URL">🔗 Copy</button>
+                            <a href="{url}" target="_blank" class="btn btn-view" title="Play Video">▶️ Play</a>
+                            <button class="btn btn-move" onclick="moveFolder('{quote(name)}')" title="Move to Folder">📁 Move</button>
+                            <button class="btn btn-rename" onclick="renameFile('{quote(name)}')" title="Rename File">✏️ Rename</button>
+                            <button class="btn btn-delete" onclick="deleteFile('{quote(name)}')" title="Delete File">🗑️ Delete</button>
+                        </div>
                     </td>
                 </tr>"""
         else:
-            file_rows = "<tr><td colspan='3' style='text-align:center'>No files found in bucket.</td></tr>"
+            file_rows = "<tr><td colspan='4' style='text-align:center; color:#94a3b8;'>No files found in your bucket.</td></tr>"
     except Exception as e:
-        file_rows = f"<tr><td colspan='3' style='color:red'>Error: {str(e)}</td></tr>"
+        file_rows = f"<tr><td colspan='4' style='color:#fb7185;'>Error connecting to R2: {str(e)}</td></tr>"
 
     html = f"""
     <!DOCTYPE html>
     <html lang="en">
     <head>
         <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>R2 Dash</title>
-        <style>
-            body {{ background:#0f0f0f; color:#eee; font-family:'Segoe UI', sans-serif; padding:20px; margin:0; }}
-            .container {{ max-width: 1100px; margin: auto; background: #151a21; padding: 20px; border-radius: 10px; }}
-            h2 {{ color: #00d2ff; margin-top: 0; }}
-            table {{ width:100%; border-collapse:collapse; margin-top: 15px; }}
-            th {{ background:#00d2ff; color:#000; padding:12px; text-align:left; }}
-            td {{ padding:10px; border-bottom:1px solid #222; font-size:14px; word-break: break-all; }}
-            tr:hover {{ background:#1c232d; }}
-            .btn {{ border:none; padding:6px 12px; cursor:pointer; font-weight:bold; border-radius:4px; text-decoration:none; font-size:12px; display:inline-block; margin:2px; }}
-            .btn-copy {{ background:#00d2ff; color:#000; }}
-            .btn-view {{ background:#00ff88; color:#000; }}
-            .btn-move {{ background:#9d4edd; color:#fff; }}
-            .btn-rename {{ background:#ffb703; color:#000; }}
-            .btn-delete {{ background:#e63946; color:#fff; }}
-        </style>
-        <script>
-            function copyText(t) {{ navigator.clipboard.writeText(t); alert('Copied!'); }}
-            function deleteFile(key) {{
-                let decodedKey = decodeURIComponent(key);
-                if (confirm('Delete: ' + decodedKey + '?')) {{
-                    window.location.href = '/delete_file?key=' + encodeURIComponent(decodedKey);
-                }}
-            }}
-            function renameFile(key) {{
-                let decodedKey = decodeURIComponent(key);
-                let newKey = prompt('New filename/path:', decodedKey);
-                if (newKey && newKey !== decodedKey) {{
-                    window.location.href = '/rename_file?old_key=' + encodeURIComponent(decodedKey) + '&new_key=' + encodeURIComponent(newKey);
-                }}
-            }}
-            function moveFolder(key) {{
-                let decodedKey = decodeURIComponent(key);
-                let currentDir = decodedKey.includes('/') ? decodedKey.substring(0, decodedKey.lastIndexOf('/')) : '';
-                let targetFolder = prompt('Enter target folder path (e.g. Movies/2026 or Series/S01):', currentDir);
-                if (targetFolder !== null) {{
-                    window.location.href = '/move_file?old_key=' + encodeURIComponent(decodedKey) + '&target_folder=' + encodeURIComponent(targetFolder);
-                }}
-            }}
-        </script>
+        <title>R2 Cloud Manager</title>
+        <style>{DASHBOARD_CSS}</style>
+        <script>{DASHBOARD_JS}</script>
     </head>
     <body>
         <div class="container">
-            <h2>🛡️ Cloudflare R2 Dashboard</h2>
-            <div style="background:#222; padding:10px; border-radius:5px; font-size:13px;"><b>Bucket:</b> {R2_BUCKET_NAME}</div>
-            <table>
-                <thead><tr><th>File Path</th><th>Size</th><th>Actions</th></tr></thead>
-                <tbody>{file_rows}</tbody>
-            </table>
+            <div class="header-bar">
+                <h2>🛡️ Cloudflare R2 Control Panel</h2>
+            </div>
+            
+            <div class="stats-grid">
+                <div class="stat-card"><div class="stat-title">Storage Used</div><div class="stat-val">{human_size(total_size_bytes) if total_size_bytes else '0 B'}</div></div>
+                <div class="stat-card"><div class="stat-title">Total Files</div><div class="stat-val">{total_files}</div></div>
+                <div class="stat-card"><div class="stat-title">Active Bucket</div><div class="stat-val">{R2_BUCKET_NAME}</div></div>
+            </div>
+
+            <div class="controls">
+                <input type="text" id="searchInput" class="search-box" onkeyup="filterTable()" placeholder="🔍 Search files by name or folder...">
+            </div>
+
+            <div class="table-wrapper">
+                <table>
+                    <thead>
+                        <tr>
+                            <th id="th-0" onclick="sortTable(0, 'str')">File Path / Name <span></span></th>
+                            <th id="th-1" onclick="sortTable(1, 'num')">Size <span></span></th>
+                            <th id="th-2" onclick="sortTable(2, 'num')">Date Uploaded <span>🔽</span></th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody>{file_rows}</tbody>
+                </table>
+            </div>
         </div>
     </body>
     </html>
@@ -371,7 +477,31 @@ async def stream_handler(request):
     except: pass
     return resp
 
-# --- 9. HYBRID DOWNLOADER ---
+# --- 9. TG FAST UPLOAD ---
+async def fast_upload(client, file_path, msg, filename):
+    file_size = os.path.getsize(file_path)
+    part_size, file_id = 512 * 1024, random.getrandbits(63)
+    start_time, uploaded_bytes = time.time(), 0
+    sem = asyncio.Semaphore(15) 
+    async def upload_part(idx):
+        nonlocal uploaded_bytes
+        async with sem:
+            with open(file_path, 'rb') as f:
+                f.seek(idx * part_size); chunk = f.read(part_size)
+            if file_size > 10*1024*1024: await client(SaveBigFilePartRequest(file_id, idx, math.ceil(file_size/part_size), chunk))
+            else: await client(SaveFilePartRequest(file_id, idx, chunk))
+            uploaded_bytes += len(chunk)
+    tasks = [upload_part(i) for i in range(math.ceil(file_size/part_size))]
+    async def updater():
+        while uploaded_bytes < file_size:
+            await asyncio.sleep(4)
+            try: await msg.edit(get_status_text("Uploading to TG", filename, uploaded_bytes, file_size, start_time))
+            except: pass
+    u_task = asyncio.create_task(updater())
+    await asyncio.gather(*tasks); u_task.cancel()
+    return InputFileBig(file_id, math.ceil(file_size/part_size), filename) if file_size > 10*1024*1024 else InputFile(file_id, math.ceil(file_size/part_size), filename, '')
+
+# --- 10. HYBRID DOWNLOADER ---
 async def download_any_url(url, custom_name, msg, start_t):
     try:
         await msg.edit("🅿️ **Extracting File Info via yt-dlp...**")
@@ -396,7 +526,7 @@ async def download_any_url(url, custom_name, msg, start_t):
                         await msg.edit(get_status_text("Leeching", filename, f.tell(), f_size, start_t))
             return filename
 
-# --- 10. BOT HANDLERS ---
+# --- 11. BOT HANDLERS ---
 @client.on(events.NewMessage(incoming=True))
 async def handle_new_message(event):
     if event.sender_id != ADMIN_ID: return
@@ -405,7 +535,7 @@ async def handle_new_message(event):
         await event.reply(
             f"📂 **File Detected:** `{event.file.name or 'video.mp4'}`",
             buttons=[
-                [Button.inline("🔗 Generate Direct Link", data=f"link_{event.id}")],
+                [Button.inline("🔗 Get Direct Link", data=f"link_{event.id}")],
                 [Button.inline("🛡️ Upload to Cloudflare R2", data=f"r2_{event.id}")]
             ]
         )
@@ -424,7 +554,6 @@ async def handle_new_message(event):
             try:
                 filename = await download_any_url(url, custom_name, msg, start_t)
                 
-                # SAFETY CHECK: Prevent the unpack error
                 upload_result = await upload_to_r2(filename, msg)
                 if isinstance(upload_result, tuple):
                     r2_url, code = upload_result
@@ -502,7 +631,6 @@ async def on_callback(event):
                         if f.tell() % (10 * 1024 * 1024) == 0: 
                             await status.edit(get_status_text("TG Down", filename, f.tell(), tg_msg.file.size, start_t))
                 
-                # SAFETY CHECK
                 upload_result = await upload_to_r2(filename, status)
                 if isinstance(upload_result, tuple):
                     r2_url, code = upload_result
@@ -521,7 +649,7 @@ async def on_callback(event):
                 if os.path.exists(filename): os.remove(filename)
                 force_system_ram_purge()
 
-# --- 11. STARTUP ---
+# --- 12. STARTUP ---
 async def main():
     app = web.Application()
     app.add_routes(routes)
