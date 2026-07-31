@@ -169,9 +169,7 @@ async def upload_to_r2(filename, status_msg):
     await status_msg.edit(f"⬆️ **Connecting to Cloudflare R2...**\n🎬 `{basename}`")
     await asyncio.to_thread(sync_r2_upload, filename, s3_key, loop, status_msg, start_t)
     
-    code = secrets.token_urlsafe(8)
-    link_storage[code] = {'s3_key': s3_key}
-    return f"{R2_PUBLIC_URL}/{quote(s3_key, safe='/')}", code
+    return f"{R2_PUBLIC_URL}/{quote(s3_key, safe='/')}"
 
 # --- 8. SECURED WEB DASHBOARD & ACTION ENDPOINTS ---
 def check_dashboard_auth(request):
@@ -183,26 +181,19 @@ def check_dashboard_auth(request):
         return user == DASHBOARD_USER and password == DASHBOARD_PASS
     except Exception: return False
 
-# Custom CSS for the Dashboard
 DASHBOARD_CSS = """
     :root { --bg: #0f172a; --card: #1e293b; --text: #f8fafc; --muted: #94a3b8; --accent: #38bdf8; --border: #334155; }
     body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 20px; }
     .container { max-width: 1200px; margin: auto; }
     .header-bar { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; margin-bottom: 20px; gap: 15px; }
     h2 { margin: 0; color: var(--text); font-size: 24px; display: flex; align-items: center; gap: 10px; }
-    
-    /* Stats Cards */
     .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 25px; }
     .stat-card { background: var(--card); padding: 15px; border-radius: 10px; border: 1px solid var(--border); box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
     .stat-title { font-size: 12px; color: var(--muted); text-transform: uppercase; font-weight: bold; margin-bottom: 5px; }
     .stat-val { font-size: 20px; font-weight: bold; color: var(--accent); }
-
-    /* Controls */
     .controls { display: flex; gap: 10px; margin-bottom: 15px; }
     .search-box { flex-grow: 1; padding: 12px 15px; border-radius: 8px; border: 1px solid var(--border); background: var(--card); color: var(--text); font-size: 14px; outline: none; }
     .search-box:focus { border-color: var(--accent); }
-
-    /* Table */
     .table-wrapper { overflow-x: auto; background: var(--card); border-radius: 10px; border: 1px solid var(--border); box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
     table { width: 100%; border-collapse: collapse; min-width: 800px; }
     th { background: #0f172a; color: var(--muted); padding: 15px; text-align: left; font-size: 13px; font-weight: 600; cursor: pointer; user-select: none; }
@@ -210,8 +201,6 @@ DASHBOARD_CSS = """
     td { padding: 15px; border-bottom: 1px solid var(--border); font-size: 14px; word-break: break-word; color: #cbd5e1; }
     tr:last-child td { border-bottom: none; }
     tr:hover { background: #334155; }
-
-    /* Actions */
     .actions { display: flex; gap: 8px; flex-wrap: wrap; }
     .btn { display: inline-flex; align-items: center; justify-content: center; gap: 5px; padding: 6px 12px; border-radius: 6px; border: none; font-size: 12px; font-weight: 600; cursor: pointer; text-decoration: none; transition: 0.2s; }
     .btn-copy { background: rgba(56, 189, 248, 0.1); color: var(--accent); }
@@ -226,17 +215,14 @@ DASHBOARD_CSS = """
     .btn-delete:hover { background: rgba(244, 63, 94, 0.2); }
 """
 
-# Custom JS for the Dashboard
 DASHBOARD_JS = """
     function copyText(t) { navigator.clipboard.writeText(t); alert('✅ Link copied to clipboard!'); }
-    
     function deleteFile(key) {
         let decodedKey = decodeURIComponent(key);
         if (confirm('⚠️ Are you sure you want to PERMANENTLY delete:\\n' + decodedKey)) {
             window.location.href = '/delete_file?key=' + encodeURIComponent(decodedKey);
         }
     }
-    
     function renameFile(key) {
         let decodedKey = decodeURIComponent(key);
         let newKey = prompt('✏️ Enter new filename/path:', decodedKey);
@@ -244,7 +230,6 @@ DASHBOARD_JS = """
             window.location.href = '/rename_file?old_key=' + encodeURIComponent(decodedKey) + '&new_key=' + encodeURIComponent(newKey);
         }
     }
-    
     function moveFolder(key) {
         let decodedKey = decodeURIComponent(key);
         let currentDir = decodedKey.includes('/') ? decodedKey.substring(0, decodedKey.lastIndexOf('/')) : '';
@@ -253,8 +238,6 @@ DASHBOARD_JS = """
             window.location.href = '/move_file?old_key=' + encodeURIComponent(decodedKey) + '&target_folder=' + encodeURIComponent(targetFolder);
         }
     }
-
-    // Search Logic
     function filterTable() {
         let input = document.getElementById("searchInput").value.toLowerCase();
         let rows = document.querySelectorAll("tbody tr");
@@ -263,17 +246,13 @@ DASHBOARD_JS = """
             row.style.display = filename.includes(input) ? "" : "none";
         });
     }
-
-    // Sort Logic
     let currentSort = { col: -1, dir: 'asc' };
     function sortTable(colIndex, type) {
         let table = document.querySelector("tbody");
         let rows = Array.from(table.querySelectorAll("tr"));
         if (rows.length === 0 || rows[0].querySelector("td[colspan]")) return;
-
         let dir = (currentSort.col === colIndex && currentSort.dir === 'asc') ? 'desc' : 'asc';
         currentSort = { col: colIndex, dir: dir };
-
         rows.sort((a, b) => {
             let valA = a.children[colIndex].getAttribute("data-val");
             let valB = b.children[colIndex].getAttribute("data-val");
@@ -283,11 +262,8 @@ DASHBOARD_JS = """
                 return dir === 'asc' ? valA.localeCompare(valB) : valB.localeCompare(valA);
             }
         });
-
         table.innerHTML = "";
         rows.forEach(row => table.appendChild(row));
-
-        // Update UI Arrows
         document.querySelectorAll("th span").forEach(span => span.innerText = "");
         document.getElementById("th-" + colIndex).querySelector("span").innerText = dir === 'asc' ? ' 🔼' : ' 🔽';
     }
@@ -350,17 +326,14 @@ async def dashboard_handler(request):
             <div class="header-bar">
                 <h2>🛡️ Cloudflare R2 Manager</h2>
             </div>
-            
             <div class="stats-grid">
                 <div class="stat-card"><div class="stat-title">Storage Used</div><div class="stat-val">{human_size(total_size_bytes) if total_size_bytes else '0 B'}</div></div>
                 <div class="stat-card"><div class="stat-title">Total Files</div><div class="stat-val">{total_files}</div></div>
                 <div class="stat-card"><div class="stat-title">Active Bucket</div><div class="stat-val">{R2_BUCKET_NAME}</div></div>
             </div>
-
             <div class="controls">
                 <input type="text" id="searchInput" class="search-box" onkeyup="filterTable()" placeholder="🔍 Search files by name...">
             </div>
-
             <div class="table-wrapper">
                 <table>
                     <thead>
@@ -427,41 +400,29 @@ async def root(request):
     """
     return web.Response(text=html, content_type='text/html')
 
-# --- 9. BOT HANDLERS ---
-@client.on(events.NewMessage(incoming=True))
-async def handle_new_message(event):
-    if event.sender_id != ADMIN_ID: return
+@routes.get('/{code}/{filename}')
+async def stream_handler(request):
+    code = request.match_info['code']
+    data = link_storage.get(code)
+    if not data: return web.Response(text="Expired", status=410)
+    msg, file_name = data['msg'], unquote(request.match_info['filename'])
+    range_header = request.headers.get('Range')
+    start = 0
+    if range_header:
+        match = re.search(r'bytes=(\d+)-', range_header)
+        if match: start = int(match.group(1))
+    resp = web.StreamResponse(status=206 if range_header else 200, 
+                              headers={'Content-Disposition': f'attachment; filename="{file_name}"',
+                                       'Accept-Ranges': 'bytes', 'Content-Type': 'video/mp4',
+                                       'Content-Length': str(msg.file.size - start)})
+    await resp.prepare(request)
+    try:
+        async for chunk in client.iter_download(msg.media, offset=(start//1048576)*1048576, request_size=1048576):
+            await resp.write(chunk)
+    except: pass
+    return resp
 
-    if event.file:
-        await event.reply(
-            f"📂 **File Detected:** `{event.file.name or 'video.mp4'}`",
-            buttons=[[Button.inline("🛡️ Upload to Cloudflare R2", data=f"r2_{event.id}")]]
-        )
-        return
-
-    if event.text and event.text.startswith("http"):
-        async with global_semaphore:
-            raw_text = event.text.strip()
-            url = raw_text.split(" -n ")[0].strip()
-            custom_name = raw_text.split(" -n ")[1].strip() if " -n " in raw_text else None
-            
-            msg = await event.reply("🔗 **Processing URL...**")
-            start_t = time.time()
-            filename = None
-            
-            try:
-                filename = await download_any_url(url, custom_name, msg, start_t)
-                r2_url, code = await upload_to_r2(filename, msg)
-                await msg.edit(
-                    f"✅ **Leeched & Uploaded to R2!**\n\n🎬 `{os.path.basename(filename)}`\n🔗 `{r2_url}`",
-                    buttons=[[Button.inline("🗑️ Delete from R2", data=f"delr2_{code}")]]
-                )
-            except Exception as e: 
-                await msg.edit(f"❌ Error: {e}")
-            finally:
-                if filename and os.path.exists(filename): os.remove(filename)
-                force_system_ram_purge()
-
+# --- 9. HYBRID DOWNLOADER ---
 async def download_any_url(url, custom_name, msg, start_t):
     try:
         await msg.edit("🅿️ **Extracting File Info via yt-dlp...**")
@@ -486,30 +447,76 @@ async def download_any_url(url, custom_name, msg, start_t):
                         await msg.edit(get_status_text("Leeching", filename, f.tell(), f_size, start_t))
             return filename
 
+# --- 10. BOT HANDLERS ---
+@client.on(events.NewMessage(incoming=True))
+async def handle_new_message(event):
+    if event.sender_id != ADMIN_ID: return
+
+    if event.file:
+        await event.reply(
+            f"📂 **File Detected:** `{event.file.name or 'video.mp4'}`",
+            buttons=[
+                [Button.inline("🔗 Generate Direct Link", data=f"link_{event.id}")],
+                [Button.inline("🛡️ Upload to Cloudflare R2", data=f"r2_{event.id}")]
+            ]
+        )
+        return
+
+    if event.text and event.text.startswith("http"):
+        async with global_semaphore:
+            raw_text = event.text.strip()
+            url = raw_text.split(" -n ")[0].strip()
+            custom_name = raw_text.split(" -n ")[1].strip() if " -n " in raw_text else None
+            
+            msg = await event.reply("🔗 **Processing URL...**")
+            start_t = time.time()
+            filename = None
+            
+            try:
+                filename = await download_any_url(url, custom_name, msg, start_t)
+                r2_url, _ = await upload_to_r2(filename, msg)
+                await msg.edit(f"✅ **Leeched & Uploaded to R2!**\n\n🎬 `{os.path.basename(filename)}`\n🔗 `{r2_url}`")
+            except Exception as e: 
+                await msg.edit(f"❌ Error: {e}")
+            finally:
+                if filename and os.path.exists(filename): os.remove(filename)
+                force_system_ram_purge()
+
 @client.on(events.CallbackQuery)
 async def on_callback(event):
     if event.sender_id != ADMIN_ID: return
     data = event.data.decode()
     
-    if data.startswith("delr2_"):
-        code = data.split("_")[1]
-        item = link_storage.get(code)
-        if item and 's3_key' in item:
-            await event.answer("Deleting file from R2...", alert=False)
-            try:
-                await asyncio.to_thread(sync_delete_r2_file, item['s3_key'])
-                await event.edit(f"🗑️ **File Deleted from Cloudflare R2!**\n\nKey: `{item['s3_key']}`")
-            except Exception as e: await event.edit(f"❌ Delete Error: {e}")
-        else: await event.answer("❌ Reference expired.", alert=True)
+    if data.startswith("link_"):
+        msg_id = int(data.split("_")[1])
+        await event.answer("Generating Direct Link...", alert=False)
+        tg_msg = await client.get_messages(event.chat_id, ids=msg_id)
+        if not tg_msg or not tg_msg.file:
+            return await event.respond("❌ Error: File not found.")
+        
+        code = secrets.token_urlsafe(8)
+        link_storage[code] = {'msg': tg_msg, 'timestamp': time.time()}
+        
+        base = os.environ.get("KOYEB_PUBLIC_URL", "").rstrip('/')
+        if not base:
+            app_name = os.environ.get('KOYEB_APP_NAME')
+            base = f"https://{app_name}.koyeb.app" if app_name else "https://your-bot-name.koyeb.app"
+            
+        filename = get_unique_filename(clean_double_extension(re.sub(r'[\\/*?:"<>|]', "", tg_msg.file.name or "video.mp4")))
+        hotlink = f"{base}/{code}/{quote(filename)}"
+        
+        await event.respond(f"🚀 **Direct Download Link:**\n\n`{hotlink}`\n\n💡 *Valid for 24 hours. Paste into IDM for max speed.*")
         return
 
     if data.startswith("r2_"):
         msg_id = int(data.split("_")[1])
-        await event.answer("Processing R2 Upload...")
+        await event.answer("Processing R2 Upload...", alert=False)
         tg_msg = await client.get_messages(event.chat_id, ids=msg_id)
         
         async with global_semaphore:
-            filename = get_unique_filename(clean_double_extension(re.sub(r'[\\/*?:"<>|]', "", tg_msg.file.name or "video.mp4")))
+            raw_filename = re.sub(r'[\\/*?:"<>|]', "", tg_msg.file.name or "video.mp4")
+            filename = get_unique_filename(clean_double_extension(raw_filename))
+            
             status = await event.respond(f"⬇️ Downloading from Telegram...")
             start_t = time.time()
             try:
@@ -519,14 +526,16 @@ async def on_callback(event):
                         if f.tell() % (10 * 1024 * 1024) == 0: 
                             await status.edit(get_status_text("TG Down", filename, f.tell(), tg_msg.file.size, start_t))
                 
-                r2_url, code = await upload_to_r2(filename, status)
-                await status.edit(f"✅ **Cloudflare R2 Complete!**\n\n🎬 `{os.path.basename(filename)}`\n🔗 `{r2_url}`", buttons=[[Button.inline("🗑️ Delete from R2", data=f"delr2_{code}")]])
-            except Exception as e: await status.edit(f"❌ Error: {e}")
+                r2_url, _ = await upload_to_r2(filename, status)
+                await status.edit(f"✅ **Cloudflare R2 Complete!**\n\n🎬 `{os.path.basename(filename)}`\n🔗 `{r2_url}`")
+                
+            except Exception as e: 
+                await status.edit(f"❌ Error: {e}")
             finally:
                 if os.path.exists(filename): os.remove(filename)
                 force_system_ram_purge()
 
-# --- 10. STARTUP ---
+# --- 11. STARTUP ---
 async def main():
     app = web.Application()
     app.add_routes(routes)
