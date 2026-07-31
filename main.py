@@ -80,6 +80,7 @@ def sync_yt_dlp_download(url, custom_name=None):
         'nocheckcertificate': True,
         'geo_bypass': True,
         'overwrites': True,
+        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best' # Forces mp4 merging
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
@@ -123,7 +124,13 @@ def get_r2_client():
     clean_id = R2_ACCOUNT_ID.replace("https://", "").replace("http://", "").split(".")[0].strip('/')
     endpoint = f"https://{clean_id}.r2.cloudflarestorage.com"
     r2_config = Config(region_name='auto', signature_version='s3v4')
-    return boto3.client('s3', endpoint_url=endpoint, aws_access_key_id=R2_ACCESS_KEY_ID, aws_secret_access_key=R2_SECRET_ACCESS_KEY, config=r2_config)
+    return boto3.client(
+        's3',
+        endpoint_url=endpoint,
+        aws_access_key_id=R2_ACCESS_KEY_ID,
+        aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+        config=r2_config
+    )
 
 def sync_get_r2_files():
     s3 = get_r2_client()
@@ -141,12 +148,14 @@ def sync_rename_r2_file(old_key, new_key):
 def sync_r2_upload(filename, s3_key, loop, status_msg, start_t):
     s3 = get_r2_client()
     file_size = os.path.getsize(filename)
+    
     mime_type, _ = mimetypes.guess_type(filename)
     if not mime_type: mime_type = 'video/mp4'
 
     class ProgressCallback:
         def __init__(self):
-            self.seen = 0; self.last_update = 0
+            self.seen = 0
+            self.last_update = 0
         def __call__(self, bytes_amount):
             self.seen += bytes_amount
             now = time.time()
@@ -157,11 +166,23 @@ def sync_r2_upload(filename, s3_key, loop, status_msg, start_t):
                     asyncio.run_coroutine_threadsafe(status_msg.edit(text), loop)
                 except: pass
 
-    s3.upload_file(filename, R2_BUCKET_NAME, s3_key, Callback=ProgressCallback(), ExtraArgs={'ContentType': mime_type, 'ContentDisposition': 'inline'})
+    extra_args = {
+        'ContentType': mime_type,
+        'ContentDisposition': 'inline'
+    }
+
+    s3.upload_file(
+        filename, 
+        R2_BUCKET_NAME, 
+        s3_key, 
+        Callback=ProgressCallback(), 
+        ExtraArgs=extra_args
+    )
 
 async def upload_to_r2(filename, status_msg):
     start_t = time.time()
     loop = asyncio.get_running_loop()
+    
     now = datetime.datetime.now()
     basename = os.path.basename(filename)
     s3_key = f"{now.year}/{now.month}/{now.day}/{basename}"
@@ -169,184 +190,112 @@ async def upload_to_r2(filename, status_msg):
     await status_msg.edit(f"⬆️ **Connecting to Cloudflare R2...**\n🎬 `{basename}`")
     await asyncio.to_thread(sync_r2_upload, filename, s3_key, loop, status_msg, start_t)
     
-    return f"{R2_PUBLIC_URL}/{quote(s3_key, safe='/')}"
+    code = secrets.token_urlsafe(8)
+    link_storage[code] = {'s3_key': s3_key}
+    
+    public_link = f"{R2_PUBLIC_URL}/{quote(s3_key, safe='/')}"
+    return public_link, code
 
 # --- 8. SECURED WEB DASHBOARD & ACTION ENDPOINTS ---
 def check_dashboard_auth(request):
     auth_header = request.headers.get('Authorization')
-    if not auth_header or not auth_header.startswith('Basic '): return False
+    if not auth_header or not auth_header.startswith('Basic '):
+        return False
     try:
-        decoded = base64.b64decode(auth_header.split(' ', 1)[1]).decode('utf-8')
+        encoded_credentials = auth_header.split(' ', 1)[1]
+        decoded = base64.b64decode(encoded_credentials).decode('utf-8')
         user, password = decoded.split(':', 1)
         return user == DASHBOARD_USER and password == DASHBOARD_PASS
-    except Exception: return False
-
-DASHBOARD_CSS = """
-    :root { --bg: #0f172a; --card: #1e293b; --text: #f8fafc; --muted: #94a3b8; --accent: #38bdf8; --border: #334155; }
-    body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 20px; }
-    .container { max-width: 1200px; margin: auto; }
-    .header-bar { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; margin-bottom: 20px; gap: 15px; }
-    h2 { margin: 0; color: var(--text); font-size: 24px; display: flex; align-items: center; gap: 10px; }
-    .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 25px; }
-    .stat-card { background: var(--card); padding: 15px; border-radius: 10px; border: 1px solid var(--border); box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
-    .stat-title { font-size: 12px; color: var(--muted); text-transform: uppercase; font-weight: bold; margin-bottom: 5px; }
-    .stat-val { font-size: 20px; font-weight: bold; color: var(--accent); }
-    .controls { display: flex; gap: 10px; margin-bottom: 15px; }
-    .search-box { flex-grow: 1; padding: 12px 15px; border-radius: 8px; border: 1px solid var(--border); background: var(--card); color: var(--text); font-size: 14px; outline: none; }
-    .search-box:focus { border-color: var(--accent); }
-    .table-wrapper { overflow-x: auto; background: var(--card); border-radius: 10px; border: 1px solid var(--border); box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
-    table { width: 100%; border-collapse: collapse; min-width: 800px; }
-    th { background: #0f172a; color: var(--muted); padding: 15px; text-align: left; font-size: 13px; font-weight: 600; cursor: pointer; user-select: none; }
-    th:hover { color: var(--text); }
-    td { padding: 15px; border-bottom: 1px solid var(--border); font-size: 14px; word-break: break-word; color: #cbd5e1; }
-    tr:last-child td { border-bottom: none; }
-    tr:hover { background: #334155; }
-    .actions { display: flex; gap: 8px; flex-wrap: wrap; }
-    .btn { display: inline-flex; align-items: center; justify-content: center; gap: 5px; padding: 6px 12px; border-radius: 6px; border: none; font-size: 12px; font-weight: 600; cursor: pointer; text-decoration: none; transition: 0.2s; }
-    .btn-copy { background: rgba(56, 189, 248, 0.1); color: var(--accent); }
-    .btn-copy:hover { background: rgba(56, 189, 248, 0.2); }
-    .btn-view { background: rgba(16, 185, 129, 0.1); color: #34d399; }
-    .btn-view:hover { background: rgba(16, 185, 129, 0.2); }
-    .btn-move { background: rgba(167, 139, 250, 0.1); color: #c084fc; }
-    .btn-move:hover { background: rgba(167, 139, 250, 0.2); }
-    .btn-rename { background: rgba(251, 191, 36, 0.1); color: #fbbf24; }
-    .btn-rename:hover { background: rgba(251, 191, 36, 0.2); }
-    .btn-delete { background: rgba(244, 63, 94, 0.1); color: #fb7185; }
-    .btn-delete:hover { background: rgba(244, 63, 94, 0.2); }
-"""
-
-DASHBOARD_JS = """
-    function copyText(t) { navigator.clipboard.writeText(t); alert('✅ Link copied to clipboard!'); }
-    function deleteFile(key) {
-        let decodedKey = decodeURIComponent(key);
-        if (confirm('⚠️ Are you sure you want to PERMANENTLY delete:\\n' + decodedKey)) {
-            window.location.href = '/delete_file?key=' + encodeURIComponent(decodedKey);
-        }
-    }
-    function renameFile(key) {
-        let decodedKey = decodeURIComponent(key);
-        let newKey = prompt('✏️ Enter new filename/path:', decodedKey);
-        if (newKey && newKey !== decodedKey) {
-            window.location.href = '/rename_file?old_key=' + encodeURIComponent(decodedKey) + '&new_key=' + encodeURIComponent(newKey);
-        }
-    }
-    function moveFolder(key) {
-        let decodedKey = decodeURIComponent(key);
-        let currentDir = decodedKey.includes('/') ? decodedKey.substring(0, decodedKey.lastIndexOf('/')) : '';
-        let targetFolder = prompt('📁 Enter target folder path (e.g. Movies/2026):', currentDir);
-        if (targetFolder !== null) {
-            window.location.href = '/move_file?old_key=' + encodeURIComponent(decodedKey) + '&target_folder=' + encodeURIComponent(targetFolder);
-        }
-    }
-    function filterTable() {
-        let input = document.getElementById("searchInput").value.toLowerCase();
-        let rows = document.querySelectorAll("tbody tr");
-        rows.forEach(row => {
-            let filename = row.querySelector(".file-name")?.innerText.toLowerCase() || "";
-            row.style.display = filename.includes(input) ? "" : "none";
-        });
-    }
-    let currentSort = { col: -1, dir: 'asc' };
-    function sortTable(colIndex, type) {
-        let table = document.querySelector("tbody");
-        let rows = Array.from(table.querySelectorAll("tr"));
-        if (rows.length === 0 || rows[0].querySelector("td[colspan]")) return;
-        let dir = (currentSort.col === colIndex && currentSort.dir === 'asc') ? 'desc' : 'asc';
-        currentSort = { col: colIndex, dir: dir };
-        rows.sort((a, b) => {
-            let valA = a.children[colIndex].getAttribute("data-val");
-            let valB = b.children[colIndex].getAttribute("data-val");
-            if (type === 'num') {
-                return dir === 'asc' ? parseFloat(valA) - parseFloat(valB) : parseFloat(valB) - parseFloat(valA);
-            } else {
-                return dir === 'asc' ? valA.localeCompare(valB) : valB.localeCompare(valA);
-            }
-        });
-        table.innerHTML = "";
-        rows.forEach(row => table.appendChild(row));
-        document.querySelectorAll("th span").forEach(span => span.innerText = "");
-        document.getElementById("th-" + colIndex).querySelector("span").innerText = dir === 'asc' ? ' 🔼' : ' 🔽';
-    }
-"""
+    except Exception:
+        return False
 
 @routes.get('/dashboard')
 async def dashboard_handler(request):
     if not check_dashboard_auth(request):
-        return web.Response(status=401, headers={'WWW-Authenticate': 'Basic realm="Cloudflare R2 Dashboard"'}, text="🔒 Access Denied")
+        return web.Response(
+            status=401,
+            headers={'WWW-Authenticate': 'Basic realm="Cloudflare R2 Dashboard"'},
+            text="🔒 Access Denied"
+        )
 
     file_rows = ""
-    total_size_bytes = 0
-    total_files = 0
-    
     try:
         response = await asyncio.to_thread(sync_get_r2_files)
         if 'Contents' in response:
-            total_files = len(response['Contents'])
             for obj in sorted(response['Contents'], key=lambda x: x['LastModified'], reverse=True):
                 name = obj['Key']
-                size_bytes = obj['Size']
-                total_size_bytes += size_bytes
-                
-                size_str = human_size(size_bytes)
-                timestamp = obj['LastModified'].timestamp()
-                date_str = obj['LastModified'].strftime("%Y-%m-%d %H:%M")
                 url = f"{R2_PUBLIC_URL}/{quote(name, safe='/')}"
-                
                 file_rows += f"""
                 <tr>
-                    <td data-val="{name}"><span class="file-name">{name}</span></td>
-                    <td data-val="{size_bytes}">{size_str}</td>
-                    <td data-val="{timestamp}">{date_str}</td>
+                    <td>{name}</td>
+                    <td>{human_size(obj['Size'])}</td>
                     <td>
-                        <div class="actions">
-                            <button class="btn btn-copy" onclick="copyText('{url}')" title="Copy URL">🔗 Copy</button>
-                            <a href="{url}" target="_blank" class="btn btn-view" title="Play Video">▶️ Play</a>
-                            <button class="btn btn-move" onclick="moveFolder('{quote(name)}')" title="Move to Folder">📁 Move</button>
-                            <button class="btn btn-rename" onclick="renameFile('{quote(name)}')" title="Rename File">✏️ Rename</button>
-                            <button class="btn btn-delete" onclick="deleteFile('{quote(name)}')" title="Delete File">🗑️ Delete</button>
-                        </div>
+                        <button class="btn btn-copy" onclick="copyText('{url}')">Copy URL</button>
+                        <a href="{url}" target="_blank" class="btn btn-view">Play Video</a>
+                        <button class="btn btn-move" onclick="moveFolder('{quote(name)}')">📁 Move</button>
+                        <button class="btn btn-rename" onclick="renameFile('{quote(name)}')">Rename</button>
+                        <button class="btn btn-delete" onclick="deleteFile('{quote(name)}')">Delete</button>
                     </td>
                 </tr>"""
         else:
-            file_rows = "<tr><td colspan='4' style='text-align:center; color:#94a3b8;'>No files found in your bucket.</td></tr>"
+            file_rows = "<tr><td colspan='3' style='text-align:center'>No files found in bucket.</td></tr>"
     except Exception as e:
-        file_rows = f"<tr><td colspan='4' style='color:#fb7185;'>Error connecting to R2: {str(e)}</td></tr>"
+        file_rows = f"<tr><td colspan='3' style='color:red'>Error: {str(e)}</td></tr>"
 
     html = f"""
     <!DOCTYPE html>
     <html lang="en">
     <head>
         <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Cloudflare R2 Manager</title>
-        <style>{DASHBOARD_CSS}</style>
-        <script>{DASHBOARD_JS}</script>
+        <title>R2 Dash</title>
+        <style>
+            body {{ background:#0f0f0f; color:#eee; font-family:'Segoe UI', sans-serif; padding:20px; margin:0; }}
+            .container {{ max-width: 1100px; margin: auto; background: #151a21; padding: 20px; border-radius: 10px; }}
+            h2 {{ color: #00d2ff; margin-top: 0; }}
+            table {{ width:100%; border-collapse:collapse; margin-top: 15px; }}
+            th {{ background:#00d2ff; color:#000; padding:12px; text-align:left; }}
+            td {{ padding:10px; border-bottom:1px solid #222; font-size:14px; word-break: break-all; }}
+            tr:hover {{ background:#1c232d; }}
+            .btn {{ border:none; padding:6px 12px; cursor:pointer; font-weight:bold; border-radius:4px; text-decoration:none; font-size:12px; display:inline-block; margin:2px; }}
+            .btn-copy {{ background:#00d2ff; color:#000; }}
+            .btn-view {{ background:#00ff88; color:#000; }}
+            .btn-move {{ background:#9d4edd; color:#fff; }}
+            .btn-rename {{ background:#ffb703; color:#000; }}
+            .btn-delete {{ background:#e63946; color:#fff; }}
+        </style>
+        <script>
+            function copyText(t) {{ navigator.clipboard.writeText(t); alert('Copied!'); }}
+            function deleteFile(key) {{
+                let decodedKey = decodeURIComponent(key);
+                if (confirm('Delete: ' + decodedKey + '?')) {{
+                    window.location.href = '/delete_file?key=' + encodeURIComponent(decodedKey);
+                }}
+            }}
+            function renameFile(key) {{
+                let decodedKey = decodeURIComponent(key);
+                let newKey = prompt('New filename/path:', decodedKey);
+                if (newKey && newKey !== decodedKey) {{
+                    window.location.href = '/rename_file?old_key=' + encodeURIComponent(decodedKey) + '&new_key=' + encodeURIComponent(newKey);
+                }}
+            }}
+            function moveFolder(key) {{
+                let decodedKey = decodeURIComponent(key);
+                let currentDir = decodedKey.includes('/') ? decodedKey.substring(0, decodedKey.lastIndexOf('/')) : '';
+                let targetFolder = prompt('Enter target folder path (e.g. Movies/2026 or Series/S01):', currentDir);
+                if (targetFolder !== null) {{
+                    window.location.href = '/move_file?old_key=' + encodeURIComponent(decodedKey) + '&target_folder=' + encodeURIComponent(targetFolder);
+                }}
+            }}
+        </script>
     </head>
     <body>
         <div class="container">
-            <div class="header-bar">
-                <h2>🛡️ Cloudflare R2 Manager</h2>
-            </div>
-            <div class="stats-grid">
-                <div class="stat-card"><div class="stat-title">Storage Used</div><div class="stat-val">{human_size(total_size_bytes) if total_size_bytes else '0 B'}</div></div>
-                <div class="stat-card"><div class="stat-title">Total Files</div><div class="stat-val">{total_files}</div></div>
-                <div class="stat-card"><div class="stat-title">Active Bucket</div><div class="stat-val">{R2_BUCKET_NAME}</div></div>
-            </div>
-            <div class="controls">
-                <input type="text" id="searchInput" class="search-box" onkeyup="filterTable()" placeholder="🔍 Search files by name...">
-            </div>
-            <div class="table-wrapper">
-                <table>
-                    <thead>
-                        <tr>
-                            <th id="th-0" onclick="sortTable(0, 'str')">File Path / Name <span></span></th>
-                            <th id="th-1" onclick="sortTable(1, 'num')">Size <span></span></th>
-                            <th id="th-2" onclick="sortTable(2, 'num')">Date Uploaded <span>🔽</span></th>
-                            <th>Actions</th>
-                        </tr>
-                    </thead>
-                    <tbody>{file_rows}</tbody>
-                </table>
-            </div>
+            <h2>🛡️ Cloudflare R2 Dashboard</h2>
+            <div style="background:#222; padding:10px; border-radius:5px; font-size:13px;"><b>Bucket:</b> {R2_BUCKET_NAME}</div>
+            <table>
+                <thead><tr><th>File Path</th><th>Size</th><th>Actions</th></tr></thead>
+                <tbody>{file_rows}</tbody>
+            </table>
         </div>
     </body>
     </html>
@@ -474,8 +423,19 @@ async def handle_new_message(event):
             
             try:
                 filename = await download_any_url(url, custom_name, msg, start_t)
-                r2_url, _ = await upload_to_r2(filename, msg)
-                await msg.edit(f"✅ **Leeched & Uploaded to R2!**\n\n🎬 `{os.path.basename(filename)}`\n🔗 `{r2_url}`")
+                
+                # SAFETY CHECK: Prevent the unpack error
+                upload_result = await upload_to_r2(filename, msg)
+                if isinstance(upload_result, tuple):
+                    r2_url, code = upload_result
+                else:
+                    r2_url = upload_result
+                    code = "unknown"
+
+                await msg.edit(
+                    f"✅ **Leeched & Uploaded to R2!**\n\n🎬 `{os.path.basename(filename)}`\n🔗 `{r2_url}`",
+                    buttons=[[Button.inline("🗑️ Delete from R2", data=f"delr2_{code}")]] if code != "unknown" else None
+                )
             except Exception as e: 
                 await msg.edit(f"❌ Error: {e}")
             finally:
@@ -508,6 +468,22 @@ async def on_callback(event):
         await event.respond(f"🚀 **Direct Download Link:**\n\n`{hotlink}`\n\n💡 *Valid for 24 hours. Paste into IDM for max speed.*")
         return
 
+    if data.startswith("delr2_"):
+        code = data.split("_")[1]
+        item = link_storage.get(code)
+        if item and 's3_key' in item:
+            s3_key = item['s3_key']
+            await event.answer("Deleting file from R2...", alert=False)
+            try:
+                await asyncio.to_thread(sync_delete_r2_file, s3_key)
+                await event.edit(f"🗑️ **File Deleted from Cloudflare R2!**\n\nKey: `{s3_key}`")
+                force_system_ram_purge()
+            except Exception as e:
+                await event.edit(f"❌ Delete Error: {e}")
+        else:
+            await event.answer("❌ Reference expired or already deleted.", alert=True)
+        return
+
     if data.startswith("r2_"):
         msg_id = int(data.split("_")[1])
         await event.answer("Processing R2 Upload...", alert=False)
@@ -526,8 +502,18 @@ async def on_callback(event):
                         if f.tell() % (10 * 1024 * 1024) == 0: 
                             await status.edit(get_status_text("TG Down", filename, f.tell(), tg_msg.file.size, start_t))
                 
-                r2_url, _ = await upload_to_r2(filename, status)
-                await status.edit(f"✅ **Cloudflare R2 Complete!**\n\n🎬 `{os.path.basename(filename)}`\n🔗 `{r2_url}`")
+                # SAFETY CHECK
+                upload_result = await upload_to_r2(filename, status)
+                if isinstance(upload_result, tuple):
+                    r2_url, code = upload_result
+                else:
+                    r2_url = upload_result
+                    code = "unknown"
+
+                await status.edit(
+                    f"✅ **Cloudflare R2 Complete!**\n\n🎬 `{os.path.basename(filename)}`\n🔗 `{r2_url}`",
+                    buttons=[[Button.inline("🗑️ Delete from R2", data=f"delr2_{code}")]] if code != "unknown" else None
+                )
                 
             except Exception as e: 
                 await status.edit(f"❌ Error: {e}")
