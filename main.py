@@ -18,11 +18,11 @@ from urllib.parse import quote, unquote
 # Telegram Imports
 from telethon import TelegramClient, events, types, Button
 from telethon.network import ConnectionTcpFull
-from telethon.tl.functions.upload import SaveBigFilePartRequest, SaveFilePartRequest, GetFileRequest
+from telethon.tl.functions.upload import SaveBigFilePartRequest, SaveFilePartRequest
 from telethon.tl.types import InputFileBig, InputFile
 
 # Web & Storage Imports
-from aiohttp import web, ClientSession, FormData
+from aiohttp import web, ClientSession
 import aiohttp
 import boto3
 from boto3.s3.transfer import TransferConfig
@@ -51,29 +51,7 @@ global_semaphore = asyncio.Semaphore(4)
 link_storage = {}
 routes = web.RouteTableDef()
 
-# --- 2. AUTO-INSTALL ARIA2C BINARY IF MISSING ---
-def get_aria2_executable():
-    """Checks if aria2c is installed, if not, downloads a static binary automatically."""
-    if shutil.which('aria2c'):
-        return 'aria2c'
-    
-    local_aria = os.path.abspath('./aria2c')
-    if os.path.exists(local_aria):
-        return local_aria
-    
-    print("📥 Downloading static aria2c binary for Koyeb...")
-    try:
-        tar_url = "https://github.com/P3TERX/aria2-builder/releases/download/1.36.0/aria2-1.36.0-static-linux-amd64.tar.gz"
-        subprocess.run(f"wget -qO- {tar_url} | tar -xz", shell=True, check=True)
-        if os.path.exists('./aria2c'):
-            os.chmod('./aria2c', 0o755)
-            return local_aria
-    except Exception as e:
-        print(f"Failed to download aria2c binary: {e}")
-    
-    return 'aria2c'
-
-# --- 3. FILENAME CLEANERS ---
+# --- 2. FILENAME CLEANERS ---
 def clean_double_extension(filename):
     while filename.lower().endswith('.mp4.mp4') or filename.lower().endswith('.mkv.mkv'):
         filename = filename[:-4]
@@ -88,7 +66,7 @@ def get_unique_filename(filepath):
         counter += 1
     return f"{base}_{counter}{ext}"
 
-# --- 4. YT-DLP / GDRIVE ENGINE ---
+# --- 3. YT-DLP / GDRIVE ENGINE ---
 def sync_yt_dlp_download(url, custom_name=None):
     if custom_name:
         custom_name = get_unique_filename(custom_name)
@@ -114,7 +92,7 @@ def sync_yt_dlp_download(url, custom_name=None):
             filename = cleaned
         return filename
 
-# --- 5. C-LEVEL MEMORY PURGE ---
+# --- 4. C-LEVEL MEMORY PURGE ---
 def force_system_ram_purge():
     gc.collect()
     try: ctypes.CDLL('libc.so.6').malloc_trim(0)
@@ -129,10 +107,10 @@ def get_dir_size(path):
                 total += os.path.getsize(fp)
     return total
 
-# --- 6. SETUP CLIENT ---
+# --- 5. SETUP CLIENT ---
 client = TelegramClient('bot_session', int(API_ID), API_HASH, connection=ConnectionTcpFull, use_ipv6=False)
 
-# --- 7. UI HELPERS ---
+# --- 6. UI HELPERS ---
 def human_size(bytes):
     for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
         if bytes < 1024: return f"{bytes:.2f} {unit}"
@@ -153,7 +131,7 @@ def get_status_text(action, filename, current, total, start_time):
             f"⚡ **Speed:** `{human_size(speed)}/s`\n"
             f"📂 **Size:** `{human_size(current)} / {total_str}`")
 
-# --- 8. R2 CLIENT & SYNC S3 OPERATIONS ---
+# --- 7. R2 CLIENT & SYNC S3 OPERATIONS ---
 def get_r2_client():
     clean_id = R2_ACCOUNT_ID.replace("https://", "").replace("http://", "").split(".")[0].strip('/')
     endpoint = f"https://{clean_id}.r2.cloudflarestorage.com"
@@ -219,7 +197,7 @@ async def upload_to_r2(filename, status_msg, target_folder=None):
     link_storage[code] = {'s3_key': s3_key}
     return f"{R2_PUBLIC_URL}/{quote(s3_key, safe='/')}", code
 
-# --- 9. SECURED WEB DASHBOARD & ACTIONS ---
+# --- 8. SECURED WEB DASHBOARD & ACTIONS ---
 def check_dashboard_auth(request):
     auth_header = request.headers.get('Authorization')
     if not auth_header or not auth_header.startswith('Basic '): return False
@@ -234,7 +212,7 @@ DASHBOARD_CSS = """
     body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 20px; }
     .container { max-width: 1200px; margin: auto; }
     .header-bar { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; margin-bottom: 20px; gap: 15px; }
-    h2 { margin: 0; color: var(--text); font-size: 24px; display: flex; align-items: center; gap: 10px; border-bottom: 2px solid var(--border); padding-bottom: 10px; width: 100%; }
+    h2 { margin: 0; color: var(--text); font-size: 26px; display: flex; align-items: center; gap: 10px; border-bottom: 2px solid var(--border); padding-bottom: 10px; width: 100%; }
     .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 25px; }
     .stat-card { background: var(--card); padding: 15px; border-radius: 10px; border: 1px solid var(--border); box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
     .stat-title { font-size: 12px; color: var(--muted); text-transform: uppercase; font-weight: bold; margin-bottom: 5px; }
@@ -380,7 +358,7 @@ async def web_move_handler(request):
 
 @routes.get('/')
 async def root(request):
-    return web.Response(text="<html><body style='background:#0f172a;color:#38bdf8;text-align:center;padding-top:150px;font-family:sans-serif;'><h1 style='font-size:40px;'>✅ System Online</h1><a href='/dashboard' style='display:inline-block;margin-top:20px;padding:15px 30px;background:#38bdf8;color:#0f172a;text-decoration:none;border-radius:8px;font-weight:bold;font-size:18px;'>Go to Dashboard</a></body></html>", content_type='text/html')
+    return web.Response(text="<html><body style='background:#0f172a;color:#38bdf8;text-align:center;padding-top:150px;font-family:sans-serif;'><h1 style='font-size:40px;'>✅ System Online</h1><a href='/dashboard' style='style=display:inline-block;margin-top:20px;padding:15px 30px;background:#38bdf8;color:#0f172a;text-decoration:none;border-radius:8px;font-weight:bold;font-size:18px;'>Go to Dashboard</a></body></html>", content_type='text/html')
 
 @routes.get('/{code}/{filename}')
 async def stream_handler(request):
@@ -393,23 +371,23 @@ async def stream_handler(request):
     if range_header:
         match = re.search(r'bytes=(\d+)-', range_header)
         if match: start = int(match.group(1))
-    resp = web.StreamResponse(status=206 if range_header else 200, headers={'Content-Disposition': f'attachment; filename="{file_name}"', 'Accept-Ranges': 'bytes', 'Content-Type': 'video/mp4', 'Content-Length': str(msg.file.size - start)})
+    resp = web.StreamResponse(status=206 if start else 200, headers={'Content-Disposition': f'attachment; filename="{file_name}"', 'Accept-Ranges': 'bytes', 'Content-Type': 'video/mp4', 'Content-Length': str(msg.file.size - start)})
     await resp.prepare(request)
     try:
         async for chunk in client.iter_download(msg.media, offset=(start//1048576)*1048576, request_size=1048576): await resp.write(chunk)
     except: pass
     return resp
 
-# --- 10. MAGNET / TORRENT DOWNLOADER ---
+# --- 9. NATIVE TORRENT / MAGNET DOWNLOADER ---
 async def download_magnet(url, custom_name, msg, start_t):
-    aria_cmd = get_aria2_executable()
+    """Uses native aria2c installed in Docker."""
     dl_dir = f"downloads_{int(time.time())}"
     os.makedirs(dl_dir, exist_ok=True)
     
     await msg.edit("🧲 **Initializing Torrent Engine (aria2c)...**")
     
     process = await asyncio.create_subprocess_exec(
-        aria_cmd,
+        'aria2c',
         '--seed-time=0',
         '--max-connection-per-server=16',
         '--split=16',
@@ -460,7 +438,7 @@ async def download_magnet(url, custom_name, msg, start_t):
     
     return final_name
 
-# --- 11. HYBRID URL DOWNLOADER ---
+# --- 10. HYBRID URL DOWNLOADER ---
 async def download_any_url(url, custom_name, msg, start_t):
     if url.startswith("magnet:?"):
         return await download_magnet(url, custom_name, msg, start_t)
@@ -488,7 +466,7 @@ async def download_any_url(url, custom_name, msg, start_t):
                         await msg.edit(get_status_text("Leeching", filename, f.tell(), f_size, start_t))
             return filename
 
-# --- 12. BOT HANDLERS ---
+# --- 11. BOT HANDLERS ---
 @client.on(events.NewMessage(incoming=True))
 async def handle_new_message(event):
     if event.sender_id != ADMIN_ID: return
@@ -552,6 +530,22 @@ async def on_callback(event):
         await event.respond(f"🚀 **Direct Download Link:**\n\n`{base}/{code}/{quote(filename)}`\n\n💡 *Valid for 24 hours.*")
         return
 
+    if data.startswith("delr2_"):
+        code = data.split("_")[1]
+        item = link_storage.get(code)
+        if item and 's3_key' in item:
+            s3_key = item['s3_key']
+            await event.answer("Deleting file from R2...", alert=False)
+            try:
+                await asyncio.to_thread(sync_delete_r2_file, s3_key)
+                await event.edit(f"🗑️ **File Deleted from Cloudflare R2!**\n\nKey: `{s3_key}`")
+                force_system_ram_purge()
+            except Exception as e:
+                await event.edit(f"❌ Delete Error: {e}")
+        else:
+            await event.answer("❌ Reference expired or already deleted.", alert=True)
+        return
+
     if data.startswith("r2_"):
         msg_id = int(data.split("_")[1])
         await event.answer("Processing R2 Upload...", alert=False)
@@ -563,7 +557,6 @@ async def on_callback(event):
             status = await event.respond(f"⬇️ Downloading from Telegram...")
             start_t = time.time()
             try:
-                # RELIABLE 1MB STREAMING DOWNLOAD (5+ MB/s)
                 with open(filename, 'wb') as f:
                     async for chunk in client.iter_download(tg_msg.media, request_size=1048576):
                         f.write(chunk)
@@ -580,7 +573,7 @@ async def on_callback(event):
                 if os.path.exists(filename): os.remove(filename)
                 force_system_ram_purge()
 
-# --- 13. STARTUP ---
+# --- 12. STARTUP ---
 async def main():
     app = web.Application()
     app.add_routes(routes)
