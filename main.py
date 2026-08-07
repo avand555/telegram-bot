@@ -36,23 +36,31 @@ API_ID = os.environ.get("API_ID")
 API_HASH = os.environ.get("API_HASH")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
-# STRICT SINGLE ADMIN ACCESS
 ADMIN_ID = 716887656  
 
-# CLOUDFLARE R2 CREDENTIALS
 R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID", "").strip()
 R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID", "").strip()
 R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY", "").strip()
 R2_BUCKET_NAME = os.environ.get("R2_BUCKET_NAME", "").strip()
 R2_PUBLIC_URL = os.environ.get("R2_PUBLIC_URL", "").strip().rstrip('/')
 
-# DASHBOARD AUTHENTICATION
 DASHBOARD_USER = os.environ.get("DASHBOARD_USER", "admin").strip()
 DASHBOARD_PASS = os.environ.get("DASHBOARD_PASS", "admin123").strip()
 
+# HIGH-AVAILABILITY PUBLIC TRACKERS FOR FAST MAGNET METADATA FETCH
+PUBLIC_TRACKERS = ",".join([
+    "udp://tracker.opentrackr.org:1337/announce",
+    "http://tracker.openbittorrent.com:80/announce",
+    "udp://opentracker.i2p.rocks:6969/announce",
+    "udp://tracker.internetwarriors.net:1337/announce",
+    "udp://tracker.leechers-paradise.org:6969/announce",
+    "udp://coppersurfer.tk:6969/announce",
+    "udp://tracker.zerobytes.xyz:1337/announce"
+])
+
 global_semaphore = asyncio.Semaphore(4)
 link_storage = {}
-active_tasks = {} # Tracks active torrent tasks for cancelling
+active_tasks = {} 
 routes = web.RouteTableDef()
 
 # Regex to parse aria2c progress output
@@ -60,16 +68,25 @@ aria_re = re.compile(
     r'\[#(?P<gid>\w+)\s+(?P<downloaded>[^\s/]+)/(?P<total>[^\s\(\)]+)(?:\((?P<percent>\d+)%\))?\s+CN:(?P<cn>\d+)\s+SPD:(?P<speed>[^\s\]]+)(?:\s+ETA:(?P<eta>[^\s\]]+))?\]'
 )
 
-# --- 2. SYSTEM UTILITIES ---
+# --- 2. AUTO-BINARY DOWNLOADER ---
 def get_aria2_executable():
-    """Detects aria2c binary in system PATH or local folder."""
     if shutil.which('aria2c'):
         return 'aria2c'
     local_aria = os.path.abspath('./aria2c')
     if os.path.exists(local_aria):
         return local_aria
+    print("📥 Downloading static aria2c binary for Koyeb...")
+    try:
+        tar_url = "https://github.com/P3TERX/aria2-builder/releases/download/1.36.0/aria2-1.36.0-static-linux-amd64.tar.gz"
+        subprocess.run(f"wget -qO- {tar_url} | tar -xz", shell=True, check=True)
+        if os.path.exists('./aria2c'):
+            os.chmod('./aria2c', 0o755)
+            return local_aria
+    except Exception as e:
+        print(f"Failed to download aria2c binary: {e}")
     return 'aria2c'
 
+# --- 3. FILENAME CLEANERS ---
 def clean_double_extension(filename):
     while filename.lower().endswith('.mp4.mp4') or filename.lower().endswith('.mkv.mkv'):
         filename = filename[:-4]
@@ -84,21 +101,7 @@ def get_unique_filename(filepath):
         counter += 1
     return f"{base}_{counter}{ext}"
 
-def force_system_ram_purge():
-    gc.collect()
-    try: ctypes.CDLL('libc.so.6').malloc_trim(0)
-    except Exception: pass
-
-def get_dir_size(path):
-    total = 0
-    for dirpath, dirnames, filenames in os.walk(path):
-        for f in filenames:
-            fp = os.path.join(dirpath, f)
-            if not os.path.islink(fp):
-                total += os.path.getsize(fp)
-    return total
-
-# --- 3. YT-DLP / GDRIVE ENGINE ---
+# --- 4. YT-DLP / GDRIVE ENGINE ---
 def sync_yt_dlp_download(url, custom_name=None):
     if custom_name:
         custom_name = get_unique_filename(custom_name)
@@ -124,14 +127,29 @@ def sync_yt_dlp_download(url, custom_name=None):
             filename = cleaned
         return filename
 
-# --- 4. SETUP CLIENT ---
+# --- 5. C-LEVEL MEMORY PURGE ---
+def force_system_ram_purge():
+    gc.collect()
+    try: ctypes.CDLL('libc.so.6').malloc_trim(0)
+    except Exception: pass
+
+def get_dir_size(path):
+    total = 0
+    for dirpath, dirnames, filenames in os.walk(path):
+        for f in filenames:
+            fp = os.path.join(dirpath, f)
+            if not os.path.islink(fp):
+                total += os.path.getsize(fp)
+    return total
+
+# --- 6. SETUP CLIENT ---
 client = TelegramClient('bot_session', int(API_ID), API_HASH, connection=ConnectionTcpFull, use_ipv6=False)
 
-# --- 5. UI HELPERS ---
-def human_size(bytes_val):
+# --- 7. UI HELPERS ---
+def human_size(bytes):
     for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
-        if bytes_val < 1024: return f"{bytes_val:.2f} {unit}"
-        bytes_val /= 1024
+        if bytes < 1024: return f"{bytes:.2f} {unit}"
+        bytes /= 1024
     return "0 B"
 
 def format_saas_progress(action, filename, percent, downloaded, total, speed, eta, cn, elapsed, task_code):
@@ -142,7 +160,7 @@ def format_saas_progress(action, filename, percent, downloaded, total, speed, et
         p_bar += "○" * (9 - done)
         
     return (
-        f"🚀 **{action}...**\n"
+        f"🧲 **{action}...**\n"
         f"╭ `[{p_bar}]` » `{percent}%`\n"
         f"├ **Processed:** `{downloaded} of {total}`\n"
         f"├ **Speed:** `{speed}`\n"
@@ -178,7 +196,7 @@ def get_readable_time(seconds: int) -> str:
     result += f"{int(seconds)}s"
     return result
 
-# --- 6. R2 CLIENT & S3 OPERATIONS ---
+# --- 8. R2 CLIENT & S3 OPERATIONS ---
 def get_r2_client():
     clean_id = R2_ACCOUNT_ID.replace("https://", "").replace("http://", "").split(".")[0].strip('/')
     endpoint = f"https://{clean_id}.r2.cloudflarestorage.com"
@@ -244,7 +262,7 @@ async def upload_to_r2(filename, status_msg, target_folder=None):
     link_storage[code] = {'s3_key': s3_key}
     return f"{R2_PUBLIC_URL}/{quote(s3_key, safe='/')}", code
 
-# --- 7. SECURED WEB DASHBOARD & ACTIONS ---
+# --- 9. SECURED WEB DASHBOARD ---
 def check_dashboard_auth(request):
     auth_header = request.headers.get('Authorization')
     if not auth_header or not auth_header.startswith('Basic '): return False
@@ -425,20 +443,24 @@ async def stream_handler(request):
     except: pass
     return resp
 
-# --- 8. NATIVE TORRENT / MAGNET DOWNLOADER ---
+# --- 10. NATIVE TORRENT / MAGNET DOWNLOADER (OPTIMIZED FOR TRACKERS) ---
 async def download_magnet(url, custom_name, msg, start_t):
     aria_cmd = get_aria2_executable()
     dl_dir = f"downloads_{int(time.time())}"
     os.makedirs(dl_dir, exist_ok=True)
     
-    await msg.edit("🧲 **Initializing Torrent Engine (aria2c)...**")
+    await msg.edit("🧲 **Connecting to Torrent Swarm & Trackers...**\n*(Finding peers...)*")
     
+    # Process aria2c with Tracker Boost & 2 min Timeout for dead seeds
     process = await asyncio.create_subprocess_exec(
         aria_cmd,
         '--seed-time=0',
         '--max-connection-per-server=16',
         '--split=16',
-        '--summary-interval=3',
+        '--summary-interval=2',
+        '--bt-stop-timeout=120', # Stop after 2 mins if 0 seeders
+        f'--bt-tracker={PUBLIC_TRACKERS}',
+        '--enable-dht=true',
         f'--dir={dl_dir}',
         url,
         stdout=asyncio.subprocess.PIPE,
@@ -467,6 +489,7 @@ async def download_magnet(url, custom_name, msg, start_t):
             speed = match.group('speed') + "/s"
             eta = match.group('eta') or "Calculating..."
             
+            # Dynamically find the main file being downloaded
             active_file = "Fetching Metadata..."
             for r_dir, dirs, files in os.walk(dl_dir):
                 for f in files:
@@ -475,13 +498,15 @@ async def download_magnet(url, custom_name, msg, start_t):
                         break
             
             now = time.time()
-            if now - last_update > 4:
+            if now - last_update > 3:
                 elapsed = get_readable_time(int(now - start_t))
                 p_text = format_saas_progress("Download", active_file, percent, downloaded, total, speed, eta, cn, elapsed, task_code)
                 try:
                     await msg.edit(p_text, buttons=[[Button.inline("❌ Cancel", data=f"canceltask_{task_code}")]])
                     last_update = now
                 except: pass
+
+    await process.wait()
 
     largest_file = None
     max_size = 0
@@ -493,10 +518,10 @@ async def download_magnet(url, custom_name, msg, start_t):
                 max_size = sz
                 largest_file = fp
 
-    if not largest_file:
+    if not largest_file or max_size == 0:
         shutil.rmtree(dl_dir, ignore_errors=True)
         active_tasks.pop(task_code, None)
-        raise ValueError("Torrent downloaded but no video file found!")
+        raise ValueError("Torrent failed! 0 seeders found or connection timed out.")
 
     final_name = custom_name if custom_name else os.path.basename(largest_file)
     final_name = get_unique_filename(clean_double_extension(re.sub(r'[\\/*?:"<>|]', "", final_name)))
@@ -507,13 +532,13 @@ async def download_magnet(url, custom_name, msg, start_t):
     
     return final_name
 
-# --- 9. HYBRID URL DOWNLOADER ---
+# --- 11. HYBRID URL DOWNLOADER ---
 async def download_any_url(url, custom_name, msg, start_t):
     if url.startswith("magnet:?"):
         return await download_magnet(url, custom_name, msg, start_t)
 
     try:
-        await msg.edit("🅿️ **Extracting File Info via yt-dlp...**")
+        await msg.edit("®️ **Extracting File Info via yt-dlp...**")
         filename = await asyncio.to_thread(sync_yt_dlp_download, url, custom_name)
         if filename and os.path.exists(filename) and os.path.getsize(filename) > 0:
             return filename
@@ -535,7 +560,7 @@ async def download_any_url(url, custom_name, msg, start_t):
                         await msg.edit(get_status_text("Leeching", filename, f.tell(), f_size, start_t))
             return filename
 
-# --- 10. BOT HANDLERS ---
+# --- 12. BOT HANDLERS ---
 @client.on(events.NewMessage(incoming=True))
 async def handle_new_message(event):
     if event.sender_id != ADMIN_ID: return
@@ -670,7 +695,7 @@ async def on_callback(event):
                 if os.path.exists(filename): os.remove(filename)
                 force_system_ram_purge()
 
-# --- 11. STARTUP ---
+# --- 13. STARTUP ---
 async def main():
     app = web.Application()
     app.add_routes(routes)
