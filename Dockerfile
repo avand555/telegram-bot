@@ -1,11 +1,9 @@
 FROM python:3.10-slim
 
-# Install system utilities, native aria2c, and ffmpeg
+# Install core Linux tools natively
 RUN apt-get update && apt-get install -y \
     aria2 \
     ffmpeg \
-    procps \
-    psmisc \
     wget \
     curl \
     && rm -rf /var/lib/apt/lists/*
@@ -16,12 +14,12 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application source code
+# Copy your bot code
 COPY . .
 
-# Expose default HTTP port
+# Expose Port for Koyeb Health Checks
 ENV PORT=8000
 EXPOSE 8000
 
-# Start application
+# Start the Bot
 CMD ["python", "main.py"]
