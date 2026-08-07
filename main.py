@@ -36,14 +36,17 @@ API_ID = os.environ.get("API_ID")
 API_HASH = os.environ.get("API_HASH")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
+# STRICT SINGLE ADMIN ACCESS
 ADMIN_ID = 716887656  
 
+# CLOUDFLARE R2 CREDENTIALS
 R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID", "").strip()
 R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID", "").strip()
 R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY", "").strip()
 R2_BUCKET_NAME = os.environ.get("R2_BUCKET_NAME", "").strip()
 R2_PUBLIC_URL = os.environ.get("R2_PUBLIC_URL", "").strip().rstrip('/')
 
+# DASHBOARD AUTHENTICATION
 DASHBOARD_USER = os.environ.get("DASHBOARD_USER", "admin").strip()
 DASHBOARD_PASS = os.environ.get("DASHBOARD_PASS", "admin123").strip()
 
@@ -52,30 +55,21 @@ link_storage = {}
 active_tasks = {} # Tracks active torrent tasks for cancelling
 routes = web.RouteTableDef()
 
-# Regex to parse aria2c progress output line-by-line
+# Regex to parse aria2c progress output
 aria_re = re.compile(
     r'\[#(?P<gid>\w+)\s+(?P<downloaded>[^\s/]+)/(?P<total>[^\s\(\)]+)(?:\((?P<percent>\d+)%\))?\s+CN:(?P<cn>\d+)\s+SPD:(?P<speed>[^\s\]]+)(?:\s+ETA:(?P<eta>[^\s\]]+))?\]'
 )
 
-# --- 2. AUTO-BINARY DOWNLOADER (DOUBLE-SAFETY NET) ---
+# --- 2. SYSTEM UTILITIES ---
 def get_aria2_executable():
+    """Detects aria2c binary in system PATH or local folder."""
     if shutil.which('aria2c'):
         return 'aria2c'
     local_aria = os.path.abspath('./aria2c')
     if os.path.exists(local_aria):
         return local_aria
-    print("📥 Downloading static aria2c binary for Koyeb...")
-    try:
-        tar_url = "https://github.com/P3TERX/aria2-builder/releases/download/1.36.0/aria2-1.36.0-static-linux-amd64.tar.gz"
-        subprocess.run(f"wget -qO- {tar_url} | tar -xz", shell=True, check=True)
-        if os.path.exists('./aria2c'):
-            os.chmod('./aria2c', 0o755)
-            return local_aria
-    except Exception as e:
-        print(f"Failed to download aria2c binary: {e}")
     return 'aria2c'
 
-# --- 3. FILENAME CLEANERS ---
 def clean_double_extension(filename):
     while filename.lower().endswith('.mp4.mp4') or filename.lower().endswith('.mkv.mkv'):
         filename = filename[:-4]
@@ -90,7 +84,21 @@ def get_unique_filename(filepath):
         counter += 1
     return f"{base}_{counter}{ext}"
 
-# --- 4. YT-DLP / GDRIVE ENGINE ---
+def force_system_ram_purge():
+    gc.collect()
+    try: ctypes.CDLL('libc.so.6').malloc_trim(0)
+    except Exception: pass
+
+def get_dir_size(path):
+    total = 0
+    for dirpath, dirnames, filenames in os.walk(path):
+        for f in filenames:
+            fp = os.path.join(dirpath, f)
+            if not os.path.islink(fp):
+                total += os.path.getsize(fp)
+    return total
+
+# --- 3. YT-DLP / GDRIVE ENGINE ---
 def sync_yt_dlp_download(url, custom_name=None):
     if custom_name:
         custom_name = get_unique_filename(custom_name)
@@ -116,33 +124,17 @@ def sync_yt_dlp_download(url, custom_name=None):
             filename = cleaned
         return filename
 
-# --- 5. C-LEVEL MEMORY PURGE ---
-def force_system_ram_purge():
-    gc.collect()
-    try: ctypes.CDLL('libc.so.6').malloc_trim(0)
-    except Exception: pass
-
-def get_dir_size(path):
-    total = 0
-    for dirpath, dirnames, filenames in os.walk(path):
-        for f in filenames:
-            fp = os.path.join(dirpath, f)
-            if not os.path.islink(fp):
-                total += os.path.getsize(fp)
-    return total
-
-# --- 6. SETUP CLIENT ---
+# --- 4. SETUP CLIENT ---
 client = TelegramClient('bot_session', int(API_ID), API_HASH, connection=ConnectionTcpFull, use_ipv6=False)
 
-# --- 7. UI HELPERS ---
-def human_size(bytes):
+# --- 5. UI HELPERS ---
+def human_size(bytes_val):
     for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
-        if bytes < 1024: return f"{bytes:.2f} {unit}"
-        bytes /= 1024
+        if bytes_val < 1024: return f"{bytes_val:.2f} {unit}"
+        bytes_val /= 1024
     return "0 B"
 
 def format_saas_progress(action, filename, percent, downloaded, total, speed, eta, cn, elapsed, task_code):
-    """Generates the advanced progress bar formatting."""
     done = int(percent // 10)
     p_bar = "●" * done
     if done < 10:
@@ -150,15 +142,14 @@ def format_saas_progress(action, filename, percent, downloaded, total, speed, et
         p_bar += "○" * (9 - done)
         
     return (
-        f"3. {action}...\n"
+        f"🚀 **{action}...**\n"
         f"╭ `[{p_bar}]` » `{percent}%`\n"
         f"├ **Processed:** `{downloaded} of {total}`\n"
         f"├ **Speed:** `{speed}`\n"
         f"├ **ETA:** `{eta}`\n"
-        f"├ **S/L (Peers):** `{cn}`\n"
+        f"├ **Peers (CN):** `{cn}`\n"
         f"├ **Elapsed:** `{elapsed}`\n"
-        f"├ **Engine:** `Aria2 v1.36.0`\n"
-        f"├ **Action:** `/leech`\n"
+        f"├ **Engine:** `Aria2 / Docker Native`\n"
         f"╰ **Cancel:** `/c_{task_code}`"
     )
 
@@ -176,7 +167,18 @@ def get_status_text(action, filename, current, total, start_time):
             f"⚡ **Speed:** `{human_size(speed)}/s`\n"
             f"📂 **Size:** `{human_size(current)} / {total_str}`")
 
-# --- 8. R2 CLIENT & S3 OPERATIONS ---
+def get_readable_time(seconds: int) -> str:
+    result = ""
+    (days, remainder) = divmod(seconds, 86400)
+    if days: result += f"{int(days)}d "
+    (hours, remainder) = divmod(remainder, 3600)
+    if hours: result += f"{int(hours)}h "
+    (minutes, seconds) = divmod(remainder, 60)
+    if minutes: result += f"{int(minutes)}m "
+    result += f"{int(seconds)}s"
+    return result
+
+# --- 6. R2 CLIENT & S3 OPERATIONS ---
 def get_r2_client():
     clean_id = R2_ACCOUNT_ID.replace("https://", "").replace("http://", "").split(".")[0].strip('/')
     endpoint = f"https://{clean_id}.r2.cloudflarestorage.com"
@@ -202,6 +204,7 @@ def sync_rename_r2_file(old_key, new_key):
 def sync_r2_upload(filename, s3_key, loop, status_msg, start_t):
     s3 = get_r2_client()
     file_size = os.path.getsize(filename)
+    
     mime_type, _ = mimetypes.guess_type(filename)
     if not mime_type: mime_type = 'video/mp4'
 
@@ -241,8 +244,7 @@ async def upload_to_r2(filename, status_msg, target_folder=None):
     link_storage[code] = {'s3_key': s3_key}
     return f"{R2_PUBLIC_URL}/{quote(s3_key, safe='/')}", code
 
-
-# --- 9. SECURED WEB DASHBOARD ---
+# --- 7. SECURED WEB DASHBOARD & ACTIONS ---
 def check_dashboard_auth(request):
     auth_header = request.headers.get('Authorization')
     if not auth_header or not auth_header.startswith('Basic '): return False
@@ -346,11 +348,29 @@ async def dashboard_handler(request):
                 size_str, timestamp = human_size(size_bytes), obj['LastModified'].timestamp()
                 date_str = obj['LastModified'].strftime("%Y-%m-%d %H:%M")
                 url = f"{R2_PUBLIC_URL}/{quote(name, safe='/')}"
-                file_rows += f"<tr><td data-val=\"{name}\"><span class=\"file-name\">{name}</span></td><td data-val=\"{size_bytes}\">{size_str}</td><td data-val=\"{timestamp}\">{date_str}</td><td><div class=\"actions\"><button class=\"btn btn-copy\" onclick=\"copyText('{url}')\">🔗 Copy</button><a href=\"{url}\" target=\"_blank\" class=\"btn btn-view\">▶️ Play</a><button class=\"btn btn-move\" onclick=\"moveFolder('{quote(name)}')\">📁 Move</button><button class=\"btn btn-rename\" onclick=\"renameFile('{quote(name)}')\">✏️ Rename</button><button class=\"btn btn-delete\" onclick=\"deleteFile('{quote(name)}')\">🗑️ Delete</button></div></td></tr>"
+                file_rows += f"""<tr>
+                    <td data-val="{name}"><span class="file-name">{name}</span></td>
+                    <td data-val="{size_bytes}">{size_str}</td><td data-val="{timestamp}">{date_str}</td>
+                    <td><div class="actions">
+                        <button class="btn btn-copy" onclick="copyText('{url}')">🔗 Copy</button>
+                        <a href="{url}" target="_blank" class="btn btn-view">▶️ Play</a>
+                        <button class="btn btn-move" onclick="moveFolder('{quote(name)}')">📁 Move</button>
+                        <button class="btn btn-rename" onclick="renameFile('{quote(name)}')">✏️ Rename</button>
+                        <button class="btn btn-delete" onclick="deleteFile('{quote(name)}')">🗑️ Delete</button>
+                    </div></td></tr>"""
         else: file_rows = "<tr><td colspan='4' style='text-align:center; color:#94a3b8;'>No files found.</td></tr>"
     except Exception as e: file_rows = f"<tr><td colspan='4' style='color:#fb7185;'>Error connecting to R2: {str(e)}</td></tr>"
 
-    html = f"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Cloudflare R2 Manager</title><style>{DASHBOARD_CSS}</style><script>{DASHBOARD_JS}</script></head><body><div class="container"><div class="header-bar"><h2>🛡️ Cloudflare R2 Manager</h2></div><div class="stats-grid"><div class="stat-card"><div class="stat-title">Storage Used</div><div class="stat-val">{human_size(total_size_bytes) if total_size_bytes else '0 B'}</div></div><div class="stat-card"><div class="stat-title">Total Files</div><div class="stat-val">{total_files}</div></div><div class="stat-card"><div class="stat-title">Active Bucket</div><div class="stat-val">{R2_BUCKET_NAME}</div></div></div><div class="controls"><input type="text" id="searchInput" class="search-box" onkeyup="filterTable()" placeholder="🔍 Search files by name or folder..."></div><div class="table-wrapper"><table><thead><tr><th id="th-0" onclick="sortTable(0, 'str')">File Path / Name <span></span></th><th id="th-1" onclick="sortTable(1, 'num')">Size <span></span></th><th id="th-2" onclick="sortTable(2, 'num')">Date Uploaded <span>🔽</span></th><th>Actions</th></tr></thead><tbody>{file_rows}</tbody></table></div></div></body></html>"""
+    html = f"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Cloudflare R2 Manager</title><style>{DASHBOARD_CSS}</style><script>{DASHBOARD_JS}</script></head><body>
+        <div class="container"><div class="header-bar"><h2>🛡️ Cloudflare R2 Manager</h2></div>
+            <div class="stats-grid">
+                <div class="stat-card"><div class="stat-title">Storage Used</div><div class="stat-val">{human_size(total_size_bytes) if total_size_bytes else '0 B'}</div></div>
+                <div class="stat-card"><div class="stat-title">Total Files</div><div class="stat-val">{total_files}</div></div>
+                <div class="stat-card"><div class="stat-title">Active Bucket</div><div class="stat-val">{R2_BUCKET_NAME}</div></div>
+            </div>
+            <div class="controls"><input type="text" id="searchInput" class="search-box" onkeyup="filterTable()" placeholder="🔍 Search files by name or folder..."></div>
+            <div class="table-wrapper"><table><thead><tr><th id="th-0" onclick="sortTable(0, 'str')">File Path / Name <span></span></th><th id="th-1" onclick="sortTable(1, 'num')">Size <span></span></th><th id="th-2" onclick="sortTable(2, 'num')">Date Uploaded <span>🔽</span></th><th>Actions</th></tr></thead><tbody>{file_rows}</tbody></table></div>
+        </div></body></html>"""
     return web.Response(text=html, content_type='text/html')
 
 @routes.get('/delete_file')
@@ -398,14 +418,14 @@ async def stream_handler(request):
     if range_header:
         match = re.search(r'bytes=(\d+)-', range_header)
         if match: start = int(match.group(1))
-    resp = web.StreamResponse(status=206 if range_header else 200, headers={'Content-Disposition': f'attachment; filename="{file_name}"', 'Accept-Ranges': 'bytes', 'Content-Type': 'video/mp4', 'Content-Length': str(msg.file.size - start)})
+    resp = web.StreamResponse(status=206 if start else 200, headers={'Content-Disposition': f'attachment; filename="{file_name}"', 'Accept-Ranges': 'bytes', 'Content-Type': 'video/mp4', 'Content-Length': str(msg.file.size - start)})
     await resp.prepare(request)
     try:
         async for chunk in client.iter_download(msg.media, offset=(start//1048576)*1048576, request_size=1048576): await resp.write(chunk)
     except: pass
     return resp
 
-# --- 9. NATIVE TORRENT / MAGNET DOWNLOADER (ADVANCED PARSER) ---
+# --- 8. NATIVE TORRENT / MAGNET DOWNLOADER ---
 async def download_magnet(url, custom_name, msg, start_t):
     aria_cmd = get_aria2_executable()
     dl_dir = f"downloads_{int(time.time())}"
@@ -418,14 +438,13 @@ async def download_magnet(url, custom_name, msg, start_t):
         '--seed-time=0',
         '--max-connection-per-server=16',
         '--split=16',
-        '--summary-interval=3', # Fast output updates
+        '--summary-interval=3',
         f'--dir={dl_dir}',
         url,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE
     )
 
-    # Store task details globally so it can be canceled by /c_<code>
     task_code = secrets.token_urlsafe(8)
     active_tasks[task_code] = {
         'process': process,
@@ -439,7 +458,6 @@ async def download_magnet(url, custom_name, msg, start_t):
         if not line_bytes: break
         line = line_bytes.decode('utf-8', errors='ignore').strip()
         
-        # Match Aria2c stdout progress line
         match = aria_re.search(line)
         if match:
             percent = int(match.group('percent') or 0)
@@ -449,7 +467,6 @@ async def download_magnet(url, custom_name, msg, start_t):
             speed = match.group('speed') + "/s"
             eta = match.group('eta') or "Calculating..."
             
-            # Dynamic Filename Scanner (Scans directory to find active video file)
             active_file = "Fetching Metadata..."
             for r_dir, dirs, files in os.walk(dl_dir):
                 for f in files:
@@ -466,7 +483,6 @@ async def download_magnet(url, custom_name, msg, start_t):
                     last_update = now
                 except: pass
 
-    # Torrent complete. Find largest file.
     largest_file = None
     max_size = 0
     for root_dir, dirs, files in os.walk(dl_dir):
@@ -491,7 +507,7 @@ async def download_magnet(url, custom_name, msg, start_t):
     
     return final_name
 
-# --- 10. HYBRID URL DOWNLOADER ---
+# --- 9. HYBRID URL DOWNLOADER ---
 async def download_any_url(url, custom_name, msg, start_t):
     if url.startswith("magnet:?"):
         return await download_magnet(url, custom_name, msg, start_t)
@@ -519,12 +535,11 @@ async def download_any_url(url, custom_name, msg, start_t):
                         await msg.edit(get_status_text("Leeching", filename, f.tell(), f_size, start_t))
             return filename
 
-# --- 11. BOT HANDLERS ---
+# --- 10. BOT HANDLERS ---
 @client.on(events.NewMessage(incoming=True))
 async def handle_new_message(event):
     if event.sender_id != ADMIN_ID: return
 
-    # Custom Task Cancel Command (e.g. /c_a1b2c3d4)
     if event.text and event.text.startswith('/c_'):
         code = event.text.split('/c_')[1].strip()
         item = active_tasks.get(code)
@@ -583,7 +598,6 @@ async def on_callback(event):
     if event.sender_id != ADMIN_ID: return
     data = event.data.decode()
     
-    # Handle inline button cancels
     if data.startswith("canceltask_"):
         code = data.split("_")[1]
         item = active_tasks.get(code)
@@ -656,7 +670,7 @@ async def on_callback(event):
                 if os.path.exists(filename): os.remove(filename)
                 force_system_ram_purge()
 
-# --- 13. STARTUP ---
+# --- 11. STARTUP ---
 async def main():
     app = web.Application()
     app.add_routes(routes)
