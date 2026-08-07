@@ -4,4 +4,3 @@ cryptg
 hachoir
 boto3
 yt-dlp
-aria2
