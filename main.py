@@ -18,11 +18,11 @@ from urllib.parse import quote, unquote
 # Telegram Imports
 from telethon import TelegramClient, events, types, Button
 from telethon.network import ConnectionTcpFull
-from telethon.tl.functions.upload import SaveBigFilePartRequest, SaveFilePartRequest
+from telethon.tl.functions.upload import SaveBigFilePartRequest, SaveFilePartRequest, GetFileRequest
 from telethon.tl.types import InputFileBig, InputFile
 
 # Web & Storage Imports
-from aiohttp import web, ClientSession
+from aiohttp import web, ClientSession, FormData
 import aiohttp
 import boto3
 from boto3.s3.transfer import TransferConfig
@@ -49,9 +49,33 @@ DASHBOARD_PASS = os.environ.get("DASHBOARD_PASS", "admin123").strip()
 
 global_semaphore = asyncio.Semaphore(4)
 link_storage = {}
+active_tasks = {} # Tracks active torrent tasks for cancelling
 routes = web.RouteTableDef()
 
-# --- 2. FILENAME CLEANERS ---
+# Regex to parse aria2c progress output line-by-line
+aria_re = re.compile(
+    r'\[#(?P<gid>\w+)\s+(?P<downloaded>[^\s/]+)/(?P<total>[^\s\(\)]+)(?:\((?P<percent>\d+)%\))?\s+CN:(?P<cn>\d+)\s+SPD:(?P<speed>[^\s\]]+)(?:\s+ETA:(?P<eta>[^\s\]]+))?\]'
+)
+
+# --- 2. AUTO-BINARY DOWNLOADER (DOUBLE-SAFETY NET) ---
+def get_aria2_executable():
+    if shutil.which('aria2c'):
+        return 'aria2c'
+    local_aria = os.path.abspath('./aria2c')
+    if os.path.exists(local_aria):
+        return local_aria
+    print("📥 Downloading static aria2c binary for Koyeb...")
+    try:
+        tar_url = "https://github.com/P3TERX/aria2-builder/releases/download/1.36.0/aria2-1.36.0-static-linux-amd64.tar.gz"
+        subprocess.run(f"wget -qO- {tar_url} | tar -xz", shell=True, check=True)
+        if os.path.exists('./aria2c'):
+            os.chmod('./aria2c', 0o755)
+            return local_aria
+    except Exception as e:
+        print(f"Failed to download aria2c binary: {e}")
+    return 'aria2c'
+
+# --- 3. FILENAME CLEANERS ---
 def clean_double_extension(filename):
     while filename.lower().endswith('.mp4.mp4') or filename.lower().endswith('.mkv.mkv'):
         filename = filename[:-4]
@@ -66,7 +90,7 @@ def get_unique_filename(filepath):
         counter += 1
     return f"{base}_{counter}{ext}"
 
-# --- 3. YT-DLP / GDRIVE ENGINE ---
+# --- 4. YT-DLP / GDRIVE ENGINE ---
 def sync_yt_dlp_download(url, custom_name=None):
     if custom_name:
         custom_name = get_unique_filename(custom_name)
@@ -92,7 +116,7 @@ def sync_yt_dlp_download(url, custom_name=None):
             filename = cleaned
         return filename
 
-# --- 4. C-LEVEL MEMORY PURGE ---
+# --- 5. C-LEVEL MEMORY PURGE ---
 def force_system_ram_purge():
     gc.collect()
     try: ctypes.CDLL('libc.so.6').malloc_trim(0)
@@ -107,15 +131,36 @@ def get_dir_size(path):
                 total += os.path.getsize(fp)
     return total
 
-# --- 5. SETUP CLIENT ---
+# --- 6. SETUP CLIENT ---
 client = TelegramClient('bot_session', int(API_ID), API_HASH, connection=ConnectionTcpFull, use_ipv6=False)
 
-# --- 6. UI HELPERS ---
+# --- 7. UI HELPERS ---
 def human_size(bytes):
     for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
         if bytes < 1024: return f"{bytes:.2f} {unit}"
         bytes /= 1024
     return "0 B"
+
+def format_saas_progress(action, filename, percent, downloaded, total, speed, eta, cn, elapsed, task_code):
+    """Generates the advanced progress bar formatting."""
+    done = int(percent // 10)
+    p_bar = "●" * done
+    if done < 10:
+        p_bar += "◔" if (percent % 10) >= 5 else "○"
+        p_bar += "○" * (9 - done)
+        
+    return (
+        f"3. {action}...\n"
+        f"╭ `[{p_bar}]` » `{percent}%`\n"
+        f"├ **Processed:** `{downloaded} of {total}`\n"
+        f"├ **Speed:** `{speed}`\n"
+        f"├ **ETA:** `{eta}`\n"
+        f"├ **S/L (Peers):** `{cn}`\n"
+        f"├ **Elapsed:** `{elapsed}`\n"
+        f"├ **Engine:** `Aria2 v1.36.0`\n"
+        f"├ **Action:** `/leech`\n"
+        f"╰ **Cancel:** `/c_{task_code}`"
+    )
 
 def get_status_text(action, filename, current, total, start_time):
     now = time.time()
@@ -131,7 +176,7 @@ def get_status_text(action, filename, current, total, start_time):
             f"⚡ **Speed:** `{human_size(speed)}/s`\n"
             f"📂 **Size:** `{human_size(current)} / {total_str}`")
 
-# --- 7. R2 CLIENT & SYNC S3 OPERATIONS ---
+# --- 8. R2 CLIENT & S3 OPERATIONS ---
 def get_r2_client():
     clean_id = R2_ACCOUNT_ID.replace("https://", "").replace("http://", "").split(".")[0].strip('/')
     endpoint = f"https://{clean_id}.r2.cloudflarestorage.com"
@@ -157,7 +202,6 @@ def sync_rename_r2_file(old_key, new_key):
 def sync_r2_upload(filename, s3_key, loop, status_msg, start_t):
     s3 = get_r2_client()
     file_size = os.path.getsize(filename)
-    
     mime_type, _ = mimetypes.guess_type(filename)
     if not mime_type: mime_type = 'video/mp4'
 
@@ -197,7 +241,8 @@ async def upload_to_r2(filename, status_msg, target_folder=None):
     link_storage[code] = {'s3_key': s3_key}
     return f"{R2_PUBLIC_URL}/{quote(s3_key, safe='/')}", code
 
-# --- 8. SECURED WEB DASHBOARD & ACTIONS ---
+
+# --- 9. SECURED WEB DASHBOARD ---
 def check_dashboard_auth(request):
     auth_header = request.headers.get('Authorization')
     if not auth_header or not auth_header.startswith('Basic '): return False
@@ -212,7 +257,7 @@ DASHBOARD_CSS = """
     body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 20px; }
     .container { max-width: 1200px; margin: auto; }
     .header-bar { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; margin-bottom: 20px; gap: 15px; }
-    h2 { margin: 0; color: var(--text); font-size: 26px; display: flex; align-items: center; gap: 10px; border-bottom: 2px solid var(--border); padding-bottom: 10px; width: 100%; }
+    h2 { margin: 0; color: var(--text); font-size: 24px; display: flex; align-items: center; gap: 10px; border-bottom: 2px solid var(--border); padding-bottom: 10px; width: 100%; }
     .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 25px; }
     .stat-card { background: var(--card); padding: 15px; border-radius: 10px; border: 1px solid var(--border); box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
     .stat-title { font-size: 12px; color: var(--muted); text-transform: uppercase; font-weight: bold; margin-bottom: 5px; }
@@ -301,29 +346,11 @@ async def dashboard_handler(request):
                 size_str, timestamp = human_size(size_bytes), obj['LastModified'].timestamp()
                 date_str = obj['LastModified'].strftime("%Y-%m-%d %H:%M")
                 url = f"{R2_PUBLIC_URL}/{quote(name, safe='/')}"
-                file_rows += f"""<tr>
-                    <td data-val="{name}"><span class="file-name">{name}</span></td>
-                    <td data-val="{size_bytes}">{size_str}</td><td data-val="{timestamp}">{date_str}</td>
-                    <td><div class="actions">
-                        <button class="btn btn-copy" onclick="copyText('{url}')">🔗 Copy</button>
-                        <a href="{url}" target="_blank" class="btn btn-view">▶️ Play</a>
-                        <button class="btn btn-move" onclick="moveFolder('{quote(name)}')">📁 Move</button>
-                        <button class="btn btn-rename" onclick="renameFile('{quote(name)}')">✏️ Rename</button>
-                        <button class="btn btn-delete" onclick="deleteFile('{quote(name)}')">🗑️ Delete</button>
-                    </div></td></tr>"""
+                file_rows += f"<tr><td data-val=\"{name}\"><span class=\"file-name\">{name}</span></td><td data-val=\"{size_bytes}\">{size_str}</td><td data-val=\"{timestamp}\">{date_str}</td><td><div class=\"actions\"><button class=\"btn btn-copy\" onclick=\"copyText('{url}')\">🔗 Copy</button><a href=\"{url}\" target=\"_blank\" class=\"btn btn-view\">▶️ Play</a><button class=\"btn btn-move\" onclick=\"moveFolder('{quote(name)}')\">📁 Move</button><button class=\"btn btn-rename\" onclick=\"renameFile('{quote(name)}')\">✏️ Rename</button><button class=\"btn btn-delete\" onclick=\"deleteFile('{quote(name)}')\">🗑️ Delete</button></div></td></tr>"
         else: file_rows = "<tr><td colspan='4' style='text-align:center; color:#94a3b8;'>No files found.</td></tr>"
     except Exception as e: file_rows = f"<tr><td colspan='4' style='color:#fb7185;'>Error connecting to R2: {str(e)}</td></tr>"
 
-    html = f"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Cloudflare R2 Manager</title><style>{DASHBOARD_CSS}</style><script>{DASHBOARD_JS}</script></head><body>
-        <div class="container"><div class="header-bar"><h2>🛡️ Cloudflare R2 Manager</h2></div>
-            <div class="stats-grid">
-                <div class="stat-card"><div class="stat-title">Storage Used</div><div class="stat-val">{human_size(total_size_bytes) if total_size_bytes else '0 B'}</div></div>
-                <div class="stat-card"><div class="stat-title">Total Files</div><div class="stat-val">{total_files}</div></div>
-                <div class="stat-card"><div class="stat-title">Active Bucket</div><div class="stat-val">{R2_BUCKET_NAME}</div></div>
-            </div>
-            <div class="controls"><input type="text" id="searchInput" class="search-box" onkeyup="filterTable()" placeholder="🔍 Search files by name or folder..."></div>
-            <div class="table-wrapper"><table><thead><tr><th id="th-0" onclick="sortTable(0, 'str')">File Path / Name <span></span></th><th id="th-1" onclick="sortTable(1, 'num')">Size <span></span></th><th id="th-2" onclick="sortTable(2, 'num')">Date Uploaded <span>🔽</span></th><th>Actions</th></tr></thead><tbody>{file_rows}</tbody></table></div>
-        </div></body></html>"""
+    html = f"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Cloudflare R2 Manager</title><style>{DASHBOARD_CSS}</style><script>{DASHBOARD_JS}</script></head><body><div class="container"><div class="header-bar"><h2>🛡️ Cloudflare R2 Manager</h2></div><div class="stats-grid"><div class="stat-card"><div class="stat-title">Storage Used</div><div class="stat-val">{human_size(total_size_bytes) if total_size_bytes else '0 B'}</div></div><div class="stat-card"><div class="stat-title">Total Files</div><div class="stat-val">{total_files}</div></div><div class="stat-card"><div class="stat-title">Active Bucket</div><div class="stat-val">{R2_BUCKET_NAME}</div></div></div><div class="controls"><input type="text" id="searchInput" class="search-box" onkeyup="filterTable()" placeholder="🔍 Search files by name or folder..."></div><div class="table-wrapper"><table><thead><tr><th id="th-0" onclick="sortTable(0, 'str')">File Path / Name <span></span></th><th id="th-1" onclick="sortTable(1, 'num')">Size <span></span></th><th id="th-2" onclick="sortTable(2, 'num')">Date Uploaded <span>🔽</span></th><th>Actions</th></tr></thead><tbody>{file_rows}</tbody></table></div></div></body></html>"""
     return web.Response(text=html, content_type='text/html')
 
 @routes.get('/delete_file')
@@ -358,7 +385,7 @@ async def web_move_handler(request):
 
 @routes.get('/')
 async def root(request):
-    return web.Response(text="<html><body style='background:#0f172a;color:#38bdf8;text-align:center;padding-top:150px;font-family:sans-serif;'><h1 style='font-size:40px;'>✅ System Online</h1><a href='/dashboard' style='style=display:inline-block;margin-top:20px;padding:15px 30px;background:#38bdf8;color:#0f172a;text-decoration:none;border-radius:8px;font-weight:bold;font-size:18px;'>Go to Dashboard</a></body></html>", content_type='text/html')
+    return web.Response(text="<html><body style='background:#0f172a;color:#38bdf8;text-align:center;padding-top:150px;font-family:sans-serif;'><h1 style='font-size:40px;'>✅ System Online</h1><a href='/dashboard' style='display:inline-block;margin-top:20px;padding:15px 30px;background:#38bdf8;color:#0f172a;text-decoration:none;border-radius:8px;font-weight:bold;font-size:18px;'>Go to Dashboard</a></body></html>", content_type='text/html')
 
 @routes.get('/{code}/{filename}')
 async def stream_handler(request):
@@ -371,51 +398,75 @@ async def stream_handler(request):
     if range_header:
         match = re.search(r'bytes=(\d+)-', range_header)
         if match: start = int(match.group(1))
-    resp = web.StreamResponse(status=206 if start else 200, headers={'Content-Disposition': f'attachment; filename="{file_name}"', 'Accept-Ranges': 'bytes', 'Content-Type': 'video/mp4', 'Content-Length': str(msg.file.size - start)})
+    resp = web.StreamResponse(status=206 if range_header else 200, headers={'Content-Disposition': f'attachment; filename="{file_name}"', 'Accept-Ranges': 'bytes', 'Content-Type': 'video/mp4', 'Content-Length': str(msg.file.size - start)})
     await resp.prepare(request)
     try:
         async for chunk in client.iter_download(msg.media, offset=(start//1048576)*1048576, request_size=1048576): await resp.write(chunk)
     except: pass
     return resp
 
-# --- 9. NATIVE TORRENT / MAGNET DOWNLOADER ---
+# --- 9. NATIVE TORRENT / MAGNET DOWNLOADER (ADVANCED PARSER) ---
 async def download_magnet(url, custom_name, msg, start_t):
-    """Uses native aria2c installed in Docker."""
+    aria_cmd = get_aria2_executable()
     dl_dir = f"downloads_{int(time.time())}"
     os.makedirs(dl_dir, exist_ok=True)
     
     await msg.edit("🧲 **Initializing Torrent Engine (aria2c)...**")
     
     process = await asyncio.create_subprocess_exec(
-        'aria2c',
+        aria_cmd,
         '--seed-time=0',
         '--max-connection-per-server=16',
         '--split=16',
-        '--summary-interval=5',
+        '--summary-interval=3', # Fast output updates
         f'--dir={dl_dir}',
         url,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE
     )
 
+    # Store task details globally so it can be canceled by /c_<code>
+    task_code = secrets.token_urlsafe(8)
+    active_tasks[task_code] = {
+        'process': process,
+        'cancel_event': asyncio.Event(),
+        'dir': dl_dir
+    }
+
     last_update = 0
     while process.returncode is None:
-        await asyncio.sleep(4)
-        current_size = get_dir_size(dl_dir)
-        now = time.time()
+        line_bytes = await process.stdout.readline()
+        if not line_bytes: break
+        line = line_bytes.decode('utf-8', errors='ignore').strip()
         
-        if now - last_update > 5 and current_size > 0:
-            speed = (current_size / (now - start_t)) / 1024 / 1024
-            try:
-                await msg.edit(
-                    f"🧲 **Downloading Torrent...**\n\n"
-                    f"⚡ **Speed:** `{speed:.2f} MB/s`\n"
-                    f"📂 **Downloaded:** `{human_size(current_size)}`\n"
-                    f"*(Fetching metadata and blocks)*"
-                )
-                last_update = now
-            except: pass
+        # Match Aria2c stdout progress line
+        match = aria_re.search(line)
+        if match:
+            percent = int(match.group('percent') or 0)
+            downloaded = match.group('downloaded')
+            total = match.group('total')
+            cn = match.group('cn')
+            speed = match.group('speed') + "/s"
+            eta = match.group('eta') or "Calculating..."
+            
+            # Dynamic Filename Scanner (Scans directory to find active video file)
+            active_file = "Fetching Metadata..."
+            for r_dir, dirs, files in os.walk(dl_dir):
+                for f in files:
+                    if not f.endswith('.aria2'):
+                        active_file = f
+                        break
+            
+            now = time.time()
+            if now - last_update > 4:
+                elapsed = get_readable_time(int(now - start_t))
+                p_text = format_saas_progress("Download", active_file, percent, downloaded, total, speed, eta, cn, elapsed, task_code)
+                try:
+                    await msg.edit(p_text, buttons=[[Button.inline("❌ Cancel", data=f"canceltask_{task_code}")]])
+                    last_update = now
+                except: pass
 
+    # Torrent complete. Find largest file.
     largest_file = None
     max_size = 0
     for root_dir, dirs, files in os.walk(dl_dir):
@@ -428,6 +479,7 @@ async def download_magnet(url, custom_name, msg, start_t):
 
     if not largest_file:
         shutil.rmtree(dl_dir, ignore_errors=True)
+        active_tasks.pop(task_code, None)
         raise ValueError("Torrent downloaded but no video file found!")
 
     final_name = custom_name if custom_name else os.path.basename(largest_file)
@@ -435,6 +487,7 @@ async def download_magnet(url, custom_name, msg, start_t):
     
     shutil.move(largest_file, final_name)
     shutil.rmtree(dl_dir, ignore_errors=True)
+    active_tasks.pop(task_code, None)
     
     return final_name
 
@@ -470,6 +523,20 @@ async def download_any_url(url, custom_name, msg, start_t):
 @client.on(events.NewMessage(incoming=True))
 async def handle_new_message(event):
     if event.sender_id != ADMIN_ID: return
+
+    # Custom Task Cancel Command (e.g. /c_a1b2c3d4)
+    if event.text and event.text.startswith('/c_'):
+        code = event.text.split('/c_')[1].strip()
+        item = active_tasks.get(code)
+        if item:
+            item['cancel_event'].set()
+            if item['process']:
+                try: item['process'].terminate()
+                except: pass
+            await event.reply("🛑 **Torrent download cancelled successfully.**")
+        else:
+            await event.reply("❌ **Active task not found.**")
+        return
 
     if event.file:
         await event.reply(
@@ -516,6 +583,22 @@ async def on_callback(event):
     if event.sender_id != ADMIN_ID: return
     data = event.data.decode()
     
+    # Handle inline button cancels
+    if data.startswith("canceltask_"):
+        code = data.split("_")[1]
+        item = active_tasks.get(code)
+        if item:
+            item['cancel_event'].set()
+            if item['process']:
+                try: item['process'].terminate()
+                except: pass
+            await event.answer("Task cancelled successfully.", alert=True)
+            try: await event.edit("🛑 **Task Cancelled by User.**")
+            except: pass
+        else:
+            await event.answer("Task already finished.", alert=True)
+        return
+
     if data.startswith("link_"):
         msg_id = int(data.split("_")[1])
         await event.answer("Generating Direct Link...", alert=False)
@@ -573,7 +656,7 @@ async def on_callback(event):
                 if os.path.exists(filename): os.remove(filename)
                 force_system_ram_purge()
 
-# --- 12. STARTUP ---
+# --- 13. STARTUP ---
 async def main():
     app = web.Application()
     app.add_routes(routes)
