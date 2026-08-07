@@ -21,7 +21,7 @@ from telethon.network import ConnectionTcpFull
 from telethon.tl.functions.upload import SaveBigFilePartRequest, SaveFilePartRequest, GetFileRequest
 from telethon.tl.types import InputFileBig, InputFile
 
-# Web, Storage & Engine Imports
+# Web & Storage Imports
 from aiohttp import web, ClientSession, FormData
 import aiohttp
 import boto3
@@ -51,7 +51,29 @@ global_semaphore = asyncio.Semaphore(4)
 link_storage = {}
 routes = web.RouteTableDef()
 
-# --- 2. FILENAME CLEANERS ---
+# --- 2. AUTO-INSTALL ARIA2C BINARY IF MISSING ---
+def get_aria2_executable():
+    """Checks if aria2c is installed, if not, downloads a static binary automatically."""
+    if shutil.which('aria2c'):
+        return 'aria2c'
+    
+    local_aria = os.path.abspath('./aria2c')
+    if os.path.exists(local_aria):
+        return local_aria
+    
+    print("📥 Downloading static aria2c binary for Koyeb...")
+    try:
+        tar_url = "https://github.com/P3TERX/aria2-builder/releases/download/1.36.0/aria2-1.36.0-static-linux-amd64.tar.gz"
+        subprocess.run(f"wget -qO- {tar_url} | tar -xz", shell=True, check=True)
+        if os.path.exists('./aria2c'):
+            os.chmod('./aria2c', 0o755)
+            return local_aria
+    except Exception as e:
+        print(f"Failed to download aria2c binary: {e}")
+    
+    return 'aria2c'
+
+# --- 3. FILENAME CLEANERS ---
 def clean_double_extension(filename):
     while filename.lower().endswith('.mp4.mp4') or filename.lower().endswith('.mkv.mkv'):
         filename = filename[:-4]
@@ -66,7 +88,7 @@ def get_unique_filename(filepath):
         counter += 1
     return f"{base}_{counter}{ext}"
 
-# --- 3. YT-DLP / GDRIVE ENGINE ---
+# --- 4. YT-DLP / GDRIVE ENGINE ---
 def sync_yt_dlp_download(url, custom_name=None):
     if custom_name:
         custom_name = get_unique_filename(custom_name)
@@ -92,7 +114,7 @@ def sync_yt_dlp_download(url, custom_name=None):
             filename = cleaned
         return filename
 
-# --- 4. C-LEVEL MEMORY PURGE ---
+# --- 5. C-LEVEL MEMORY PURGE ---
 def force_system_ram_purge():
     gc.collect()
     try: ctypes.CDLL('libc.so.6').malloc_trim(0)
@@ -107,10 +129,10 @@ def get_dir_size(path):
                 total += os.path.getsize(fp)
     return total
 
-# --- 5. SETUP CLIENT ---
+# --- 6. SETUP CLIENT ---
 client = TelegramClient('bot_session', int(API_ID), API_HASH, connection=ConnectionTcpFull, use_ipv6=False)
 
-# --- 6. UI HELPERS ---
+# --- 7. UI HELPERS ---
 def human_size(bytes):
     for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
         if bytes < 1024: return f"{bytes:.2f} {unit}"
@@ -131,7 +153,7 @@ def get_status_text(action, filename, current, total, start_time):
             f"⚡ **Speed:** `{human_size(speed)}/s`\n"
             f"📂 **Size:** `{human_size(current)} / {total_str}`")
 
-# --- 7. R2 CLIENT & SYNC S3 OPERATIONS ---
+# --- 8. R2 CLIENT & SYNC S3 OPERATIONS ---
 def get_r2_client():
     clean_id = R2_ACCOUNT_ID.replace("https://", "").replace("http://", "").split(".")[0].strip('/')
     endpoint = f"https://{clean_id}.r2.cloudflarestorage.com"
@@ -197,8 +219,7 @@ async def upload_to_r2(filename, status_msg, target_folder=None):
     link_storage[code] = {'s3_key': s3_key}
     return f"{R2_PUBLIC_URL}/{quote(s3_key, safe='/')}", code
 
-
-# --- 8. SECURED WEB DASHBOARD & ACTION ENDPOINTS ---
+# --- 9. SECURED WEB DASHBOARD & ACTIONS ---
 def check_dashboard_auth(request):
     auth_header = request.headers.get('Authorization')
     if not auth_header or not auth_header.startswith('Basic '): return False
@@ -238,10 +259,10 @@ DASHBOARD_CSS = """
 """
 
 DASHBOARD_JS = """
-    function copyText(t) { navigator.clipboard.writeText(t); alert('✅ URL Copied to clipboard!'); }
+    function copyText(t) { navigator.clipboard.writeText(t); alert('✅ URL Copied!'); }
     function deleteFile(key) {
         let decodedKey = decodeURIComponent(key);
-        if (confirm('⚠️ PERMANENTLY DELETE: \\n' + decodedKey + '\\n\\nAre you sure?')) {
+        if (confirm('⚠️ PERMANENTLY DELETE: \\n' + decodedKey)) {
             window.location.href = '/delete_file?key=' + encodeURIComponent(decodedKey);
         }
     }
@@ -379,17 +400,17 @@ async def stream_handler(request):
     except: pass
     return resp
 
-# --- 9. MAGNET / TORRENT DOWNLOADER ---
+# --- 10. MAGNET / TORRENT DOWNLOADER ---
 async def download_magnet(url, custom_name, msg, start_t):
-    """Uses aria2c to download torrents/magnets."""
+    aria_cmd = get_aria2_executable()
     dl_dir = f"downloads_{int(time.time())}"
     os.makedirs(dl_dir, exist_ok=True)
     
     await msg.edit("🧲 **Initializing Torrent Engine (aria2c)...**")
     
     process = await asyncio.create_subprocess_exec(
-        'aria2c',
-        '--seed-time=0', # Do not seed
+        aria_cmd,
+        '--seed-time=0',
         '--max-connection-per-server=16',
         '--split=16',
         '--summary-interval=5',
@@ -399,7 +420,6 @@ async def download_magnet(url, custom_name, msg, start_t):
         stderr=asyncio.subprocess.PIPE
     )
 
-    # Monitor folder size while aria2c runs
     last_update = 0
     while process.returncode is None:
         await asyncio.sleep(4)
@@ -418,7 +438,6 @@ async def download_magnet(url, custom_name, msg, start_t):
                 last_update = now
             except: pass
 
-    # Torrent finished. Find the largest file (usually the movie).
     largest_file = None
     max_size = 0
     for root_dir, dirs, files in os.walk(dl_dir):
@@ -431,24 +450,21 @@ async def download_magnet(url, custom_name, msg, start_t):
 
     if not largest_file:
         shutil.rmtree(dl_dir, ignore_errors=True)
-        raise ValueError("Torrent downloaded but no files found!")
+        raise ValueError("Torrent downloaded but no video file found!")
 
-    # Extract the file to the main directory
     final_name = custom_name if custom_name else os.path.basename(largest_file)
     final_name = get_unique_filename(clean_double_extension(re.sub(r'[\\/*?:"<>|]', "", final_name)))
     
     shutil.move(largest_file, final_name)
-    shutil.rmtree(dl_dir, ignore_errors=True) # Delete garbage NFOs/Samples
+    shutil.rmtree(dl_dir, ignore_errors=True)
     
     return final_name
 
-# --- 10. HYBRID URL DOWNLOADER ---
+# --- 11. HYBRID URL DOWNLOADER ---
 async def download_any_url(url, custom_name, msg, start_t):
-    # 1. Magnet Link Handler
     if url.startswith("magnet:?"):
         return await download_magnet(url, custom_name, msg, start_t)
 
-    # 2. Try yt-dlp
     try:
         await msg.edit("🅿️ **Extracting File Info via yt-dlp...**")
         filename = await asyncio.to_thread(sync_yt_dlp_download, url, custom_name)
@@ -456,7 +472,6 @@ async def download_any_url(url, custom_name, msg, start_t):
             return filename
     except Exception: pass
 
-    # 3. Fallback to Direct HTTP Leeching
     async with ClientSession() as sess:
         async with sess.get(url, allow_redirects=True) as r:
             if "text/html" in r.headers.get("Content-Type", ""): raise ValueError("HTML webpage detected, not a direct file.")
@@ -473,7 +488,7 @@ async def download_any_url(url, custom_name, msg, start_t):
                         await msg.edit(get_status_text("Leeching", filename, f.tell(), f_size, start_t))
             return filename
 
-# --- 11. BOT HANDLERS ---
+# --- 12. BOT HANDLERS ---
 @client.on(events.NewMessage(incoming=True))
 async def handle_new_message(event):
     if event.sender_id != ADMIN_ID: return
@@ -488,37 +503,29 @@ async def handle_new_message(event):
         )
         return
 
-    # Trigger on http:// OR magnet:?
     if event.text and (event.text.startswith("http") or event.text.startswith("magnet:?")):
         async with global_semaphore:
             raw_text = event.text.strip()
             url = raw_text.split(" -n ")[0].strip()
             custom_name = raw_text.split(" -n ")[1].strip() if " -n " in raw_text else None
             
-            # Allow users to specify custom folder using -f
             target_folder = None
             if " -f " in url:
                 url, target_folder = url.split(" -f ", 1)
             elif custom_name and " -f " in custom_name:
                 custom_name, target_folder = custom_name.split(" -f ", 1)
 
-            msg = await event.reply("🔗 **Processing URL/Magnet...**")
+            msg = await event.reply("🔗 **Processing Request...**")
             start_t = time.time()
             filename = None
             
             try:
                 filename = await download_any_url(url, custom_name, msg, start_t)
-                
                 upload_result = await upload_to_r2(filename, msg, target_folder)
-                if isinstance(upload_result, tuple):
-                    r2_url, code = upload_result
-                else:
-                    r2_url = upload_result
-                    code = "unknown"
+                r2_url, code = upload_result if isinstance(upload_result, tuple) else (upload_result, "unknown")
 
                 await msg.edit(
-                    f"✅ **Leeched & Uploaded to R2!**\n\n🎬 `{os.path.basename(filename)}`\n🔗 `{r2_url}`",
-                    buttons=[[Button.inline("🗑️ Delete from R2", data=f"delr2_{code}")]] if code != "unknown" else None
+                    f"✅ **Leeched & Uploaded to R2!**\n\n🎬 `{os.path.basename(filename)}`\n🔗 `{r2_url}`"
                 )
             except Exception as e: 
                 await msg.edit(f"❌ Error: {e}")
@@ -535,37 +542,14 @@ async def on_callback(event):
         msg_id = int(data.split("_")[1])
         await event.answer("Generating Direct Link...", alert=False)
         tg_msg = await client.get_messages(event.chat_id, ids=msg_id)
-        if not tg_msg or not tg_msg.file:
-            return await event.respond("❌ Error: File not found.")
+        if not tg_msg or not tg_msg.file: return await event.respond("❌ Error: File not found.")
         
         code = secrets.token_urlsafe(8)
         link_storage[code] = {'msg': tg_msg, 'timestamp': time.time()}
-        
-        base = os.environ.get("KOYEB_PUBLIC_URL", "").rstrip('/')
-        if not base:
-            app_name = os.environ.get('KOYEB_APP_NAME')
-            base = f"https://{app_name}.koyeb.app" if app_name else "https://your-bot-name.koyeb.app"
-            
+        base = os.environ.get("KOYEB_PUBLIC_URL", "").rstrip('/') or f"https://{os.environ.get('KOYEB_APP_NAME')}.koyeb.app"
         filename = get_unique_filename(clean_double_extension(re.sub(r'[\\/*?:"<>|]', "", tg_msg.file.name or "video.mp4")))
-        hotlink = f"{base}/{code}/{quote(filename)}"
         
-        await event.respond(f"🚀 **Direct Download Link:**\n\n`{hotlink}`\n\n💡 *Valid for 24 hours. Paste into IDM for max speed.*")
-        return
-
-    if data.startswith("delr2_"):
-        code = data.split("_")[1]
-        item = link_storage.get(code)
-        if item and 's3_key' in item:
-            s3_key = item['s3_key']
-            await event.answer("Deleting file from R2...", alert=False)
-            try:
-                await asyncio.to_thread(sync_delete_r2_file, s3_key)
-                await event.edit(f"🗑️ **File Deleted from Cloudflare R2!**\n\nKey: `{s3_key}`")
-                force_system_ram_purge()
-            except Exception as e:
-                await event.edit(f"❌ Delete Error: {e}")
-        else:
-            await event.answer("❌ Reference expired or already deleted.", alert=True)
+        await event.respond(f"🚀 **Direct Download Link:**\n\n`{base}/{code}/{quote(filename)}`\n\n💡 *Valid for 24 hours.*")
         return
 
     if data.startswith("r2_"):
@@ -576,10 +560,10 @@ async def on_callback(event):
         async with global_semaphore:
             raw_filename = re.sub(r'[\\/*?:"<>|]', "", tg_msg.file.name or "video.mp4")
             filename = get_unique_filename(clean_double_extension(raw_filename))
-            
             status = await event.respond(f"⬇️ Downloading from Telegram...")
             start_t = time.time()
             try:
+                # RELIABLE 1MB STREAMING DOWNLOAD (5+ MB/s)
                 with open(filename, 'wb') as f:
                     async for chunk in client.iter_download(tg_msg.media, request_size=1048576):
                         f.write(chunk)
@@ -587,24 +571,16 @@ async def on_callback(event):
                             await status.edit(get_status_text("TG Down", filename, f.tell(), tg_msg.file.size, start_t))
                 
                 upload_result = await upload_to_r2(filename, status)
-                if isinstance(upload_result, tuple):
-                    r2_url, code = upload_result
-                else:
-                    r2_url = upload_result
-                    code = "unknown"
+                r2_url, code = upload_result if isinstance(upload_result, tuple) else (upload_result, "unknown")
 
-                await status.edit(
-                    f"✅ **Cloudflare R2 Complete!**\n\n🎬 `{os.path.basename(filename)}`\n🔗 `{r2_url}`",
-                    buttons=[[Button.inline("🗑️ Delete from R2", data=f"delr2_{code}")]] if code != "unknown" else None
-                )
-                
+                await status.edit(f"✅ **Cloudflare R2 Complete!**\n\n🎬 `{os.path.basename(filename)}`\n🔗 `{r2_url}`")
             except Exception as e: 
                 await status.edit(f"❌ Error: {e}")
             finally:
                 if os.path.exists(filename): os.remove(filename)
                 force_system_ram_purge()
 
-# --- 12. STARTUP ---
+# --- 13. STARTUP ---
 async def main():
     app = web.Application()
     app.add_routes(routes)
