@@ -93,17 +93,21 @@ def get_status_text(action, filename, current, total, start_time):
 
 def format_saas_progress(action, filename, percent, downloaded, total, speed, eta, cn, elapsed, task_code):
     done = int(percent // 10)
-    p_bar = "●" * done + "◔" * (1 if percent % 10 >= 5 else 0)
-    p_bar += "○" * (10 - len(p_bar.replace("●", "a").replace("◔", "b")))
-    return (f"🧲 **{action}...**\n"
-            f"╭ `[{p_bar[:10]}]` » `{percent}%`\n"
-            f"├ **Processed:** `{downloaded} of {total}`\n"
-            f"├ **Speed:** `{speed}`\n"
-            f"├ **ETA:** `{eta}`\n"
-            f"├ **Peers:** `{cn}`\n"
-            f"├ **Elapsed:** `{elapsed}`\n"
-            f"├ **Engine:** `Aria2 v1.36.0`\n"
-            f"╰ **Cancel:** `/c_{task_code}`")
+    p_bar = "●" * done
+    if done < 10:
+        p_bar += "◔" if (percent % 10) >= 5 else "○"
+        p_bar += "○" * (9 - done)
+    return (
+        f"🧲 **{action}...**\n"
+        f"╭ `[{p_bar[:10]}]` » `{percent}%`\n"
+        f"├ **Processed:** `{downloaded} of {total}`\n"
+        f"├ **Speed:** `{speed}`\n"
+        f"├ **ETA:** `{eta}`\n"
+        f"├ **Peers:** `{cn}`\n"
+        f"├ **Elapsed:** `{elapsed}`\n"
+        f"├ **Engine:** `Aria2 v1.36.0`\n"
+        f"╰ **Cancel:** `/c_{task_code}`"
+    )
 
 def get_readable_time(seconds: int) -> str:
     result = ""
@@ -147,14 +151,11 @@ def get_r2_client():
     r2_config = Config(region_name='auto', signature_version='s3v4', retries={'max_attempts': 3, 'mode': 'standard'})
     return boto3.client('s3', endpoint_url=endpoint, aws_access_key_id=R2_ACCESS_KEY_ID, aws_secret_access_key=R2_SECRET_ACCESS_KEY, config=r2_config)
 
-# R2 Directory List supporting dynamic prefixes
-def sync_get_r2_files(prefix=""):
-    s3 = get_r2_client()
-    return s3.list_objects_v2(Bucket=R2_BUCKET_NAME, Prefix=prefix, Delimiter='/')
+def sync_get_r2_files():
+    return get_r2_client().list_objects_v2(Bucket=R2_BUCKET_NAME)
 
 def sync_delete_r2_file(s3_key):
-    s3 = get_r2_client()
-    s3.delete_object(Bucket=R2_BUCKET_NAME, Key=s3_key)
+    get_r2_client().delete_object(Bucket=R2_BUCKET_NAME, Key=s3_key)
 
 def sync_rename_r2_file(old_key, new_key):
     s3 = get_r2_client()
@@ -209,13 +210,9 @@ def sync_r2_upload_folder(folder_path, s3_prefix, loop, msg, start_t):
         rel_path = os.path.relpath(file_path, folder_path)
         s3_key = f"{s3_prefix.strip('/')}/{rel_path.replace(os.sep, '/')}"
         ext = os.path.splitext(file_path)[1].lower()
-        
         content_type, _ = mimetypes.guess_type(file_path)
-        content_type = content_type or 'application/octet-stream'
-
-        extra_args = {'ContentType': content_type}
+        extra_args = {'ContentType': content_type or 'application/octet-stream'}
         if ext not in ['.m3u8', '.ts']: extra_args['ContentDisposition'] = 'inline'
-
         s3.upload_file(file_path, R2_BUCKET_NAME, s3_key, Callback=prog_cb, ExtraArgs=extra_args)
 
     with ThreadPoolExecutor(max_workers=15) as executor:
@@ -248,9 +245,13 @@ def get_aria2_executable():
     except: return 'aria2c'
 
 async def download_magnet(url, workspace, custom_name, msg, start_t):
-    cmd = [get_aria2_executable(), "--seed-time=0", "--max-connection-per-server=16", "--split=16",
-           "--summary-interval=3", "--bt-stop-timeout=120", f"--bt-tracker={PUBLIC_TRACKERS}", f"--dir={workspace}", url]
-    process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE)
+    aria_cmd = get_aria2_executable()
+    await msg.edit("🧲 **Initializing Torrent Engine (aria2c)...**")
+    process = await asyncio.create_subprocess_exec(
+        aria_cmd, "--seed-time=0", "--max-connection-per-server=16", "--split=16",
+        "--summary-interval=3", "--bt-stop-timeout=120", f"--bt-tracker={PUBLIC_TRACKERS}",
+        f"--dir={workspace}", url, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
     task_code = secrets.token_urlsafe(8)
     active_tasks[task_code] = {'process': process, 'cancel_event': asyncio.Event(), 'dir': workspace}
     aria_re = re.compile(r'\[#(?P<gid>\w+)\s+(?P<downloaded>[^\s/]+)/(?P<total>[^\s\(\)]+)(?:\((?P<percent>\d+)%\))?\s+CN:(?P<cn>\d+)\s+SPD:(?P<speed>[^\s\]]+)(?:\s+ETA:(?P<eta>[^\s\]]+))?\]')
@@ -319,7 +320,203 @@ async def download_any_url(url, workspace, custom_name, msg, start_t):
     return await download_direct(url, workspace, msg, start_t, custom_name)
 
 # ============================================
-# --- 5. SECURED WEB DASHBOARD & UI ---
+# --- 5. TELEGRAM HANDLERS ---
+# ============================================
+@client.on(events.NewMessage(incoming=True))
+async def handle_new_message(event):
+    if event.sender_id != ADMIN_ID: return
+
+    if event.text and event.text.startswith('/c_'):
+        code = event.text.split('/c_')[1].strip()
+        item = active_tasks.get(code)
+        if item:
+            item['cancel_event'].set()
+            if item['process']:
+                try: item['process'].terminate()
+                except: pass
+            await event.reply("🛑 **Torrent download cancelled successfully.**")
+        else: await event.reply("❌ **Active task not found.**")
+        return
+
+    if event.file:
+        await event.reply(
+            f"📂 **File Detected:** `{event.file.name or 'video.mp4'}`",
+            buttons=[
+                [Button.inline("🔗 Generate Direct Link", data=f"link_{event.id}")],
+                [Button.inline("🛡️ Upload to Cloudflare R2", data=f"r2_{event.id}")]
+            ]
+        )
+        return
+
+    if event.text and (event.text.startswith("http") or event.text.startswith("magnet:?")):
+        async with global_semaphore:
+            raw_text = event.text.strip()
+            url = raw_text.split(" -n ")[0].strip()
+            custom_name = raw_text.split(" -n ")[1].strip() if " -n " in raw_text else None
+            
+            target_folder = None
+            if " -f " in url:
+                url, target_folder = url.split(" -f ", 1)
+            elif custom_name and " -f " in custom_name:
+                custom_name, target_folder = custom_name.split(" -f ", 1)
+
+            msg = await event.reply("🔗 **Processing Request...**")
+            start_t = time.time()
+            workspace = f"dl_{uuid.uuid4().hex[:8]}"
+            os.makedirs(workspace, exist_ok=True)
+            filename = None
+            
+            try:
+                filename = await download_any_url(url, workspace, custom_name, msg, start_t)
+                
+                # Check if it is a ZIP HLS archive
+                if filename.lower().endswith('.zip'):
+                    await msg.edit("📦 **Extracting HLS ZIP Archive...**")
+                    extract_dir = os.path.join(workspace, "extracted")
+                    os.makedirs(extract_dir, exist_ok=True)
+                    await asyncio.to_thread(lambda: zipfile.ZipFile(filename, 'r').extractall(extract_dir))
+
+                    project_name = os.path.splitext(os.path.basename(filename))[0]
+                    extracted_items = os.listdir(extract_dir)
+                    
+                    if len(extracted_items) == 1 and os.path.isdir(os.path.join(extract_dir, extracted_items[0])):
+                        upload_source_dir = os.path.join(extract_dir, extracted_items[0])
+                        s3_prefix = target_folder if target_folder else extracted_items[0]
+                    else:
+                        upload_source_dir = extract_dir
+                        s3_prefix = target_folder if target_folder else project_name
+
+                    await msg.edit(f"⬆️ **Uploading HLS Pack to R2...**\n📂 `{s3_prefix}`")
+                    await asyncio.to_thread(sync_r2_upload_folder, upload_source_dir, s3_prefix, asyncio.get_running_loop(), msg, time.time())
+                    
+                    master_url = f"{R2_PUBLIC_URL}/{quote(s3_prefix, safe='/')}/master.m3u8"
+                    # Telethon expects 'link_preview=False' to disable preview
+                    await msg.edit(f"✅ **HLS Uploaded to R2!**\n\n🎬 `{project_name}`\n📺 **Stream Link:**\n`{master_url}`", link_preview=False)
+
+                else:
+                    upload_result = await upload_to_r2(filename, msg, target_folder)
+                    r2_url, code = upload_result if isinstance(upload_result, tuple) else (upload_result, "unknown")
+
+                    await msg.edit(
+                        f"✅ **Leeched & Uploaded to R2!**\n\n🎬 `{os.path.basename(filename)}`\n🔗 `{r2_url}`",
+                        buttons=[[Button.inline("🗑️ Delete from R2", data=f"delr2_{code}")]] if code != "unknown" else None,
+                        link_preview=False
+                    )
+            except Exception as e: 
+                await msg.edit(f"❌ Error: {e}")
+            finally:
+                if filename and os.path.exists(filename): os.remove(filename)
+                force_system_ram_purge()
+
+@client.on(events.CallbackQuery)
+async def on_callback(event):
+    if event.sender_id != ADMIN_ID: return
+    data = event.data.decode()
+    
+    if data.startswith("canceltask_"):
+        code = data.split("_")[1]
+        item = active_tasks.get(code)
+        if item:
+            item['cancel_event'].set()
+            if item['process']:
+                try: item['process'].terminate()
+                except: pass
+            await event.answer("Task cancelled successfully.", alert=True)
+            try: await event.edit("🛑 **Task Cancelled by User.**")
+            except: pass
+        else: await event.answer("Task already finished.", alert=True)
+        return
+
+    if data.startswith("link_"):
+        msg_id = int(data.split("_")[1])
+        await event.answer("Generating Direct Link...", alert=False)
+        tg_msg = await client.get_messages(event.chat_id, ids=msg_id)
+        if not tg_msg or not tg_msg.file: return await event.respond("❌ Error: File not found.")
+        
+        code = secrets.token_urlsafe(8)
+        link_storage[code] = {'msg': tg_msg, 'timestamp': time.time()}
+        
+        base = os.environ.get("KOYEB_PUBLIC_URL", "").rstrip('/')
+        if not base:
+            app_name = os.environ.get('KOYEB_APP_NAME')
+            base = f"https://{app_name}.koyeb.app" if app_name else "https://your-bot-name.koyeb.app"
+            
+        filename = get_unique_filename(clean_double_extension(re.sub(r'[\\/*?:"<>|]', "", tg_msg.file.name or "video.mp4")))
+        hotlink = f"{base}/{code}/{quote(filename)}"
+        
+        await event.respond(f"🚀 **Direct Download Link:**\n\n`{hotlink}`\n\n💡 *Valid for 24 hours. Paste into IDM for max speed.*")
+        return
+
+    if data.startswith("delr2_"):
+        code = data.split("_")[1]
+        item = link_storage.get(code)
+        if item and 's3_key' in item:
+            s3_key = item['s3_key']
+            await event.answer("Deleting file from R2...", alert=False)
+            try:
+                await asyncio.to_thread(sync_delete_r2_file, s3_key)
+                await event.edit(f"🗑️ **File Deleted from Cloudflare R2!**\n\nKey: `{s3_key}`")
+                force_system_ram_purge()
+            except Exception as e:
+                await event.edit(f"❌ Delete Error: {e}")
+        else:
+            await event.answer("❌ Reference expired or already deleted.", alert=True)
+        return
+
+    if data.startswith("r2_"):
+        msg_id = int(data.split("_")[1])
+        await event.answer("Processing R2 Upload...", alert=False)
+        tg_msg = await client.get_messages(event.chat_id, ids=msg_id)
+        
+        async with global_semaphore:
+            workspace = f"dl_{uuid.uuid4().hex[:8]}"
+            os.makedirs(workspace, exist_ok=True)
+            raw_filename = re.sub(r'[\\/*?:"<>|]', "", tg_msg.file.name or "video.mp4")
+            filename = get_unique_filename(clean_double_extension(raw_filename))
+            file_path = os.path.join(workspace, filename)
+            
+            status = await event.respond(f"⬇️ Downloading from Telegram...")
+            start_t = time.time()
+            try:
+                with open(file_path, 'wb') as f:
+                    async for chunk in client.iter_download(tg_msg.media, request_size=1048576):
+                        f.write(chunk)
+                        if f.tell() % (10 * 1024 * 1024) == 0: 
+                            await status.edit(get_status_text("TG Down", filename, f.tell(), tg_msg.file.size, start_t))
+                
+                # Check if it is a ZIP HLS archive
+                if filename.lower().endswith('.zip'):
+                    await status.edit("📦 **Extracting HLS ZIP Archive...**")
+                    extract_dir = os.path.join(workspace, "extracted")
+                    os.makedirs(extract_dir, exist_ok=True)
+                    await asyncio.to_thread(lambda: zipfile.ZipFile(file_path, 'r').extractall(extract_dir))
+
+                    project_name = os.path.splitext(filename)[0]
+                    extracted_items = os.listdir(extract_dir)
+                    if len(extracted_items) == 1 and os.path.isdir(os.path.join(extract_dir, extracted_items[0])):
+                        upload_source_dir = os.path.join(extract_dir, extracted_items[0])
+                        s3_prefix = extracted_items[0]
+                    else:
+                        upload_source_dir = extract_dir
+                        s3_prefix = project_name
+
+                    await status.edit(f"⬆️ **Uploading HLS Pack to R2...**\n📂 `{s3_prefix}`")
+                    await asyncio.to_thread(sync_r2_upload_folder, upload_source_dir, s3_prefix, asyncio.get_running_loop(), status, time.time())
+                    
+                    master_url = f"{R2_PUBLIC_URL}/{quote(s3_prefix, safe='/')}/master.m3u8"
+                    # Telethon expects 'link_preview=False' to disable preview
+                    await status.edit(f"✅ **HLS Uploaded!**\n\n🎬 `{project_name}`\n📺 **Stream Link:**\n`{master_url}`", link_preview=False)
+                else:
+                    r2_url, code = await upload_to_r2(file_path, status)
+                    await status.edit(f"✅ **Cloudflare R2 Complete!**\n\n🎬 `{filename}`\n🔗 `{r2_url}`", buttons=[[Button.inline("🗑️ Delete from R2", data=f"delr2_{code}")]])
+            except Exception as e: 
+                await status.edit(f"❌ Error: {e}")
+            finally:
+                if os.path.exists(filename): os.remove(filename)
+                force_system_ram_purge()
+
+# ============================================
+# --- 6. SECURE WEB DASHBOARD & UI ---
 # ============================================
 def check_dashboard_auth(request):
     auth_header = request.headers.get('Authorization')
@@ -334,20 +531,10 @@ DASHBOARD_CSS = """
     body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 20px; }
     .container { max-width: 1200px; margin: auto; }
     .header-bar { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; margin-bottom: 20px; gap: 15px; }
-    h2 { margin: 0; color: var(--text); font-size: 26px; display: flex; align-items: center; gap: 10px; border-bottom: 2px solid var(--border); padding-bottom: 10px; width: 100%; }
-    
-    /* Breadcrumbs Navigation */
-    .breadcrumbs { display: flex; align-items: center; gap: 8px; background: var(--card); padding: 12px 20px; border-radius: 8px; border: 1px solid var(--border); margin-bottom: 20px; font-size: 15px; }
-    .breadcrumb-link { color: var(--accent); text-decoration: none; font-weight: 600; }
-    .breadcrumb-link:hover { text-decoration: underline; }
-    .divider { color: var(--muted); }
-
-    /* Controls */
+    h2 { margin: 0; color: var(--text); font-size: 24px; display: flex; align-items: center; gap: 10px; border-bottom: 2px solid var(--border); padding-bottom: 10px; width: 100%; }
     .controls { display: flex; gap: 10px; margin-bottom: 15px; width: 100%; }
     .search-box { flex-grow: 1; padding: 14px 20px; border-radius: 8px; border: 1px solid var(--border); background: var(--card); color: var(--text); font-size: 15px; outline: none; transition: 0.2s; }
     .search-box:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(56, 189, 248, 0.2); }
-
-    /* Table */
     .table-wrapper { overflow-x: auto; background: var(--card); border-radius: 10px; border: 1px solid var(--border); box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
     table { width: 100%; border-collapse: collapse; min-width: 900px; }
     th { background: #0f172a; color: var(--muted); padding: 16px; text-align: left; font-size: 13px; font-weight: 600; cursor: pointer; user-select: none; }
@@ -355,47 +542,18 @@ DASHBOARD_CSS = """
     td { padding: 16px; border-bottom: 1px solid var(--border); font-size: 14px; word-break: break-all; color: #cbd5e1; }
     tr:last-child td { border-bottom: none; }
     tr:hover { background: #334155; }
-
-    /* Folder Links */
-    .folder-link { color: #ffb703; text-decoration: none; font-weight: 600; display: inline-flex; align-items: center; gap: 8px; }
-    .folder-link:hover { text-decoration: underline; }
-
-    /* Actions */
     .actions { display: flex; gap: 8px; flex-wrap: wrap; }
     .btn { display: inline-flex; align-items: center; justify-content: center; gap: 5px; padding: 8px 14px; border-radius: 6px; border: none; font-size: 12px; font-weight: 600; cursor: pointer; text-decoration: none; transition: 0.2s; }
     .btn-copy { background: rgba(56, 189, 248, 0.1); color: var(--accent); }
-    .btn-copy:hover { background: rgba(56, 189, 248, 0.2); }
-    .btn-view { background: rgba(16, 185, 129, 0.1); color: #34d399; }
-    .btn-view:hover { background: rgba(16, 185, 129, 0.2); }
-    .btn-move { background: rgba(167, 139, 250, 0.1); color: #c084fc; }
-    .btn-move:hover { background: rgba(167, 139, 250, 0.2); }
-    .btn-rename { background: rgba(251, 191, 36, 0.1); color: #fbbf24; }
-    .btn-rename:hover { background: rgba(251, 191, 36, 0.2); }
     .btn-delete { background: rgba(244, 63, 94, 0.1); color: #fb7185; }
-    .btn-delete:hover { background: rgba(244, 63, 94, 0.2); }
 """
 
 DASHBOARD_JS = """
     function copyText(t) { navigator.clipboard.writeText(t); alert('✅ URL Copied!'); }
-    function deleteFile(key, prefix) {
+    function deleteFile(key) {
         let decodedKey = decodeURIComponent(key);
         if (confirm('⚠️ PERMANENTLY DELETE: \\n' + decodedKey)) {
-            window.location.href = '/delete_file?key=' + encodeURIComponent(decodedKey) + '&prefix=' + encodeURIComponent(prefix);
-        }
-    }
-    function renameFile(key, prefix) {
-        let decodedKey = decodeURIComponent(key);
-        let newKey = prompt('✏️ Rename File (Full Path):', decodedKey);
-        if (newKey && newKey !== decodedKey) {
-            window.location.href = '/rename_file?old_key=' + encodeURIComponent(decodedKey) + '&new_key=' + encodeURIComponent(newKey) + '&prefix=' + encodeURIComponent(prefix);
-        }
-    }
-    function moveFolder(key, prefix) {
-        let decodedKey = decodeURIComponent(key);
-        let currentDir = decodedKey.includes('/') ? decodedKey.substring(0, decodedKey.lastIndexOf('/')) : '';
-        let targetFolder = prompt('📁 Enter target folder path (e.g. Movies/2026):', currentDir);
-        if (targetFolder !== null) {
-            window.location.href = '/move_file?old_key=' + encodeURIComponent(decodedKey) + '&target_folder=' + encodeURIComponent(targetFolder) + '&prefix=' + encodeURIComponent(prefix);
+            window.location.href = '/delete_file?key=' + encodeURIComponent(decodedKey);
         }
     }
     function filterTable() {
@@ -406,186 +564,45 @@ DASHBOARD_JS = """
             row.style.display = filename.includes(input) ? "" : "none";
         });
     }
-    let currentSort = { col: -1, dir: 'asc' };
-    function sortTable(colIndex, type) {
-        let table = document.querySelector("tbody");
-        let rows = Array.from(table.querySelectorAll("tr"));
-        if (rows.length === 0 || rows[0].querySelector("td[colspan]")) return;
-        let dir = (currentSort.col === colIndex && currentSort.dir === 'asc') ? 'desc' : 'asc';
-        currentSort = { col: colIndex, dir: dir };
-        rows.sort((a, b) => {
-            let valA = a.children[colIndex].getAttribute("data-val") || "";
-            let valB = b.children[colIndex].getAttribute("data-val") || "";
-            if (type === 'num') { return dir === 'asc' ? parseFloat(valA) - parseFloat(valB) : parseFloat(valB) - parseFloat(valA); }
-            else { return dir === 'asc' ? valA.localeCompare(valB) : valB.localeCompare(valA); }
-        });
-        table.innerHTML = "";
-        rows.forEach(row => table.appendChild(row));
-        document.querySelectorAll("th span").forEach(span => span.innerText = "");
-        document.getElementById("th-" + colIndex).querySelector("span").innerText = dir === 'asc' ? ' 🔼' : ' 🔽';
-    }
 """
 
 @routes.get('/dashboard')
 async def dashboard_handler(request):
     if not check_dashboard_auth(request):
-        return web.Response(status=401, headers={'WWW-Authenticate': 'Basic realm="Cloudflare R2 Dashboard"'}, text="🔒 Access Denied")
-
-    prefix = request.query.get('prefix', '').strip()
-    file_rows = ""
+        return web.Response(status=401, headers={'WWW-Authenticate': 'Basic realm="Dashboard"'}, text="Access Denied")
     
-    # Generate breadcrumb links for navigation
-    parts = [p for p in prefix.split('/') if p]
-    breadcrumbs_html = '<a href="/dashboard" class="breadcrumb-link">🏠 Home</a>'
-    curr_path = ""
-    for part in parts:
-        curr_path += part + "/"
-        breadcrumbs_html += f' <span class="divider">/</span> <a href="/dashboard?prefix={quote(curr_path)}" class="breadcrumb-link">{part}</a>'
-
     try:
-        response = await asyncio.to_thread(sync_get_r2_files, prefix)
-        
-        # 1. ADD FOLDER ROWS (CommonPrefixes)
-        if 'CommonPrefixes' in response:
-            for pref in response['CommonPrefixes']:
-                folder_path = pref['Prefix']
-                folder_name = folder_path.rstrip('/').split('/')[-1]
-                encoded_folder = quote(folder_path)
-                file_rows += f"""
-                <tr style="background: rgba(255, 183, 3, 0.03);">
-                    <td data-val="{folder_name}"><a href="/dashboard?prefix={encoded_folder}" class="folder-link">📁 {folder_name}/</a></td>
-                    <td data-val="0">-</td>
-                    <td data-val="0">Folder</td>
-                    <td>-</td>
-                </tr>"""
+        response = await asyncio.to_thread(sync_get_r2_files)
+        file_rows = "".join([
+            f"<tr><td class='file-name'>{o['Key']}</td><td>{human_size(o['Size'])}</td><td><div class='actions'><button class='btn btn-copy' onclick=\"copyText('{R2_PUBLIC_URL}/{quote(o['Key'], safe='/')}')\">🔗 Copy URL</button><button class='btn btn-delete' onclick=\"deleteFile('{quote(o['Key'], safe='/')}')\">🗑️ Delete</button></div></td></tr>" 
+            for o in sorted(response.get('Contents', []), key=lambda x: x['LastModified'], reverse=True)
+        ]) or "<tr><td colspan='3'>No files.</td></tr>"
+    except Exception as e: file_rows = f"<tr><td colspan='3' style='color:red'>Error: {e}</td></tr>"
 
-        # 2. ADD FILE ROWS (Contents)
-        if 'Contents' in response:
-            for obj in sorted(response['Contents'], key=lambda x: x['LastModified'], reverse=True):
-                name = obj['Key']
-                if name == prefix: continue # Skip root directory key
-                
-                size_bytes = obj['Size']
-                size_str = human_size(size_bytes)
-                timestamp = obj['LastModified'].timestamp()
-                date_str = obj['LastModified'].strftime("%Y-%m-%d %H:%M")
-                url = f"{R2_PUBLIC_URL}/{quote(name, safe='/')}"
-                display_name = name.split('/')[-1]
-                
-                file_rows += f"""
-                <tr>
-                    <td data-val="{display_name}"><span class="file-name">📄 {display_name}</span></td>
-                    <td data-val="{size_bytes}">{size_str}</td>
-                    <td data-val="{timestamp}">{date_str}</td>
-                    <td>
-                        <div class="actions">
-                            <button class="btn btn-copy" onclick="copyText('{url}')">🔗 Copy</button>
-                            <a href="{url}" target="_blank" class="btn btn-view">▶️ Play</a>
-                            <button class="btn btn-move" onclick="moveFolder('{quote(name)}', '{quote(prefix)}')">📁 Move</button>
-                            <button class="btn btn-rename" onclick="renameFile('{quote(name)}', '{quote(prefix)}')">✏️ Rename</button>
-                            <button class="btn btn-delete" onclick="deleteFile('{quote(name)}', '{quote(prefix)}')">🗑️ Delete</button>
-                        </div>
-                    </td>
-                </tr>"""
-        
-        if not file_rows:
-            file_rows = "<tr><td colspan='4' style='text-align:center; color:#94a3b8;'>Empty directory.</td></tr>"
-            
-    except Exception as e:
-        file_rows = f"<tr><td colspan='4' style='color:#fb7185;'>Error connecting to R2: {str(e)}</td></tr>"
-
-    html = f"""
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Cloudflare R2 Manager</title>
-        <style>{DASHBOARD_CSS}</style>
-        <script>{DASHBOARD_JS}</script>
-    </head>
-    <body>
-        <div class="container">
-            <div class="header-bar">
-                <h2>🛡️ Cloudflare R2 Control Panel</h2>
-            </div>
-            
-            <div class="breadcrumbs">
-                {breadcrumbs_html}
-            </div>
-
-            <div class="controls">
-                <input type="text" id="searchInput" class="search-box" onkeyup="filterTable()" placeholder="🔍 Search current directory...">
-            </div>
-
-            <div class="table-wrapper">
-                <table>
-                    <thead>
-                        <tr>
-                            <th id="th-0" onclick="sortTable(0, 'str')">Name <span></span></th>
-                            <th id="th-1" onclick="sortTable(1, 'num')">Size <span></span></th>
-                            <th id="th-2" onclick="sortTable(2, 'num')">Date Uploaded <span>🔽</span></th>
-                            <th>Actions</th>
-                        </tr>
-                    </thead>
-                    <tbody>{file_rows}</tbody>
-                </table>
-            </div>
-        </div>
-    </body>
-    </html>
-    """
+    html = f"<html><head><title>R2 Dash</title><style>{DASHBOARD_CSS}</style><script>{DASHBOARD_JS}</script></head><body><div class='container'><h2>🛡️ R2 Dashboard</h2><div class='controls'><input type='text' id='searchInput' class='search-box' onkeyup='filterTable()' placeholder='🔍 Search files...'></div><div class='table-wrapper'><table><tr><th>File</th><th>Size</th><th>Actions</th></tr>{file_rows}</table></div></div></body></html>"
     return web.Response(text=html, content_type='text/html')
 
 @routes.get('/delete_file')
 async def web_delete_handler(request):
     if not check_dashboard_auth(request): return web.Response(status=401, text="Unauthorized")
-    key = request.query.get('key')
-    prefix = request.query.get('prefix', '')
-    if key:
-        try: await asyncio.to_thread(sync_delete_r2_file, key); force_system_ram_purge()
+    if key := request.query.get('key'):
+        try: await asyncio.to_thread(sync_delete_r2_file, key)
         except: pass
-    raise web.HTTPFound(f'/dashboard?prefix={quote(prefix)}')
-
-@routes.get('/rename_file')
-async def web_rename_handler(request):
-    if not check_dashboard_auth(request): return web.Response(status=401, text="Unauthorized")
-    old_key, new_key = request.query.get('old_key'), request.query.get('new_key')
-    prefix = request.query.get('prefix', '')
-    if old_key and new_key and old_key != new_key:
-        try: await asyncio.to_thread(sync_rename_r2_file, old_key, new_key); force_system_ram_purge()
-        except: pass
-    raise web.HTTPFound(f'/dashboard?prefix={quote(prefix)}')
-
-@routes.get('/move_file')
-async def web_move_handler(request):
-    if not check_dashboard_auth(request): return web.Response(status=401, text="Unauthorized")
-    old_key = request.query.get('old_key')
-    target_folder = request.query.get('target_folder', '').strip().strip('/')
-    prefix = request.query.get('prefix', '')
-    if old_key and target_folder is not None:
-        filename = old_key.split('/')[-1]
-        new_key = f"{target_folder}/{filename}" if target_folder else filename
-        if old_key != new_key:
-            try: await asyncio.to_thread(sync_rename_r2_file, old_key, new_key); force_system_ram_purge()
-            except: pass
-    raise web.HTTPFound(f'/dashboard?prefix={quote(prefix)}')
+    raise web.HTTPFound('/dashboard')
 
 @routes.get('/')
 async def root(request):
-    return web.Response(text="<html><body style='background:#0f172a;color:#38bdf8;text-align:center;padding-top:150px;font-family:sans-serif;'><h1 style='font-size:40px;'>✅ System Online</h1><a href='/dashboard' style='display:inline-block;margin-top:20px;padding:15px 30px;background:#38bdf8;color:#0f172a;text-decoration:none;border-radius:8px;font-weight:bold;font-size:18px;'>Go to Dashboard</a></body></html>", content_type='text/html')
+    return web.Response(text="<html><body style='background:#0f172a;color:#38bdf8;text-align:center;padding-top:150px;font-family:sans-serif;'><h1 style='font-size:40px;'>✅ System Online</h1><a href='/dashboard' style='color:#0f172a;background:#38bdf8;padding:15px;text-decoration:none;border-radius:5px;'>Dashboard</a></body></html>", content_type='text/html')
 
-@routes.get('/{code}/{filename}')
-async def stream_handler(request):
-    code, data = request.match_info['code'], link_storage.get(request.match_info['code'])
-    if not data: return web.Response(text="Expired", status=410)
-    msg, file_name = data['msg'], unquote(request.match_info['filename'])
-    start = int(re.search(r'bytes=(\d+)-', request.headers.get('Range')).group(1)) if request.headers.get('Range') else 0
-    resp = web.StreamResponse(status=206 if start else 200, headers={'Content-Disposition': f'attachment; filename="{file_name}"', 'Accept-Ranges': 'bytes', 'Content-Type': 'video/mp4', 'Content-Length': str(msg.file.size - start)})
-    await resp.prepare(request)
-    try:
-        async for chunk in client.iter_download(msg.media, offset=(start//1048576)*1048576, request_size=1048576): await resp.write(chunk)
-    except: pass
-    return resp
+# --- 13. STARTUP ---
+async def main():
+    app = web.Application()
+    app.add_routes(routes)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, '0.0.0.0', int(os.environ.get("PORT", 8000))).start()
+    await client.start(bot_token=BOT_TOKEN)
+    await client.run_until_disconnected()
 
-# --- 10. RE-ENABLED BOT CODE WITH FIXES ---
-# ... (All Bot handling logic remains intact exactly as in previous version, including /c_, yt-dlp, and folder uploads) ...
+if __name__ == '__main__':
+    asyncio.run(main())
