@@ -19,17 +19,15 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import quote, unquote
 
-# Add HLS Specific MIME Types
+# --- HLS MIME TYPES ---
 mimetypes.add_type('application/vnd.apple.mpegurl', '.m3u8')
-mimetypes.add_type('video/mp2t', '.ts')
+mimetypes.add_type('video/MP2T', '.ts')
 
-# Telegram Imports
+# --- TELEGRAM IMPORTS ---
 from telethon import TelegramClient, events, types, Button
 from telethon.network import ConnectionTcpFull
-from telethon.tl.functions.upload import SaveBigFilePartRequest, SaveFilePartRequest, GetFileRequest
-from telethon.tl.types import InputFileBig, InputFile
 
-# Web & Storage
+# --- WEB & STORAGE IMPORTS ---
 from aiohttp import web, ClientSession
 import boto3
 from boto3.s3.transfer import TransferConfig
@@ -57,19 +55,21 @@ R2_PUBLIC_URL = os.environ.get("R2_PUBLIC_URL", "").strip().rstrip('/')
 DASHBOARD_USER = os.environ.get("DASHBOARD_USER", "admin").strip()
 DASHBOARD_PASS = os.environ.get("DASHBOARD_PASS", "admin123").strip()
 
+# Public Trackers for Aria2c Magnet Links
 PUBLIC_TRACKERS = "udp://tracker.opentrackr.org:1337/announce,http://tracker.openbittorrent.com:80/announce,udp://opentracker.i2p.rocks:6969/announce"
 
-global_semaphore = asyncio.Semaphore(4)
+# 2 Concurrent global tasks to protect 16GB disk (e.g. two 7GB zips = 14GB)
+global_semaphore = asyncio.Semaphore(2)
 routes = web.RouteTableDef()
-link_storage = {}
 active_tasks = {}
 
-client = TelegramClient('bot_session', int(API_ID), API_HASH, connection=ConnectionTcpFull)
+client = TelegramClient('bot_session', int(API_ID), API_HASH, connection=ConnectionTcpFull, use_ipv6=False)
 
 # ============================================
 # --- 2. CORE SYSTEM HELPERS ---
 # ============================================
 def free_memory():
+    """Forces Linux to reclaim unused RAM."""
     gc.collect()
     try: ctypes.CDLL('libc.so.6').malloc_trim(0)
     except: pass
@@ -93,41 +93,18 @@ def get_status_text(action, filename, current, total, start_time):
 
 def format_saas_progress(action, filename, percent, downloaded, total, speed, eta, cn, elapsed, task_code):
     done = int(percent // 10)
-    p_bar = "●" * done
-    if done < 10:
-        p_bar += "◔" if (percent % 10) >= 5 else "○"
-        p_bar += "○" * (9 - done)
-    return (
-        f"🧲 **{action}...**\n"
-        f"╭ `[{p_bar[:10]}]` » `{percent}%`\n"
-        f"├ **Processed:** `{downloaded} of {total}`\n"
-        f"├ **Speed:** `{speed}`\n"
-        f"├ **ETA:** `{eta}`\n"
-        f"├ **Peers:** `{cn}`\n"
-        f"├ **Elapsed:** `{elapsed}`\n"
-        f"├ **Engine:** `Aria2 v1.36.0`\n"
-        f"╰ **Cancel:** `/c_{task_code}`"
-    )
+    p_bar = "●" * done + "◔" * (1 if percent % 10 >= 5 else 0)
+    p_bar += "○" * (10 - len(p_bar.replace("●", "a").replace("◔", "b")))
+    return (f"🧲 **{action}...**\n╭ `[{p_bar[:10]}]` » `{percent}%`\n"
+            f"├ **Processed:** `{downloaded} of {total}`\n├ **Speed:** `{speed}`\n"
+            f"├ **ETA:** `{eta}`\n├ **Peers:** `{cn}`\n├ **Elapsed:** `{elapsed}`\n"
+            f"╰ **Cancel:** `/c_{task_code}`")
 
 def get_readable_time(seconds: int) -> str:
-    result = ""
-    (days, remainder) = divmod(seconds, 86400)
-    if days: result += f"{int(days)}d "
-    (hours, remainder) = divmod(remainder, 3600)
-    if hours: result += f"{int(hours)}h "
-    (minutes, seconds) = divmod(remainder, 60)
-    if minutes: result += f"{int(minutes)}m "
-    result += f"{int(seconds)}s"
-    return result
-
-def get_largest_file(folder_path):
-    largest, max_size = None, 0
-    for r, _, files in os.walk(folder_path):
-        for f in files:
-            fp = os.path.join(r, f)
-            sz = os.path.getsize(fp)
-            if sz > max_size: max_size, largest = sz, fp
-    return largest
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    mins, secs = divmod(rem, 60)
+    return f"{int(days)}d {int(hours)}h {int(mins)}m {int(secs)}s".replace("0d ", "").replace("0h ", "")
 
 def clean_double_extension(filename):
     while filename.lower().endswith(('.mp4.mp4', '.mkv.mkv', '.zip.zip')):
@@ -142,6 +119,15 @@ def get_unique_filename(filepath):
     while os.path.exists(f"{base}_{counter}{ext}"): counter += 1
     return f"{base}_{counter}{ext}"
 
+def get_largest_file(folder_path):
+    largest, max_size = None, 0
+    for r, _, files in os.walk(folder_path):
+        for f in files:
+            fp = os.path.join(r, f)
+            sz = os.path.getsize(fp)
+            if sz > max_size: max_size, largest = sz, fp
+    return largest
+
 # ============================================
 # --- 3. CLOUDFLARE R2 ENGINES ---
 # ============================================
@@ -151,11 +137,24 @@ def get_r2_client():
     r2_config = Config(region_name='auto', signature_version='s3v4', retries={'max_attempts': 3, 'mode': 'standard'})
     return boto3.client('s3', endpoint_url=endpoint, aws_access_key_id=R2_ACCESS_KEY_ID, aws_secret_access_key=R2_SECRET_ACCESS_KEY, config=r2_config)
 
-def sync_get_r2_files():
-    return get_r2_client().list_objects_v2(Bucket=R2_BUCKET_NAME)
+def sync_get_r2_files(prefix=""):
+    """Lists files AND folders dynamically."""
+    s3 = get_r2_client()
+    return s3.list_objects_v2(Bucket=R2_BUCKET_NAME, Prefix=prefix, Delimiter='/')
 
 def sync_delete_r2_file(s3_key):
-    get_r2_client().delete_object(Bucket=R2_BUCKET_NAME, Key=s3_key)
+    s3 = get_r2_client()
+    s3.delete_object(Bucket=R2_BUCKET_NAME, Key=s3_key)
+
+def sync_delete_r2_folder(prefix):
+    """Deletes an entire folder and all its contents in R2."""
+    s3 = get_r2_client()
+    paginator = s3.get_paginator('list_objects_v2')
+    pages = paginator.paginate(Bucket=R2_BUCKET_NAME, Prefix=prefix)
+    for page in pages:
+        if 'Contents' in page:
+            objects_to_delete = [{'Key': obj['Key']} for obj in page['Contents']]
+            s3.delete_objects(Bucket=R2_BUCKET_NAME, Delete={'Objects': objects_to_delete})
 
 def sync_rename_r2_file(old_key, new_key):
     s3 = get_r2_client()
@@ -182,7 +181,8 @@ def sync_r2_upload(file_path, s3_key, loop, msg, start_t):
     if not filename.endswith('.m3u8') and not filename.endswith('.ts'):
         extra_args['ContentDisposition'] = 'inline'
 
-    t_config = TransferConfig(multipart_threshold=8*1024*1024, multipart_chunksize=8*1024*1024, max_concurrency=4)
+    # Upgraded concurrency for 2GB RAM instance
+    t_config = TransferConfig(multipart_threshold=8*1024*1024, multipart_chunksize=8*1024*1024, max_concurrency=8)
     s3.upload_file(file_path, R2_BUCKET_NAME, s3_key, Callback=ProgressCallback(), ExtraArgs=extra_args, Config=t_config)
 
 def sync_r2_upload_folder(folder_path, s3_prefix, loop, msg, start_t):
@@ -215,7 +215,7 @@ def sync_r2_upload_folder(folder_path, s3_prefix, loop, msg, start_t):
         if ext not in ['.m3u8', '.ts']: extra_args['ContentDisposition'] = 'inline'
         s3.upload_file(file_path, R2_BUCKET_NAME, s3_key, Callback=prog_cb, ExtraArgs=extra_args)
 
-    with ThreadPoolExecutor(max_workers=15) as executor:
+    with ThreadPoolExecutor(max_workers=20) as executor:
         executor.map(upload_single_file, all_files)
 
 async def upload_to_r2(file_path, msg, target_folder=None):
@@ -227,12 +227,10 @@ async def upload_to_r2(file_path, msg, target_folder=None):
     
     await msg.edit(f"⬆️ **Connecting to Cloudflare R2...**\n🎬 `{filename}`")
     await asyncio.to_thread(sync_r2_upload, file_path, s3_key, loop, msg, start_t)
-    code = secrets.token_urlsafe(8)
-    link_storage[code] = {'s3_key': s3_key}
-    return f"{R2_PUBLIC_URL}/{quote(s3_key, safe='/')}", code
+    return f"{R2_PUBLIC_URL}/{quote(s3_key, safe='/')}"
 
 # ============================================
-# --- 4. DOWNLOAD ENGINES ---
+# --- 4. DOWNLOAD ENGINES (MAGNET / YT-DLP) ---
 # ============================================
 def get_aria2_executable():
     if shutil.which('aria2c'): return 'aria2c'
@@ -245,13 +243,9 @@ def get_aria2_executable():
     except: return 'aria2c'
 
 async def download_magnet(url, workspace, custom_name, msg, start_t):
-    aria_cmd = get_aria2_executable()
-    await msg.edit("🧲 **Initializing Torrent Engine (aria2c)...**")
-    process = await asyncio.create_subprocess_exec(
-        aria_cmd, "--seed-time=0", "--max-connection-per-server=16", "--split=16",
-        "--summary-interval=3", "--bt-stop-timeout=120", f"--bt-tracker={PUBLIC_TRACKERS}",
-        f"--dir={workspace}", url, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-    )
+    cmd = [get_aria2_executable(), "--seed-time=0", "--max-connection-per-server=16", "--split=16",
+           "--summary-interval=3", "--bt-stop-timeout=120", f"--bt-tracker={PUBLIC_TRACKERS}", f"--dir={workspace}", url]
+    process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE)
     task_code = secrets.token_urlsafe(8)
     active_tasks[task_code] = {'process': process, 'cancel_event': asyncio.Event(), 'dir': workspace}
     aria_re = re.compile(r'\[#(?P<gid>\w+)\s+(?P<downloaded>[^\s/]+)/(?P<total>[^\s\(\)]+)(?:\((?P<percent>\d+)%\))?\s+CN:(?P<cn>\d+)\s+SPD:(?P<speed>[^\s\]]+)(?:\s+ETA:(?P<eta>[^\s\]]+))?\]')
@@ -271,11 +265,12 @@ async def download_magnet(url, workspace, custom_name, msg, start_t):
             p_text = format_saas_progress("Download", active_file, int(match.group('percent') or 0), match.group('downloaded'), match.group('total'), match.group('speed')+"/s", match.group('eta') or "Calc...", match.group('cn'), elapsed, task_code)
             try: await msg.edit(p_text, buttons=[[Button.inline("❌ Cancel", data=f"canceltask_{task_code}")]]); last_update = time.time()
             except: pass
+
     await process.wait()
     active_tasks.pop(task_code, None)
     
     largest = get_largest_file(workspace)
-    if not largest: raise ValueError("Torrent failed.")
+    if not largest: raise ValueError("Torrent failed or returned no files.")
     final_name = get_unique_filename(os.path.join(workspace, custom_name if custom_name else os.path.basename(largest)))
     shutil.move(largest, final_name)
     return final_name
@@ -290,93 +285,82 @@ def sync_yt_dlp_download(url, workspace, custom_name=None):
 async def download_direct(url, workspace, msg, start_t, custom_name=None):
     async with ClientSession() as sess:
         async with sess.get(url, allow_redirects=True) as r:
-            if "text/html" in r.headers.get("Content-Type", ""): raise ValueError("HTML webpage detected.")
+            if "text/html" in r.headers.get("Content-Type", ""): raise ValueError("HTML webpage detected, not a direct file.")
             f_size = int(r.headers.get("Content-Length", 0))
             filename = custom_name or unquote(url.split("/")[-1].split("?")[0]) or "video.mp4"
             if not "." in filename: filename += ".mp4"
-            file_path = os.path.join(workspace, clean_double_extension(re.sub(r'[\\/*?:"<>|]', "", filename)))
+            filename = get_unique_filename(re.sub(r'[\\/*?:"<>|]', "", clean_double_extension(filename)))
+            file_path = os.path.join(workspace, filename)
+
+            await msg.edit(f"⬇️ **Leeching Direct Link...**\n🎬 `{filename}`")
             with open(file_path, 'wb') as f:
                 async for chunk in r.content.iter_chunked(1024*1024):
                     f.write(chunk)
                     if f.tell() % (10 * 1024 * 1024) == 0:
                         try: await msg.edit(get_status_text("Leeching", filename, f.tell(), f_size, start_t))
                         except: pass
-    return file_path
+            return file_path
 
 async def download_any_url(url, workspace, custom_name, msg, start_t):
     if url.startswith("magnet:?"):
         return await download_magnet(url, workspace, custom_name, msg, start_t)
 
     is_zip = (custom_name and custom_name.lower().endswith('.zip')) or url.lower().endswith('.zip')
-
     if not is_zip:
         try:
             await msg.edit("🅿️ **Extracting File Info via yt-dlp...**")
             filename = await asyncio.to_thread(sync_yt_dlp_download, url, workspace, custom_name)
-            if filename and os.path.exists(filename) and os.path.getsize(filename) > 0:
-                return filename
+            if filename and os.path.exists(filename) and os.path.getsize(filename) > 0: return filename
         except Exception: pass
 
     return await download_direct(url, workspace, msg, start_t, custom_name)
 
-# ============================================
-# --- 5. TELEGRAM HANDLERS ---
-# ============================================
-@client.on(events.NewMessage(incoming=True))
-async def handle_new_message(event):
-    if event.sender_id != ADMIN_ID: return
+# --- 5. ZIP EXTRACTOR HELPER (SAVES 16GB DISK SPACE) ---
+def extract_and_delete_zip(zip_path, extract_dir):
+    """Extracts a ZIP and immediately deletes the original to save Disk Space."""
+    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+        zip_ref.extractall(extract_dir)
+    os.remove(zip_path) # Critical for preventing "Disk Full" on large HLS packages
 
-    if event.text and event.text.startswith('/c_'):
-        code = event.text.split('/c_')[1].strip()
-        item = active_tasks.get(code)
-        if item:
-            item['cancel_event'].set()
-            if item['process']:
-                try: item['process'].terminate()
-                except: pass
-            await event.reply("🛑 **Torrent download cancelled successfully.**")
-        else: await event.reply("❌ **Active task not found.**")
-        return
-
+# ============================================
+# --- 6. TELEGRAM HANDLERS ---
+# ============================================
+@client.on(events.NewMessage(incoming=True, func=lambda e: e.sender_id == ADMIN_ID))
+async def master_handler(event):
     if event.file:
-        await event.reply(
-            f"📂 **File Detected:** `{event.file.name or 'video.mp4'}`",
-            buttons=[
-                [Button.inline("🔗 Generate Direct Link", data=f"link_{event.id}")],
-                [Button.inline("🛡️ Upload to Cloudflare R2", data=f"r2_{event.id}")]
-            ]
-        )
+        await event.reply(f"📂 **File Detected:** `{event.file.name or 'file.bin'}`",
+            buttons=[[Button.inline("🛡️ Upload to Cloudflare R2", data=f"r2_{event.id}")]])
         return
 
     if event.text and (event.text.startswith("http") or event.text.startswith("magnet:?")):
         async with global_semaphore:
-            raw_text = event.text.strip()
-            url = raw_text.split(" -n ")[0].strip()
-            custom_name = raw_text.split(" -n ")[1].strip() if " -n " in raw_text else None
+            raw = event.text.strip()
+            url = raw.split(" -n ")[0].split(" -f ")[0].strip()
+            custom_name, target_folder = None, None
             
-            target_folder = None
-            if " -f " in url:
-                url, target_folder = url.split(" -f ", 1)
-            elif custom_name and " -f " in custom_name:
-                custom_name, target_folder = custom_name.split(" -f ", 1)
+            if " -n " in raw: custom_name = raw.split(" -n ")[1].split(" -f ")[0].strip()
+            if " -f " in raw: target_folder = raw.split(" -f ")[1].strip()
 
             msg = await event.reply("🔗 **Processing Request...**")
-            start_t = time.time()
             workspace = f"dl_{uuid.uuid4().hex[:8]}"
             os.makedirs(workspace, exist_ok=True)
-            filename = None
+            start_t = time.time()
             
             try:
-                filename = await download_any_url(url, workspace, custom_name, msg, start_t)
-                
-                # Check if it is a ZIP HLS archive
+                final_path = await download_any_url(url, workspace, custom_name, msg, start_t)
+                if not final_path or not os.path.exists(final_path): raise ValueError("Download failed.")
+                filename = os.path.basename(final_path)
+
+                # ZIP / HLS Logic (Smart Disk Management)
                 if filename.lower().endswith('.zip'):
                     await msg.edit("📦 **Extracting HLS ZIP Archive...**")
                     extract_dir = os.path.join(workspace, "extracted")
                     os.makedirs(extract_dir, exist_ok=True)
-                    await asyncio.to_thread(lambda: zipfile.ZipFile(filename, 'r').extractall(extract_dir))
+                    
+                    # Extract and instantly delete ZIP to save 16GB limit
+                    await asyncio.to_thread(extract_and_delete_zip, final_path, extract_dir)
 
-                    project_name = os.path.splitext(os.path.basename(filename))[0]
+                    project_name = os.path.splitext(filename)[0]
                     extracted_items = os.listdir(extract_dir)
                     
                     if len(extracted_items) == 1 and os.path.isdir(os.path.join(extract_dir, extracted_items[0])):
@@ -386,33 +370,27 @@ async def handle_new_message(event):
                         upload_source_dir = extract_dir
                         s3_prefix = target_folder if target_folder else project_name
 
-                    await msg.edit(f"⬆️ **Uploading HLS Pack to R2...**\n📂 `{s3_prefix}`")
+                    await msg.edit(f"⬆️ **Uploading HLS Pack to R2...**\n📂 `{s3_prefix}/`")
                     await asyncio.to_thread(sync_r2_upload_folder, upload_source_dir, s3_prefix, asyncio.get_running_loop(), msg, time.time())
                     
                     master_url = f"{R2_PUBLIC_URL}/{quote(s3_prefix, safe='/')}/master.m3u8"
-                    # Telethon expects 'link_preview=False' to disable preview
                     await msg.edit(f"✅ **HLS Uploaded to R2!**\n\n🎬 `{project_name}`\n📺 **Stream Link:**\n`{master_url}`", link_preview=False)
 
+                # Normal Video Logic
                 else:
-                    upload_result = await upload_to_r2(filename, msg, target_folder)
-                    r2_url, code = upload_result if isinstance(upload_result, tuple) else (upload_result, "unknown")
+                    r2_url = await upload_to_r2(final_path, msg, target_folder)
+                    await msg.edit(f"✅ **Leeched & Uploaded to R2!**\n\n🎬 `{filename}`\n🔗 `{r2_url}`", link_preview=False)
 
-                    await msg.edit(
-                        f"✅ **Leeched & Uploaded to R2!**\n\n🎬 `{os.path.basename(filename)}`\n🔗 `{r2_url}`",
-                        buttons=[[Button.inline("🗑️ Delete from R2", data=f"delr2_{code}")]] if code != "unknown" else None,
-                        link_preview=False
-                    )
-            except Exception as e: 
-                await msg.edit(f"❌ Error: {e}")
+            except Exception as e: await msg.edit(f"❌ Error: {e}")
             finally:
-                if filename and os.path.exists(filename): os.remove(filename)
-                force_system_ram_purge()
+                shutil.rmtree(workspace, ignore_errors=True)
+                free_memory()
 
 @client.on(events.CallbackQuery)
 async def on_callback(event):
     if event.sender_id != ADMIN_ID: return
     data = event.data.decode()
-    
+
     if data.startswith("canceltask_"):
         code = data.split("_")[1]
         item = active_tasks.get(code)
@@ -421,58 +399,19 @@ async def on_callback(event):
             if item['process']:
                 try: item['process'].terminate()
                 except: pass
-            await event.answer("Task cancelled successfully.", alert=True)
+            await event.answer("Task cancelled.", alert=True)
             try: await event.edit("🛑 **Task Cancelled by User.**")
             except: pass
-        else: await event.answer("Task already finished.", alert=True)
-        return
-
-    if data.startswith("link_"):
-        msg_id = int(data.split("_")[1])
-        await event.answer("Generating Direct Link...", alert=False)
-        tg_msg = await client.get_messages(event.chat_id, ids=msg_id)
-        if not tg_msg or not tg_msg.file: return await event.respond("❌ Error: File not found.")
-        
-        code = secrets.token_urlsafe(8)
-        link_storage[code] = {'msg': tg_msg, 'timestamp': time.time()}
-        
-        base = os.environ.get("KOYEB_PUBLIC_URL", "").rstrip('/')
-        if not base:
-            app_name = os.environ.get('KOYEB_APP_NAME')
-            base = f"https://{app_name}.koyeb.app" if app_name else "https://your-bot-name.koyeb.app"
-            
-        filename = get_unique_filename(clean_double_extension(re.sub(r'[\\/*?:"<>|]', "", tg_msg.file.name or "video.mp4")))
-        hotlink = f"{base}/{code}/{quote(filename)}"
-        
-        await event.respond(f"🚀 **Direct Download Link:**\n\n`{hotlink}`\n\n💡 *Valid for 24 hours. Paste into IDM for max speed.*")
-        return
-
-    if data.startswith("delr2_"):
-        code = data.split("_")[1]
-        item = link_storage.get(code)
-        if item and 's3_key' in item:
-            s3_key = item['s3_key']
-            await event.answer("Deleting file from R2...", alert=False)
-            try:
-                await asyncio.to_thread(sync_delete_r2_file, s3_key)
-                await event.edit(f"🗑️ **File Deleted from Cloudflare R2!**\n\nKey: `{s3_key}`")
-                force_system_ram_purge()
-            except Exception as e:
-                await event.edit(f"❌ Delete Error: {e}")
-        else:
-            await event.answer("❌ Reference expired or already deleted.", alert=True)
         return
 
     if data.startswith("r2_"):
-        msg_id = int(data.split("_")[1])
-        await event.answer("Processing R2 Upload...", alert=False)
+        msg_id = int(data.split("_")[1]); await event.answer("Uploading...", alert=False)
         tg_msg = await client.get_messages(event.chat_id, ids=msg_id)
         
         async with global_semaphore:
             workspace = f"dl_{uuid.uuid4().hex[:8]}"
             os.makedirs(workspace, exist_ok=True)
-            raw_filename = re.sub(r'[\\/*?:"<>|]', "", tg_msg.file.name or "video.mp4")
-            filename = get_unique_filename(clean_double_extension(raw_filename))
+            filename = get_unique_filename(clean_double_extension(re.sub(r'[\\/*?:"<>|]', "", tg_msg.file.name or "video.mp4")))
             file_path = os.path.join(workspace, filename)
             
             status = await event.respond(f"⬇️ Downloading from Telegram...")
@@ -484,39 +423,30 @@ async def on_callback(event):
                         if f.tell() % (10 * 1024 * 1024) == 0: 
                             await status.edit(get_status_text("TG Down", filename, f.tell(), tg_msg.file.size, start_t))
                 
-                # Check if it is a ZIP HLS archive
                 if filename.lower().endswith('.zip'):
                     await status.edit("📦 **Extracting HLS ZIP Archive...**")
-                    extract_dir = os.path.join(workspace, "extracted")
-                    os.makedirs(extract_dir, exist_ok=True)
-                    await asyncio.to_thread(lambda: zipfile.ZipFile(file_path, 'r').extractall(extract_dir))
-
-                    project_name = os.path.splitext(filename)[0]
-                    extracted_items = os.listdir(extract_dir)
-                    if len(extracted_items) == 1 and os.path.isdir(os.path.join(extract_dir, extracted_items[0])):
-                        upload_source_dir = os.path.join(extract_dir, extracted_items[0])
-                        s3_prefix = extracted_items[0]
-                    else:
-                        upload_source_dir = extract_dir
-                        s3_prefix = project_name
-
-                    await status.edit(f"⬆️ **Uploading HLS Pack to R2...**\n📂 `{s3_prefix}`")
-                    await asyncio.to_thread(sync_r2_upload_folder, upload_source_dir, s3_prefix, asyncio.get_running_loop(), status, time.time())
+                    extract_dir = os.path.join(workspace, "extracted"); os.makedirs(extract_dir, exist_ok=True)
+                    await asyncio.to_thread(extract_and_delete_zip, file_path, extract_dir)
                     
-                    master_url = f"{R2_PUBLIC_URL}/{quote(s3_prefix, safe='/')}/master.m3u8"
-                    # Telethon expects 'link_preview=False' to disable preview
-                    await status.edit(f"✅ **HLS Uploaded!**\n\n🎬 `{project_name}`\n📺 **Stream Link:**\n`{master_url}`", link_preview=False)
+                    proj = os.path.splitext(filename)[0]
+                    items = os.listdir(extract_dir)
+                    s_dir = os.path.join(extract_dir, items[0]) if len(items)==1 and os.path.isdir(os.path.join(extract_dir, items[0])) else extract_dir
+                    s_pref = items[0] if len(items)==1 and os.path.isdir(os.path.join(extract_dir, items[0])) else proj
+                    
+                    await status.edit(f"⬆️ **Uploading HLS...**\n📂 `{s_pref}/`")
+                    await asyncio.to_thread(sync_r2_upload_folder, s_dir, s_pref, asyncio.get_running_loop(), status, time.time())
+                    m_url = f"{R2_PUBLIC_URL}/{quote(s_pref, safe='/')}/master.m3u8"
+                    await status.edit(f"✅ **HLS Uploaded!**\n🎬 `{proj}`\n📺 **Stream Link:**\n`{m_url}`", link_preview=False)
                 else:
-                    r2_url, code = await upload_to_r2(file_path, status)
-                    await status.edit(f"✅ **Cloudflare R2 Complete!**\n\n🎬 `{filename}`\n🔗 `{r2_url}`", buttons=[[Button.inline("🗑️ Delete from R2", data=f"delr2_{code}")]])
-            except Exception as e: 
-                await status.edit(f"❌ Error: {e}")
+                    r2_url = await upload_to_r2(file_path, status)
+                    await status.edit(f"✅ **Cloudflare R2 Complete!**\n🎬 `{filename}`\n🔗 `{r2_url}`", link_preview=False)
+            except Exception as e: await status.edit(f"❌ Error: {e}")
             finally:
-                if os.path.exists(filename): os.remove(filename)
-                force_system_ram_purge()
+                shutil.rmtree(workspace, ignore_errors=True)
+                free_memory()
 
 # ============================================
-# --- 6. SECURE WEB DASHBOARD & UI ---
+# --- 7. SECURE SMART WEB DASHBOARD ---
 # ============================================
 def check_dashboard_auth(request):
     auth_header = request.headers.get('Authorization')
@@ -527,74 +457,173 @@ def check_dashboard_auth(request):
     except: return False
 
 DASHBOARD_CSS = """
-    :root { --bg: #0f172a; --card: #1e293b; --text: #f8fafc; --muted: #94a3b8; --accent: #38bdf8; --border: #334155; }
+    :root { --bg: #0b0f19; --card: #1e293b; --text: #f8fafc; --muted: #94a3b8; --accent: #3b82f6; --border: #334155; }
     body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 20px; }
     .container { max-width: 1200px; margin: auto; }
-    .header-bar { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; margin-bottom: 20px; gap: 15px; }
-    h2 { margin: 0; color: var(--text); font-size: 24px; display: flex; align-items: center; gap: 10px; border-bottom: 2px solid var(--border); padding-bottom: 10px; width: 100%; }
-    .controls { display: flex; gap: 10px; margin-bottom: 15px; width: 100%; }
-    .search-box { flex-grow: 1; padding: 14px 20px; border-radius: 8px; border: 1px solid var(--border); background: var(--card); color: var(--text); font-size: 15px; outline: none; transition: 0.2s; }
-    .search-box:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(56, 189, 248, 0.2); }
-    .table-wrapper { overflow-x: auto; background: var(--card); border-radius: 10px; border: 1px solid var(--border); box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
-    table { width: 100%; border-collapse: collapse; min-width: 900px; }
-    th { background: #0f172a; color: var(--muted); padding: 16px; text-align: left; font-size: 13px; font-weight: 600; cursor: pointer; user-select: none; }
+    h2 { margin: 0 0 20px 0; color: var(--text); font-size: 24px; border-bottom: 2px solid var(--border); padding-bottom: 15px; }
+    
+    .breadcrumbs { display: flex; align-items: center; gap: 8px; background: var(--card); padding: 12px 20px; border-radius: 8px; border: 1px solid var(--border); margin-bottom: 20px; font-size: 15px; }
+    .breadcrumb-link { color: var(--accent); text-decoration: none; font-weight: 600; }
+    .breadcrumb-link:hover { text-decoration: underline; }
+    .divider { color: var(--muted); }
+
+    .search-box { width: 100%; padding: 14px 20px; border-radius: 8px; border: 1px solid var(--border); background: var(--card); color: var(--text); font-size: 15px; outline: none; margin-bottom: 20px; box-sizing: border-box; }
+    .search-box:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.2); }
+
+    .table-wrapper { overflow-x: auto; background: var(--card); border-radius: 10px; border: 1px solid var(--border); }
+    table { width: 100%; border-collapse: collapse; min-width: 800px; }
+    th { background: #0f172a; color: var(--muted); padding: 15px; text-align: left; font-size: 13px; font-weight: 600; cursor: pointer; }
     th:hover { color: var(--text); }
-    td { padding: 16px; border-bottom: 1px solid var(--border); font-size: 14px; word-break: break-all; color: #cbd5e1; }
-    tr:last-child td { border-bottom: none; }
+    td { padding: 15px; border-bottom: 1px solid var(--border); font-size: 14px; word-break: break-all; }
     tr:hover { background: #334155; }
+
+    .folder-link { color: #fbbf24; text-decoration: none; font-weight: bold; font-size: 15px; display: flex; align-items: center; gap: 8px; }
+    .folder-link:hover { text-decoration: underline; }
+
     .actions { display: flex; gap: 8px; flex-wrap: wrap; }
-    .btn { display: inline-flex; align-items: center; justify-content: center; gap: 5px; padding: 8px 14px; border-radius: 6px; border: none; font-size: 12px; font-weight: 600; cursor: pointer; text-decoration: none; transition: 0.2s; }
-    .btn-copy { background: rgba(56, 189, 248, 0.1); color: var(--accent); }
+    .btn { display: inline-flex; align-items: center; gap: 5px; padding: 6px 12px; border-radius: 6px; border: none; font-size: 12px; font-weight: bold; cursor: pointer; text-decoration: none; }
+    .btn-copy { background: rgba(59, 130, 246, 0.1); color: var(--accent); }
+    .btn-view { background: rgba(16, 185, 129, 0.1); color: #34d399; }
+    .btn-move { background: rgba(167, 139, 250, 0.1); color: #c084fc; }
+    .btn-rename { background: rgba(251, 191, 36, 0.1); color: #fbbf24; }
     .btn-delete { background: rgba(244, 63, 94, 0.1); color: #fb7185; }
+    .btn:hover { filter: brightness(1.2); }
 """
 
 DASHBOARD_JS = """
     function copyText(t) { navigator.clipboard.writeText(t); alert('✅ URL Copied!'); }
-    function deleteFile(key) {
-        let decodedKey = decodeURIComponent(key);
-        if (confirm('⚠️ PERMANENTLY DELETE: \\n' + decodedKey)) {
-            window.location.href = '/delete_file?key=' + encodeURIComponent(decodedKey);
+    function deleteFile(key, isFolder, prefix) {
+        let dec = decodeURIComponent(key);
+        let msg = isFolder ? '⚠️ DELETE ENTIRE FOLDER: \\n' + dec : '⚠️ DELETE FILE: \\n' + dec;
+        if (confirm(msg)) {
+            window.location.href = (isFolder ? '/delete_folder?prefix=' : '/delete_file?key=') + encodeURIComponent(dec) + '&curr_prefix=' + encodeURIComponent(prefix);
         }
+    }
+    function renameFile(key, prefix) {
+        let dec = decodeURIComponent(key);
+        let newKey = prompt('✏️ Rename File (Full Path):', dec);
+        if (newKey && newKey !== dec) window.location.href = '/rename_file?old_key=' + encodeURIComponent(dec) + '&new_key=' + encodeURIComponent(newKey) + '&prefix=' + encodeURIComponent(prefix);
+    }
+    function moveFolder(key, prefix) {
+        let dec = decodeURIComponent(key);
+        let currentDir = dec.includes('/') ? dec.substring(0, dec.lastIndexOf('/')) : '';
+        let target = prompt('📁 Move to Folder (e.g. Movies/2026):', currentDir);
+        if (target !== null) window.location.href = '/move_file?old_key=' + encodeURIComponent(dec) + '&target_folder=' + encodeURIComponent(target) + '&prefix=' + encodeURIComponent(prefix);
     }
     function filterTable() {
         let input = document.getElementById("searchInput").value.toLowerCase();
         let rows = document.querySelectorAll("tbody tr");
         rows.forEach(row => {
-            let filename = row.querySelector(".file-name")?.innerText.toLowerCase() || "";
-            row.style.display = filename.includes(input) ? "" : "none";
+            let name = row.querySelector("td:first-child").innerText.toLowerCase();
+            row.style.display = name.includes(input) ? "" : "none";
         });
     }
 """
 
 @routes.get('/dashboard')
 async def dashboard_handler(request):
-    if not check_dashboard_auth(request):
-        return web.Response(status=401, headers={'WWW-Authenticate': 'Basic realm="Dashboard"'}, text="Access Denied")
+    if not check_dashboard_auth(request): return web.Response(status=401, headers={'WWW-Authenticate': 'Basic realm="Dashboard"'}, text="Access Denied")
     
-    try:
-        response = await asyncio.to_thread(sync_get_r2_files)
-        file_rows = "".join([
-            f"<tr><td class='file-name'>{o['Key']}</td><td>{human_size(o['Size'])}</td><td><div class='actions'><button class='btn btn-copy' onclick=\"copyText('{R2_PUBLIC_URL}/{quote(o['Key'], safe='/')}')\">🔗 Copy URL</button><button class='btn btn-delete' onclick=\"deleteFile('{quote(o['Key'], safe='/')}')\">🗑️ Delete</button></div></td></tr>" 
-            for o in sorted(response.get('Contents', []), key=lambda x: x['LastModified'], reverse=True)
-        ]) or "<tr><td colspan='3'>No files.</td></tr>"
-    except Exception as e: file_rows = f"<tr><td colspan='3' style='color:red'>Error: {e}</td></tr>"
+    prefix = request.query.get('prefix', '')
+    parts = [p for p in prefix.split('/') if p]
+    breadcrumbs = '<a href="/dashboard" class="breadcrumb-link">🏠 Home</a>'
+    curr_path = ""
+    for p in parts:
+        curr_path += p + "/"
+        breadcrumbs += f' <span class="divider">/</span> <a href="/dashboard?prefix={quote(curr_path)}" class="breadcrumb-link">{p}</a>'
 
-    html = f"<html><head><title>R2 Dash</title><style>{DASHBOARD_CSS}</style><script>{DASHBOARD_JS}</script></head><body><div class='container'><h2>🛡️ R2 Dashboard</h2><div class='controls'><input type='text' id='searchInput' class='search-box' onkeyup='filterTable()' placeholder='🔍 Search files...'></div><div class='table-wrapper'><table><tr><th>File</th><th>Size</th><th>Actions</th></tr>{file_rows}</table></div></div></body></html>"
+    file_rows = ""
+    try:
+        response = await asyncio.to_thread(sync_get_r2_files, prefix)
+        
+        # 1. Show Folders (CommonPrefixes)
+        if 'CommonPrefixes' in response:
+            for pref in response['CommonPrefixes']:
+                f_path = pref['Prefix']
+                f_name = f_path.rstrip('/').split('/')[-1]
+                file_rows += f"""<tr style="background: rgba(251, 191, 36, 0.03);">
+                    <td><a href="/dashboard?prefix={quote(f_path)}" class="folder-link">📁 {f_name}/</a></td>
+                    <td>-</td><td>Folder</td>
+                    <td><div class="actions"><button class="btn btn-delete" onclick="deleteFile('{quote(f_path)}', true, '{quote(prefix)}')">🗑️ Delete Folder</button></div></td>
+                </tr>"""
+
+        # 2. Show Files (Contents)
+        if 'Contents' in response:
+            for obj in sorted(response['Contents'], key=lambda x: x['LastModified'], reverse=True):
+                name = obj['Key']
+                if name == prefix: continue # Skip the directory object itself
+                
+                size = human_size(obj['Size'])
+                date = obj['LastModified'].strftime("%Y-%m-%d %H:%M")
+                url = f"{R2_PUBLIC_URL}/{quote(name, safe='/')}"
+                disp_name = name.split('/')[-1]
+                
+                file_rows += f"""<tr>
+                    <td>📄 <span class="file-name">{disp_name}</span></td>
+                    <td>{size}</td><td>{date}</td>
+                    <td><div class="actions">
+                        <button class="btn btn-copy" onclick="copyText('{url}')">🔗 Copy URL</button>
+                        <a href="{url}" target="_blank" class="btn btn-view">▶️ Play</a>
+                        <button class="btn btn-move" onclick="moveFolder('{quote(name)}', '{quote(prefix)}')">📁 Move</button>
+                        <button class="btn btn-rename" onclick="renameFile('{quote(name)}', '{quote(prefix)}')">✏️ Rename</button>
+                        <button class="btn btn-delete" onclick="deleteFile('{quote(name)}', false, '{quote(prefix)}')">🗑️ Delete</button>
+                    </div></td></tr>"""
+                    
+        if not file_rows: file_rows = "<tr><td colspan='4' style='text-align:center;'>Directory is empty.</td></tr>"
+    except Exception as e: file_rows = f"<tr><td colspan='4' style='color:red;'>Error: {e}</td></tr>"
+
+    html = f"""<!DOCTYPE html><html><head><title>Cloudflare R2 Manager</title><style>{DASHBOARD_CSS}</style><script>{DASHBOARD_JS}</script></head><body>
+        <div class="container">
+            <div class="header-bar"><h2>🛡️ Cloudflare R2 Virtual OS</h2></div>
+            <div class="breadcrumbs">{breadcrumbs}</div>
+            <input type="text" id="searchInput" class="search-box" onkeyup="filterTable()" placeholder="🔍 Search inside current folder...">
+            <div class="table-wrapper"><table><tr><th>Name</th><th>Size</th><th>Date</th><th>Actions</th></tr>{file_rows}</table></div>
+        </div></body></html>"""
     return web.Response(text=html, content_type='text/html')
 
 @routes.get('/delete_file')
 async def web_delete_handler(request):
     if not check_dashboard_auth(request): return web.Response(status=401, text="Unauthorized")
     if key := request.query.get('key'):
-        try: await asyncio.to_thread(sync_delete_r2_file, key)
+        try: await asyncio.to_thread(sync_delete_r2_file, key); force_system_ram_purge()
         except: pass
-    raise web.HTTPFound('/dashboard')
+    raise web.HTTPFound(f"/dashboard?prefix={request.query.get('curr_prefix', '')}")
+
+@routes.get('/delete_folder')
+async def web_delete_folder_handler(request):
+    if not check_dashboard_auth(request): return web.Response(status=401, text="Unauthorized")
+    if pref := request.query.get('prefix'):
+        try: await asyncio.to_thread(sync_delete_r2_folder, pref); force_system_ram_purge()
+        except: pass
+    raise web.HTTPFound(f"/dashboard?prefix={request.query.get('curr_prefix', '')}")
+
+@routes.get('/rename_file')
+async def web_rename_handler(request):
+    if not check_dashboard_auth(request): return web.Response(status=401, text="Unauthorized")
+    old_key, new_key = request.query.get('old_key'), request.query.get('new_key')
+    if old_key and new_key and old_key != new_key:
+        try: await asyncio.to_thread(sync_rename_r2_file, old_key, new_key); force_system_ram_purge()
+        except: pass
+    raise web.HTTPFound(f"/dashboard?prefix={request.query.get('prefix', '')}")
+
+@routes.get('/move_file')
+async def web_move_handler(request):
+    if not check_dashboard_auth(request): return web.Response(status=401, text="Unauthorized")
+    old_key, target = request.query.get('old_key'), request.query.get('target_folder', '').strip().strip('/')
+    if old_key and target is not None:
+        new_key = f"{target}/{old_key.split('/')[-1]}" if target else old_key.split('/')[-1]
+        if old_key != new_key:
+            try: await asyncio.to_thread(sync_rename_r2_file, old_key, new_key); force_system_ram_purge()
+            except: pass
+    raise web.HTTPFound(f"/dashboard?prefix={request.query.get('prefix', '')}")
 
 @routes.get('/')
 async def root(request):
-    return web.Response(text="<html><body style='background:#0f172a;color:#38bdf8;text-align:center;padding-top:150px;font-family:sans-serif;'><h1 style='font-size:40px;'>✅ System Online</h1><a href='/dashboard' style='color:#0f172a;background:#38bdf8;padding:15px;text-decoration:none;border-radius:5px;'>Dashboard</a></body></html>", content_type='text/html')
+    return web.Response(text="<html><body style='background:#0f172a;color:#38bdf8;text-align:center;padding-top:150px;font-family:sans-serif;'><h1 style='font-size:40px;'>✅ System Online</h1><a href='/dashboard' style='color:#0f172a;background:#38bdf8;padding:15px;text-decoration:none;border-radius:5px;'>Enter Cloudflare OS</a></body></html>", content_type='text/html')
 
-# --- 13. STARTUP ---
+# ============================================
+# --- 9. STARTUP ---
+# ============================================
 async def main():
     app = web.Application()
     app.add_routes(routes)
