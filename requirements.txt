@@ -1,7 +1,8 @@
 telethon
 aiohttp
 cryptg
+hachoir
 boto3
 yt-dlp
-aiofiles
 nest_asyncio
+aiofiles
