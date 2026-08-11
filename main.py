@@ -343,26 +343,30 @@ def extract_gdrive_id(url):
     return match.group(1) if match else None
 
 async def get_gdrive_stream(session, file_id):
-    base_url = "https://drive.google.com/uc?export=download"
-    params = {'id': file_id}
+    # Google redirected file downloads to this unified content domain
+    base_url = "https://drive.usercontent.google.com/download"
+    params = {'id': file_id, 'export': 'download', 'confirm': 't'}
+    
+    # Requesting directly with confirm=t bypasses the large file virus scan warning
     resp = await session.get(base_url, params=params, allow_redirects=True)
+    
+    # Fallback to parse tokens if Google serves an interstitial HTML warning
     if "text/html" in resp.headers.get("Content-Type", ""):
         text = await resp.text()
         confirm_token = None
         token_match = re.search(r'confirm=([a-zA-Z0-9_-]+)', text)
-        if token_match: confirm_token = token_match.group(1)
+        if token_match: 
+            confirm_token = token_match.group(1)
         else:
             for k, v in resp.cookies.items():
                 if k.startswith('download_warning'):
                     confirm_token = v.value
                     break
-        resp.close()
         if confirm_token:
+            resp.close()
             params['confirm'] = confirm_token
             resp = await session.get(base_url, params=params, allow_redirects=True)
-        else:
-            params['confirm'] = 't'
-            resp = await session.get(base_url, params=params, allow_redirects=True)
+            
     return resp
 
 async def download_direct(url, workspace, msg, start_t, custom_name=None, gdrive_id=None):
@@ -373,17 +377,41 @@ async def download_direct(url, workspace, msg, start_t, custom_name=None, gdrive
         else:
             r = await sess.get(url, allow_redirects=True)
 
-        if "text/html" in r.headers.get("Content-Type", "") and not gdrive_id: 
-            raise ValueError("HTML webpage detected.")
+        if r.status != 200:
+            raise ValueError(f"HTTP Error {r.status} occurred during download.")
+
+        # Detect error/denial pages served by Google (quota exceeded or permission issues)
+        if "text/html" in r.headers.get("Content-Type", ""): 
+            try:
+                html_body = await r.text()
+                if "Quota exceeded" in html_body or "Too many users" in html_body:
+                    raise ValueError("Google Drive Quota Exceeded for this file.")
+                if "Access Denied" in html_body or "Permission" in html_body:
+                    raise ValueError("Access Denied. Ensure 'Anyone with the link' has Reader access.")
+            except ValueError:
+                raise
+            except Exception:
+                pass
+            raise ValueError("HTML page detected instead of the direct video file.")
             
         f_size = int(r.headers.get("Content-Length", 0))
+        
+        # Robust parsing of Content-Disposition including UTF-8 standards
         filename = custom_name
         if not filename:
-            if "Content-Disposition" in r.headers:
-                matches = re.findall('filename="?([^"]+)"?', r.headers["Content-Disposition"])
-                if matches: filename = matches[0]
+            cd = r.headers.get("Content-Disposition", "")
+            if cd:
+                fn_match = re.search(r"filename\*=UTF-8''(.+)", cd, re.IGNORECASE)
+                if fn_match:
+                    filename = unquote(fn_match.group(1))
+                else:
+                    fn_match2 = re.search(r'filename="?([^";]+)"?', cd, re.IGNORECASE)
+                    if fn_match2:
+                        filename = fn_match2.group(1)
+                        
         filename = filename or unquote(url.split("/")[-1].split("?")[0]) or "video.mp4"
-        if not "." in filename: filename += ".mp4"
+        if not "." in filename: 
+            filename += ".mp4"
         
         file_path = os.path.join(workspace, clean_double_extension(re.sub(r'[\\/*?:"<>|]', "", filename)))
         
@@ -392,11 +420,13 @@ async def download_direct(url, workspace, msg, start_t, custom_name=None, gdrive
             async for chunk in r.content.iter_chunked(1024*1024):
                 f.write(chunk)
                 if f.tell() % (10 * 1024 * 1024) == 0:
-                    try: await msg.edit(get_status_text("Leeching", os.path.basename(file_path), f.tell(), f_size, start_t))
-                    except: pass
+                    try: 
+                        await msg.edit(get_status_text("Leeching", os.path.basename(file_path), f.tell(), f_size, start_t))
+                    except Exception: 
+                        pass
         r.close()
     return file_path
-
+    
 async def download_any_url(url, workspace, custom_name, msg, start_t):
     if url.startswith("magnet:?"):
         return await download_magnet(url, workspace, custom_name, msg, start_t)
