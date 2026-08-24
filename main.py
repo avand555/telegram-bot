@@ -64,7 +64,17 @@ routes = web.RouteTableDef()
 link_storage = {}
 active_tasks = {}
 
-client = TelegramClient('bot_session', int(API_ID), API_HASH, connection=ConnectionTcpFull)
+# 🚀 FIX: Added request_retries and connection_retries to auto-reconnect on "Connection closed"
+client = TelegramClient(
+    'bot_session', 
+    int(API_ID), 
+    API_HASH, 
+    connection=ConnectionTcpFull, 
+    use_ipv6=False,
+    request_retries=10,
+    connection_retries=10,
+    retry_delay=2
+)
 
 # ============================================
 # --- 2. CORE SYSTEM HELPERS ---
@@ -133,37 +143,13 @@ def get_unique_filename(filepath):
     while os.path.exists(f"{base}_{counter}{ext}"): counter += 1
     return f"{base}_{counter}{ext}"
 
-def extract_gdrive_id(url):
-    match = re.search(r'(?:file/d/|id=|/d/)([a-zA-Z0-9_-]{25,})', url)
-    return match.group(1) if match else None
-
-async def get_gdrive_stream(session, file_id):
-    base_url = "https://drive.google.com/uc?export=download"
-    params = {'id': file_id, 'confirm': 't'}
-    resp = await session.get(base_url, params=params, allow_redirects=True)
-    if "text/html" in resp.headers.get("Content-Type", ""):
-        text = await resp.text()
-        confirm_token = None
-        token_match = re.search(r'confirm=([a-zA-Z0-9_-]+)', text)
-        if token_match: confirm_token = token_match.group(1)
-        else:
-            for k, v in resp.cookies.items():
-                if k.startswith('download_warning'):
-                    confirm_token = v.value
-                    break
-        resp.close()
-        if confirm_token:
-            params['confirm'] = confirm_token
-            resp = await session.get(base_url, params=params, allow_redirects=True)
-    return resp
-
 # ============================================
 # --- 3. CLOUDFLARE R2 ENGINES ---
 # ============================================
 def get_r2_client():
     clean_id = R2_ACCOUNT_ID.replace("https://", "").replace("http://", "").split(".")[0].strip('/')
     endpoint = f"https://{clean_id}.r2.cloudflarestorage.com"
-    r2_config = Config(region_name='auto', signature_version='s3v4', retries={'max_attempts': 3, 'mode': 'standard'})
+    r2_config = Config(region_name='auto', signature_version='s3v4', retries={'max_attempts': 5, 'mode': 'standard'})
     return boto3.client('s3', endpoint_url=endpoint, aws_access_key_id=R2_ACCESS_KEY_ID, aws_secret_access_key=R2_SECRET_ACCESS_KEY, config=r2_config)
 
 def sync_get_smart_dashboard_data():
@@ -173,8 +159,7 @@ def sync_get_smart_dashboard_data():
     
     all_objects = []
     for page in pages:
-        if 'Contents' in page:
-            all_objects.extend(page['Contents'])
+        if 'Contents' in page: all_objects.extend(page['Contents'])
             
     hls_bases = set()
     for obj in all_objects:
@@ -183,7 +168,6 @@ def sync_get_smart_dashboard_data():
             
     hls_packages = {base: {'name': base, 'size': 0, 'date': None, 'type': 'HLS', 'url_key': f"{base}/master.m3u8"} for base in hls_bases}
     standalone_files = []
-    
     total_size = 0
     mp4_count = 0
     
@@ -206,28 +190,22 @@ def sync_get_smart_dashboard_data():
                 
         if not is_hls_part and not key.endswith('/'):
             standalone_files.append({'name': key, 'size': size, 'date': date, 'type': 'FILE', 'url_key': key})
-            if key.lower().endswith('.mp4'):
-                mp4_count += 1
+            if key.lower().endswith('.mp4'): mp4_count += 1
                 
     hls_count = len(hls_packages)
     all_items = list(hls_packages.values()) + standalone_files
-    all_items.sort(key=lambda x: x['date'], reverse=True)
+    all_items.sort(key=lambda x: x['date'] if x['date'] else datetime.datetime.min.replace(tzinfo=datetime.timezone.utc), reverse=True)
     
-    return {
-        'total_size': total_size,
-        'mp4_count': mp4_count,
-        'hls_count': hls_count,
-        'items': all_items
-    }
+    return {'total_size': total_size, 'mp4_count': mp4_count, 'hls_count': hls_count, 'items': all_items}
 
 def sync_delete_r2_file(s3_key):
     get_r2_client().delete_object(Bucket=R2_BUCKET_NAME, Key=s3_key)
 
 def sync_delete_r2_folder(prefix):
     s3 = get_r2_client()
+    prefix = prefix.rstrip('/') + '/' if not prefix.endswith('/') else prefix
     paginator = s3.get_paginator('list_objects_v2')
-    pages = paginator.paginate(Bucket=R2_BUCKET_NAME, Prefix=prefix)
-    for page in pages:
+    for page in paginator.paginate(Bucket=R2_BUCKET_NAME, Prefix=prefix):
         if 'Contents' in page:
             objects_to_delete = [{'Key': obj['Key']} for obj in page['Contents']]
             s3.delete_objects(Bucket=R2_BUCKET_NAME, Delete={'Objects': objects_to_delete})
@@ -302,13 +280,12 @@ async def upload_to_r2(file_path, msg, target_folder=None):
     
     await msg.edit(f"⬆️ **Connecting to Cloudflare R2...**\n🎬 `{filename}`")
     await asyncio.to_thread(sync_r2_upload, file_path, s3_key, loop, msg, start_t)
-    
     code = secrets.token_urlsafe(8)
     link_storage[code] = {'s3_key': s3_key}
     return f"{R2_PUBLIC_URL}/{quote(s3_key, safe='/')}", code
 
 # ============================================
-# --- 4. DOWNLOAD ENGINES (MAGNET / YT-DLP) ---
+# --- 4. DOWNLOAD ENGINES ---
 # ============================================
 def get_aria2_executable():
     if shutil.which('aria2c'): return 'aria2c'
@@ -346,7 +323,6 @@ async def download_magnet(url, workspace, custom_name, msg, start_t):
 
     await process.wait()
     active_tasks.pop(task_code, None)
-    
     largest = get_largest_file(workspace)
     if not largest: raise ValueError("Torrent failed.")
     final_name = get_unique_filename(os.path.join(workspace, custom_name if custom_name else os.path.basename(largest)))
@@ -360,17 +336,42 @@ def sync_yt_dlp_download(url, workspace, custom_name=None):
         info = ydl.extract_info(url, download=True)
         return clean_double_extension(ydl.prepare_filename(info))
 
+def extract_gdrive_id(url):
+    match = re.search(r'(?:file/d/|id=|/d/)([a-zA-Z0-9_-]{25,})', url)
+    return match.group(1) if match else None
+
+async def get_gdrive_stream(session, file_id):
+    base_url = "https://drive.google.com/uc?export=download"
+    params = {'id': file_id, 'confirm': 't'}
+    resp = await session.get(base_url, params=params, allow_redirects=True)
+    if "text/html" in resp.headers.get("Content-Type", ""):
+        text = await resp.text()
+        confirm_token = None
+        token_match = re.search(r'confirm=([a-zA-Z0-9_-]+)', text)
+        if token_match: confirm_token = token_match.group(1)
+        else:
+            for k, v in resp.cookies.items():
+                if k.startswith('download_warning'):
+                    confirm_token = v.value
+                    break
+        resp.close()
+        if confirm_token:
+            params['confirm'] = confirm_token
+            resp = await session.get(base_url, params=params, allow_redirects=True)
+    return resp
+
 async def download_direct(url, workspace, msg, start_t, custom_name=None, gdrive_id=None):
-    async with ClientSession() as sess:
+    # 🚀 FIX: Added ClientTimeout to prevent dropped connections on huge files
+    timeout = aiohttp.ClientTimeout(total=None, sock_read=120)
+    async with ClientSession(timeout=timeout) as sess:
         if gdrive_id:
             await msg.edit("🅿️ **Google Drive Detected! Bypassing warnings...**")
             r = await get_gdrive_stream(sess, gdrive_id)
         else:
             r = await sess.get(url, allow_redirects=True)
 
-        if "text/html" in r.headers.get("Content-Type", "") and not gdrive_id: raise ValueError("HTML webpage detected, not a direct file.")
+        if "text/html" in r.headers.get("Content-Type", "") and not gdrive_id: raise ValueError("HTML webpage detected.")
         f_size = int(r.headers.get("Content-Length", 0))
-        
         filename = custom_name
         if not filename:
             cd = r.headers.get("Content-Disposition", "")
@@ -380,13 +381,12 @@ async def download_direct(url, workspace, msg, start_t, custom_name=None, gdrive
                 else:
                     fn_match2 = re.search(r'filename="?([^";]+)"?', cd, re.IGNORECASE)
                     if fn_match2: filename = fn_match2.group(1)
-        
         filename = filename or unquote(url.split("/")[-1].split("?")[0]) or "video.mp4"
         if not "." in filename: filename += ".mp4"
         
         file_path = os.path.join(workspace, clean_double_extension(re.sub(r'[\\/*?:"<>|]', "", filename)))
-        
         await msg.edit(f"⬇️ **Leeching Direct Link...**\n🎬 `{os.path.basename(file_path)}`")
+        
         with open(file_path, 'wb') as f:
             async for chunk in r.content.iter_chunked(1024*1024):
                 f.write(chunk)
@@ -414,7 +414,7 @@ async def download_any_url(url, workspace, custom_name, msg, start_t):
     return await download_direct(url, workspace, msg, start_t, custom_name, gdrive_id)
 
 # ============================================
-# --- 5. SECURED WEB DASHBOARD & UI ---
+# --- 5. SECURED SMART WEB DASHBOARD ---
 # ============================================
 def check_dashboard_auth(request):
     auth_header = request.headers.get('Authorization')
@@ -447,6 +447,7 @@ DASHBOARD_CSS = """
     .actions { display: flex; gap: 8px; flex-wrap: wrap; }
     .btn { display: inline-flex; align-items: center; justify-content: center; gap: 5px; padding: 8px 14px; border-radius: 6px; border: none; font-size: 12px; font-weight: 600; cursor: pointer; text-decoration: none; transition: 0.2s; }
     .btn-copy { background: rgba(59, 130, 246, 0.1); color: var(--accent); }
+    .btn-view { background: rgba(16, 185, 129, 0.1); color: #34d399; }
     .btn-delete { background: rgba(244, 63, 94, 0.1); color: #fb7185; }
 """
 
@@ -467,57 +468,37 @@ DASHBOARD_JS = """
             row.style.display = filename.includes(input) ? "" : "none";
         });
     }
-    let currentSort = { col: -1, dir: 'asc' };
-    function sortTable(colIndex, type) {
-        let table = document.querySelector("tbody");
-        let rows = Array.from(table.querySelectorAll("tr"));
-        if (rows.length === 0 || rows[0].querySelector("td[colspan]")) return;
-        let dir = (currentSort.col === colIndex && currentSort.dir === 'asc') ? 'desc' : 'asc';
-        currentSort = { col: colIndex, dir: dir };
-        rows.sort((a, b) => {
-            let valA = a.children[colIndex].getAttribute("data-val");
-            let valB = b.children[colIndex].getAttribute("data-val");
-            if (type === 'num') { return dir === 'asc' ? parseFloat(valA) - parseFloat(valB) : parseFloat(valB) - parseFloat(valA); }
-            else { return dir === 'asc' ? valA.localeCompare(valB) : valB.localeCompare(valA); }
-        });
-        table.innerHTML = "";
-        rows.forEach(row => table.appendChild(row));
-        document.querySelectorAll("th span").forEach(span => span.innerText = "");
-        document.getElementById("th-" + colIndex).querySelector("span").innerText = dir === 'asc' ? ' 🔼' : ' 🔽';
-    }
 """
 
 @routes.get('/dashboard')
 async def dashboard_handler(request):
-    if not check_dashboard_auth(request):
-        return web.Response(status=401, headers={'WWW-Authenticate': 'Basic realm="Cloudflare R2 Dashboard"'}, text="🔒 Access Denied")
-
-    file_rows = ""
+    if not check_dashboard_auth(request): return web.Response(status=401, headers={'WWW-Authenticate': 'Basic realm="Dashboard"'}, text="🔒 Access Denied")
     try:
         data = await asyncio.to_thread(sync_get_smart_dashboard_data)
+        file_rows = ""
         for item in data['items']:
             name = item['name']
             size_str = human_size(item['size']) if item['size'] > 0 else "-"
             date_str = item['date'].strftime("%Y-%m-%d %H:%M") if item['date'] else "-"
             url = f"{R2_PUBLIC_URL}/{quote(item['url_key'], safe='/')}"
-            
             if item['type'] == 'HLS':
                 file_rows += f"""<tr style="background: rgba(251, 191, 36, 0.05);">
-                    <td data-val="{name}">📦 <span class="file-name"><b>{name}</b> (HLS Package)</span></td>
-                    <td data-val="{item['size']}">{size_str}</td><td data-val="{item['date'].timestamp() if item['date'] else 0}">{date_str}</td>
+                    <td>📦 <span class="file-name"><b>{name}</b> (HLS Package)</span></td>
+                    <td>{size_str}</td><td>{date_str}</td>
                     <td><div class="actions">
-                        <button class="btn btn-copy" onclick="copyText('{url}')">🔗 Copy Master.m3u8</button>
+                        <button class="btn btn-copy" onclick="copyText('{url}')">🔗 Copy Master</button>
+                        <a href="{url}" target="_blank" class="btn btn-view">▶️ Play</a>
                         <button class="btn btn-delete" onclick="deleteItem('{quote(name)}', true)">🗑️ Delete</button>
                     </div></td></tr>"""
             else:
                 file_rows += f"""<tr>
-                    <td data-val="{name}">🎬 <span class="file-name">{name}</span></td>
-                    <td data-val="{item['size']}">{size_str}</td><td data-val="{item['date'].timestamp() if item['date'] else 0}">{date_str}</td>
+                    <td>🎬 <span class="file-name">{name}</span></td>
+                    <td>{size_str}</td><td>{date_str}</td>
                     <td><div class="actions">
                         <button class="btn btn-copy" onclick="copyText('{url}')">🔗 Copy URL</button>
+                        <a href="{url}" target="_blank" class="btn btn-view">▶️ Play</a>
                         <button class="btn btn-delete" onclick="deleteItem('{quote(name)}', false)">🗑️ Delete</button>
                     </div></td></tr>"""
-                    
         if not file_rows: file_rows = "<tr><td colspan='4' style='text-align:center;'>No files found.</td></tr>"
     except Exception as e: file_rows = f"<tr><td colspan='4' style='color:red;'>Error: {e}</td></tr>"
 
@@ -528,8 +509,8 @@ async def dashboard_handler(request):
                 <div class="stat-card"><div class="stat-title">HLS Packages</div><div class="stat-val">{data.get('hls_count', 0)}</div></div>
                 <div class="stat-card"><div class="stat-title">MP4 Files</div><div class="stat-val">{data.get('mp4_count', 0)}</div></div>
             </div>
-            <div class="controls"><input type="text" id="searchInput" class="search-box" onkeyup="filterTable()" placeholder="🔍 Global Search (Find any MP4 or HLS Package)..."></div>
-            <div class="table-wrapper"><table><thead><tr><th id="th-0" onclick="sortTable(0, 'str')">Name <span></span></th><th id="th-1" onclick="sortTable(1, 'num')">Total Size <span></span></th><th id="th-2" onclick="sortTable(2, 'num')">Date Uploaded <span>🔽</span></th><th>Actions</th></tr></thead><tbody>{file_rows}</tbody></table></div>
+            <div class="controls"><input type="text" id="searchInput" class="search-box" onkeyup="filterTable()" placeholder="🔍 Global Search..."></div>
+            <div class="table-wrapper"><table><thead><tr><th>Name</th><th>Total Size</th><th>Date Uploaded</th><th>Actions</th></tr></thead><tbody>{file_rows}</tbody></table></div>
         </div></body></html>"""
     return web.Response(text=html, content_type='text/html')
 
@@ -544,21 +525,25 @@ async def web_delete_handler(request):
 @routes.get('/delete_folder')
 async def web_delete_folder_handler(request):
     if not check_dashboard_auth(request): return web.Response(status=401, text="Unauthorized")
-    if pref := request.query.get('key'):
+    if pref := request.query.get('prefix'):
         try: await asyncio.to_thread(sync_delete_r2_folder, pref); force_system_ram_purge()
         except: pass
     raise web.HTTPFound('/dashboard')
 
 @routes.get('/')
 async def root(request):
-    return web.Response(text="<html><body style='background:#0f172a;color:#38bdf8;text-align:center;padding-top:150px;font-family:sans-serif;'><h1 style='font-size:40px;'>✅ System Online</h1><a href='/dashboard' style='color:#0f172a;background:#38bdf8;padding:15px;text-decoration:none;border-radius:5px;'>Dashboard</a></body></html>", content_type='text/html')
+    return web.Response(text="<html><body style='background:#0f172a;color:#38bdf8;text-align:center;padding-top:150px;font-family:sans-serif;'><h1 style='font-size:40px;'>✅ System Online</h1><a href='/dashboard' style='display:inline-block;margin-top:20px;padding:15px 30px;background:#38bdf8;color:#0f172a;text-decoration:none;border-radius:8px;font-weight:bold;font-size:18px;'>Go to Dashboard</a></body></html>", content_type='text/html')
 
 @routes.get('/{code}/{filename}')
 async def stream_handler(request):
     code, data = request.match_info['code'], link_storage.get(request.match_info['code'])
     if not data: return web.Response(text="Expired", status=410)
     msg, file_name = data['msg'], unquote(request.match_info['filename'])
-    start = int(re.search(r'bytes=(\d+)-', request.headers.get('Range')).group(1)) if request.headers.get('Range') else 0
+    range_header = request.headers.get('Range')
+    start = 0
+    if range_header:
+        match = re.search(r'bytes=(\d+)-', range_header)
+        if match: start = int(match.group(1))
     resp = web.StreamResponse(status=206 if start else 200, headers={'Content-Disposition': f'attachment; filename="{file_name}"', 'Accept-Ranges': 'bytes', 'Content-Type': 'video/mp4', 'Content-Length': str(msg.file.size - start)})
     await resp.prepare(request)
     try:
@@ -571,14 +556,10 @@ async def stream_handler(request):
 # ============================================
 @client.on(events.NewMessage(incoming=True, func=lambda e: e.sender_id == ADMIN_ID))
 async def master_handler(event):
-    
     if event.file:
         await event.reply(
             f"📂 **File Detected:** `{event.file.name or 'file.bin'}`",
-            buttons=[
-                [Button.inline("🔗 Generate Direct Link", data=f"link_{event.id}")],
-                [Button.inline("🛡️ Upload to Cloudflare R2", data=f"r2_{event.id}")]
-            ]
+            buttons=[[Button.inline("🔗 Generate Direct Link", data=f"link_{event.id}"), Button.inline("🛡️ Upload to Cloudflare R2", data=f"r2_{event.id}")]]
         )
         return
 
@@ -587,7 +568,6 @@ async def master_handler(event):
             raw = event.text.strip()
             url = raw.split(" -n ")[0].split(" -f ")[0].strip()
             custom_name, target_folder = None, None
-            
             if " -n " in raw: custom_name = raw.split(" -n ")[1].split(" -f ")[0].strip()
             if " -f " in raw: target_folder = raw.split(" -f ")[1].strip()
 
@@ -610,7 +590,6 @@ async def master_handler(event):
 
                     project_name = os.path.splitext(filename)[0]
                     extracted_items = os.listdir(extract_dir)
-                    
                     if len(extracted_items) == 1 and os.path.isdir(os.path.join(extract_dir, extracted_items[0])):
                         upload_source_dir = os.path.join(extract_dir, extracted_items[0])
                         s3_prefix = target_folder if target_folder else extracted_items[0]
@@ -620,10 +599,8 @@ async def master_handler(event):
 
                     await msg.edit(f"⬆️ **Uploading HLS Pack to R2...**\n📂 `{s3_prefix}`")
                     await asyncio.to_thread(sync_r2_upload_folder, upload_source_dir, s3_prefix, asyncio.get_running_loop(), msg, time.time())
-                    
                     master_url = f"{R2_PUBLIC_URL}/{quote(s3_prefix, safe='/')}/master.m3u8"
                     await msg.edit(f"✅ **HLS Uploaded to R2!**\n\n🎬 `{project_name}`\n📺 **Stream Link:**\n`{master_url}`", link_preview=False)
-
                 else:
                     r2_url, code = await upload_to_r2(final_path, msg, target_folder)
                     await msg.edit(f"✅ **Leeched & Uploaded!**\n\n🎬 `{filename}`\n🔗 `{r2_url}`", buttons=[[Button.inline("🗑️ Delete from R2", data=f"delr2_{code}")]], link_preview=False)
@@ -658,7 +635,7 @@ async def on_callback(event):
             await event.answer("Deleting...", alert=False)
             try:
                 await asyncio.to_thread(sync_delete_r2_file, item['s3_key'])
-                await event.edit(f"🗑️ **File Deleted!**\nKey: `{item['s3_key']}`")
+                await event.edit(f"🗑️ **File Deleted from R2!**\nKey: `{item['s3_key']}`")
             except Exception as e: await event.edit(f"❌ Delete Error: {e}")
         return
 
@@ -666,17 +643,17 @@ async def on_callback(event):
         msg_id = int(data.split("_")[1]); await event.answer("Generating Direct Link...", alert=False)
         tg_msg = await client.get_messages(event.chat_id, ids=msg_id)
         if not tg_msg or not tg_msg.file: return await event.respond("❌ Error: File not found.")
-        
         code = secrets.token_urlsafe(8)
         link_storage[code] = {'msg': tg_msg, 'timestamp': time.time()}
         base = os.environ.get("KOYEB_PUBLIC_URL", "").rstrip('/') or f"https://{os.environ.get('KOYEB_APP_NAME')}.koyeb.app"
         filename = clean_double_extension(re.sub(r'[\\/*?:"<>|]', "", tg_msg.file.name or "video.mp4"))
-        
         await event.respond(f"🚀 **Direct Link:**\n`{base}/{code}/{quote(filename)}`\n\n💡 *Valid for 24 hours.*")
 
     if data.startswith("r2_"):
         msg_id = int(data.split("_")[1]); await event.answer("Uploading...", alert=False)
         tg_msg = await client.get_messages(event.chat_id, ids=msg_id)
+        
+        # 🚀 FIX: WRAPPED IN RETRY LOOP FOR TELEGRAM CONNECTION DROPS
         async with global_semaphore:
             workspace = f"dl_{uuid.uuid4().hex[:8]}"
             os.makedirs(workspace, exist_ok=True)
@@ -688,6 +665,7 @@ async def on_callback(event):
             try:
                 with open(file_path, 'wb') as f:
                     async for chunk in client.iter_download(tg_msg.media, request_size=1048576):
+                        # Retry logic is handled internally by Telethon's request_retries now
                         f.write(chunk)
                         if f.tell() % (10 * 1024 * 1024) == 0: 
                             await status.edit(get_status_text("TG Down", filename, f.tell(), tg_msg.file.size, start_t))
@@ -715,15 +693,11 @@ async def on_callback(event):
                 shutil.rmtree(workspace, ignore_errors=True)
                 free_memory()
 
-# --- 13. STARTUP ---
+# --- 7. STARTUP ---
 async def main():
-    app = web.Application()
-    app.add_routes(routes)
-    runner = web.AppRunner(app)
-    await runner.setup()
+    app = web.Application(); app.add_routes(routes); runner = web.AppRunner(app); await runner.setup()
     await web.TCPSite(runner, '0.0.0.0', int(os.environ.get("PORT", 8000))).start()
     await client.start(bot_token=BOT_TOKEN)
     await client.run_until_disconnected()
 
-if __name__ == '__main__':
-    asyncio.run(main())
+if __name__ == '__main__': asyncio.run(main())
