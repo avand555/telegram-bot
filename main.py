@@ -91,6 +91,13 @@ def human_size(bytes_val):
         bytes_val /= 1024
     return "0 B"
 
+# 🛡️ SAFE MESSAGE EDITING (Prevents "Message not modified" crashes)
+async def edit_msg(msg, *args, **kwargs):
+    try:
+        return await msg.edit(*args, **kwargs)
+    except Exception:
+        return msg
+
 def get_status_text(action, filename, current, total, start_time):
     diff = max(time.time() - start_time, 0.001)
     perc = (current / total) * 100 if total > 0 else 0
@@ -284,7 +291,7 @@ async def upload_to_r2(file_path, msg, target_folder=None):
     if target_folder: s3_key = f"{target_folder.strip('/')}/{filename}"
     else: s3_key = f"{datetime.datetime.now().year}/{datetime.datetime.now().month}/{datetime.datetime.now().day}/{filename}"
     
-    await msg.edit(f"⬆️ **Connecting to Cloudflare R2...**\n🎬 `{filename}`")
+    await edit_msg(msg, f"⬆️ **Connecting to Cloudflare R2...**\n🎬 `{filename}`")
     await asyncio.to_thread(sync_r2_upload, file_path, s3_key, loop, msg, start_t)
     code = secrets.token_urlsafe(8)
     link_storage[code] = {'s3_key': s3_key}
@@ -346,13 +353,12 @@ def extract_gdrive_id(url):
     match = re.search(r'(?:file/d/|id=|/d/)([a-zA-Z0-9_-]{25,})', url)
     return match.group(1) if match else None
 
-# 🚀 RESUMABLE & ROBUST GOOGLE DRIVE LEECHER (Like mirror-bots)
+# 🚀 RESUMABLE & ROBUST GOOGLE DRIVE LEECHER
 async def download_gdrive(url, workspace, custom_name, msg, start_t):
     file_id = extract_gdrive_id(url)
-    await msg.edit("🅿️ **Google Drive Detected! Bypassing warnings...**")
+    await edit_msg(msg, "🅿️ **Google Drive Detected! Bypassing warnings...**")
     
     base_url = "https://drive.google.com/uc?export=download"
-    # Shorter timeout, because we will heavily rely on Auto-Resume if it drops
     timeout = aiohttp.ClientTimeout(total=None, sock_read=45, sock_connect=30)
     
     file_path = None
@@ -360,20 +366,17 @@ async def download_gdrive(url, workspace, custom_name, msg, start_t):
     f_size = 0
     filename = custom_name
     
-    # Retry loop prevents "Connection Closed" from failing the entire task
     for attempt in range(15):
         try:
             async with ClientSession(timeout=timeout) as sess:
                 params = {'id': file_id, 'confirm': 't'}
                 headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
                 
-                # If connection dropped previously, resume where we left off
                 if downloaded > 0:
                     headers['Range'] = f'bytes={downloaded}-'
                 
                 r = await sess.get(base_url, params=params, headers=headers, allow_redirects=True)
                 
-                # Bypass Large File Virus Warning
                 if "text/html" in r.headers.get("Content-Type", ""):
                     text = await r.text()
                     confirm_token = None
@@ -387,7 +390,6 @@ async def download_gdrive(url, workspace, custom_name, msg, start_t):
                         params['confirm'] = confirm_token
                         r = await sess.get(base_url, params=params, headers=headers, allow_redirects=True)
                 
-                # Extract metadata on first attempt
                 if attempt == 0 or not filename:
                     cd = r.headers.get("Content-Disposition", "")
                     if not filename and cd:
@@ -397,7 +399,6 @@ async def download_gdrive(url, workspace, custom_name, msg, start_t):
                     filename = get_unique_filename(clean_double_extension(re.sub(r'[\\/*?:"<>|]', "", filename)))
                     file_path = os.path.join(workspace, filename)
                     
-                    # Compute actual file size securely
                     if r.status in (200, 206):
                         content_range = r.headers.get("Content-Range")
                         if content_range:
@@ -405,9 +406,8 @@ async def download_gdrive(url, workspace, custom_name, msg, start_t):
                         else:
                             f_size = downloaded + int(r.headers.get("Content-Length", 0))
 
-                await msg.edit(f"⬇️ **Leeching Google Drive...**\n🎬 `{os.path.basename(file_path)}`")
+                await edit_msg(msg, f"⬇️ **Leeching Google Drive...**\n🎬 `{os.path.basename(file_path)}`")
                 
-                # Append if resuming, Write if new
                 mode = 'ab' if downloaded > 0 else 'wb'
                 with open(file_path, mode) as f:
                     async for chunk in r.content.iter_chunked(1024 * 1024):
@@ -415,20 +415,17 @@ async def download_gdrive(url, workspace, custom_name, msg, start_t):
                         f.write(chunk)
                         downloaded += len(chunk)
                         
-                        # Report Progress
                         if downloaded % (10 * 1024 * 1024) < (1024 * 1024):
-                            try: await msg.edit(get_status_text("GDrive Down", os.path.basename(file_path), downloaded, f_size, start_t))
-                            except: pass
+                            await edit_msg(msg, get_status_text("GDrive Down", os.path.basename(file_path), downloaded, f_size, start_t))
                 r.close()
                 
-                # Success Check
                 if f_size == 0 or downloaded >= f_size:
                     return file_path
                     
-        except (aiohttp.ClientError, asyncio.TimeoutError, ConnectionError) as e:
+        except Exception as e:
             if attempt >= 14:
                 raise Exception(f"Failed to leech Drive file after 15 retries. Last error: {str(e)}")
-            await asyncio.sleep(2) # Rest before resuming
+            await asyncio.sleep(2)
             continue 
 
     return file_path
@@ -470,7 +467,7 @@ async def download_direct(url, workspace, msg, start_t, custom_name=None):
                     filename = filename or unquote(url.split("/")[-1].split("?")[0]) or "video.mp4"
                     if not "." in filename: filename += ".mp4"
                     file_path = os.path.join(workspace, clean_double_extension(re.sub(r'[\\/*?:"<>|]', "", filename)))
-                    await msg.edit(f"⬇️ **Leeching Direct Link...**\n🎬 `{os.path.basename(file_path)}`")
+                    await edit_msg(msg, f"⬇️ **Leeching Direct Link...**\n🎬 `{os.path.basename(file_path)}`")
                 
                 mode = 'ab' if downloaded > 0 else 'wb'
                 with open(file_path, mode) as f:
@@ -480,14 +477,13 @@ async def download_direct(url, workspace, msg, start_t, custom_name=None):
                         downloaded += len(chunk)
                         
                         if downloaded % (10 * 1024 * 1024) < (1024 * 1024):
-                            try: await msg.edit(get_status_text("Leeching", os.path.basename(file_path), downloaded, f_size, start_t))
-                            except: pass
+                            await edit_msg(msg, get_status_text("Leeching", os.path.basename(file_path), downloaded, f_size, start_t))
                 r.close()
                 
                 if f_size == 0 or downloaded >= f_size:
                     return file_path
                     
-        except (aiohttp.ClientError, asyncio.TimeoutError, ConnectionError) as e:
+        except Exception as e:
             if attempt >= 14:
                 raise Exception(f"Failed direct download after 15 retries: {str(e)}")
             await asyncio.sleep(2)
@@ -508,7 +504,7 @@ async def download_any_url(url, workspace, custom_name, msg, start_t):
     is_zip = (custom_name and custom_name.lower().endswith('.zip')) or url.lower().endswith('.zip')
     if not is_zip:
         try:
-            await msg.edit("🅿️ **Extracting File Info via yt-dlp...**")
+            await edit_msg(msg, "🅿️ **Extracting File Info via yt-dlp...**")
             filename = await asyncio.to_thread(sync_yt_dlp_download, url, workspace, custom_name)
             if filename and os.path.exists(filename) and os.path.getsize(filename) > 0:
                 final_path = os.path.join(workspace, os.path.basename(filename))
@@ -792,7 +788,7 @@ async def master_handler(event):
                 filename = os.path.basename(final_path)
 
                 if filename.lower().endswith('.zip'):
-                    await msg.edit("📦 **Extracting HLS ZIP Archive...**")
+                    await edit_msg(msg, "📦 **Extracting HLS ZIP Archive...**")
                     extract_dir = os.path.join(workspace, "extracted")
                     os.makedirs(extract_dir, exist_ok=True)
                     await asyncio.to_thread(lambda: zipfile.ZipFile(final_path, 'r').extractall(extract_dir))
@@ -808,17 +804,17 @@ async def master_handler(event):
                         upload_source_dir = extract_dir
                         s3_prefix = target_folder if target_folder else project_name
 
-                    await msg.edit(f"⬆️ **Uploading HLS Pack to R2...**\n📂 `{s3_prefix}`")
+                    await edit_msg(msg, f"⬆️ **Uploading HLS Pack to R2...**\n📂 `{s3_prefix}`")
                     await asyncio.to_thread(sync_r2_upload_folder, upload_source_dir, s3_prefix, asyncio.get_running_loop(), msg, time.time())
                     
                     master_url = f"{R2_PUBLIC_URL}/{quote(s3_prefix, safe='/')}/master.m3u8"
-                    await msg.edit(f"✅ **HLS Uploaded to R2!**\n\n🎬 `{project_name}`\n📺 **Stream Link:**\n`{master_url}`", link_preview=False)
+                    await edit_msg(msg, f"✅ **HLS Uploaded to R2!**\n\n🎬 `{project_name}`\n📺 **Stream Link:**\n`{master_url}`", link_preview=False)
 
                 else:
                     r2_url, code = await upload_to_r2(final_path, msg, target_folder)
-                    await msg.edit(f"✅ **Leeched & Uploaded!**\n\n🎬 `{filename}`\n🔗 `{r2_url}`", buttons=[[Button.inline("🗑️ Delete from R2", data=f"delr2_{code}")]], link_preview=False)
+                    await edit_msg(msg, f"✅ **Leeched & Uploaded!**\n\n🎬 `{filename}`\n🔗 `{r2_url}`", buttons=[[Button.inline("🗑️ Delete from R2", data=f"delr2_{code}")]], link_preview=False)
 
-            except Exception as e: await msg.edit(f"❌ Error: {e}")
+            except Exception as e: await edit_msg(msg, f"❌ Error: {e}")
             finally:
                 shutil.rmtree(workspace, ignore_errors=True)
                 free_memory()
@@ -840,7 +836,6 @@ async def fast_upload(client, file_path, msg, filename):
                 f.seek(idx * part_size)
                 chunk = f.read(part_size)
             
-            # 🚀 RETRY LOOP (Stops "Connection closed" crashes)
             retries = 0
             while retries < 5:
                 try:
@@ -857,8 +852,7 @@ async def fast_upload(client, file_path, msg, filename):
     async def updater():
         while uploaded_bytes < file_size:
             await asyncio.sleep(4)
-            try: await msg.edit(get_status_text("Uploading to TG", filename, uploaded_bytes, file_size, start_time))
-            except: pass
+            await edit_msg(msg, get_status_text("Uploading to TG", filename, uploaded_bytes, file_size, start_time))
     
     u_task = asyncio.create_task(updater())
     await asyncio.gather(*tasks)
@@ -879,8 +873,7 @@ async def on_callback(event):
                 try: item['process'].terminate()
                 except: pass
             await event.answer("Task cancelled.", alert=True)
-            try: await event.edit("🛑 **Task Cancelled.**")
-            except: pass
+            await edit_msg(event, "🛑 **Task Cancelled.**")
         return
 
     if data.startswith("delr2_"):
@@ -890,8 +883,8 @@ async def on_callback(event):
             await event.answer("Deleting...", alert=False)
             try:
                 await asyncio.to_thread(sync_delete_r2_file, item['s3_key'])
-                await event.edit(f"🗑️ **File Deleted from R2!**\nKey: `{item['s3_key']}`")
-            except Exception as e: await event.edit(f"❌ Delete Error: {e}")
+                await edit_msg(event, f"🗑️ **File Deleted from R2!**\nKey: `{item['s3_key']}`")
+            except Exception as e: await edit_msg(event, f"❌ Delete Error: {e}")
         return
 
     if data.startswith("link_"):
@@ -923,11 +916,10 @@ async def on_callback(event):
                     async for chunk in client.iter_download(tg_msg.media, request_size=1048576):
                         f.write(chunk)
                         if f.tell() % (10 * 1024 * 1024) == 0: 
-                            try: await status.edit(get_status_text("TG Down", filename, f.tell(), tg_msg.file.size, start_t))
-                            except: pass
+                            await edit_msg(status, get_status_text("TG Down", filename, f.tell(), tg_msg.file.size, start_t))
                 
                 if filename.lower().endswith('.zip'):
-                    await status.edit("📦 **Extracting HLS ZIP Archive...**")
+                    await edit_msg(status, "📦 **Extracting HLS ZIP Archive...**")
                     extract_dir = os.path.join(workspace, "extracted"); os.makedirs(extract_dir, exist_ok=True)
                     await asyncio.to_thread(lambda: zipfile.ZipFile(file_path, 'r').extractall(extract_dir))
                     os.remove(file_path)
@@ -937,14 +929,14 @@ async def on_callback(event):
                     s_dir = os.path.join(extract_dir, items[0]) if len(items)==1 and os.path.isdir(os.path.join(extract_dir, items[0])) else extract_dir
                     s_pref = items[0] if len(items)==1 and os.path.isdir(os.path.join(extract_dir, items[0])) else proj
                     
-                    await status.edit(f"⬆️ **Uploading HLS...**\n📂 `{s_pref}`")
+                    await edit_msg(status, f"⬆️ **Uploading HLS...**\n📂 `{s_pref}`")
                     await asyncio.to_thread(sync_r2_upload_folder, s_dir, s_pref, asyncio.get_running_loop(), status, time.time())
                     m_url = f"{R2_PUBLIC_URL}/{quote(s_pref, safe='/')}/master.m3u8"
-                    await status.edit(f"✅ **HLS Uploaded!**\n🎬 `{proj}`\n📺 **Stream Link:**\n`{m_url}`", link_preview=False)
+                    await edit_msg(status, f"✅ **HLS Uploaded!**\n🎬 `{proj}`\n📺 **Stream Link:**\n`{m_url}`", link_preview=False)
                 else:
                     r2_url, code = await upload_to_r2(file_path, status)
-                    await status.edit(f"✅ **Cloudflare R2 Complete!**\n🎬 `{filename}`\n🔗 `{r2_url}`", buttons=[[Button.inline("🗑️ Delete from R2", data=f"delr2_{code}")]], link_preview=False)
-            except Exception as e: await status.edit(f"❌ Error: {e}")
+                    await edit_msg(status, f"✅ **Cloudflare R2 Complete!**\n🎬 `{filename}`\n🔗 `{r2_url}`", buttons=[[Button.inline("🗑️ Delete from R2", data=f"delr2_{code}")]], link_preview=False)
+            except Exception as e: await edit_msg(status, f"❌ Error: {e}")
             finally:
                 shutil.rmtree(workspace, ignore_errors=True)
                 free_memory()
