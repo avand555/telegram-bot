@@ -346,79 +346,153 @@ def extract_gdrive_id(url):
     match = re.search(r'(?:file/d/|id=|/d/)([a-zA-Z0-9_-]{25,})', url)
     return match.group(1) if match else None
 
-# 🚀 RESTORED NATIVE GOOGLE DRIVE BYPASSER
+# 🚀 RESUMABLE & ROBUST GOOGLE DRIVE LEECHER (Like mirror-bots)
 async def download_gdrive(url, workspace, custom_name, msg, start_t):
     file_id = extract_gdrive_id(url)
     await msg.edit("🅿️ **Google Drive Detected! Bypassing warnings...**")
     
     base_url = "https://drive.google.com/uc?export=download"
-    timeout = aiohttp.ClientTimeout(total=None, sock_read=300)
+    # Shorter timeout, because we will heavily rely on Auto-Resume if it drops
+    timeout = aiohttp.ClientTimeout(total=None, sock_read=45, sock_connect=30)
     
-    async with ClientSession(timeout=timeout) as sess:
-        params = {'id': file_id, 'confirm': 't'}
-        r = await sess.get(base_url, params=params, allow_redirects=True)
-        
-        # Bypass Large File Virus Warning
-        if "text/html" in r.headers.get("Content-Type", ""):
-            text = await r.text()
-            confirm_token = None
-            match = re.search(r'confirm=([a-zA-Z0-9_-]+)', text)
-            if match: confirm_token = match.group(1)
-            else:
-                for k, v in r.cookies.items():
-                    if k.startswith('download_warning'): confirm_token = v.value; break
-            r.close()
-            if confirm_token:
-                params['confirm'] = confirm_token
-                r = await sess.get(base_url, params=params, allow_redirects=True)
-        
-        # Download the actual file
-        cd = r.headers.get("Content-Disposition", "")
-        filename = custom_name
-        if not filename and cd:
-            fn_match = re.search(r'filename="?([^";]+)"?', cd, re.IGNORECASE)
-            if fn_match: filename = fn_match.group(1)
-        filename = filename or f"gdrive_{file_id}.mp4"
-        filename = get_unique_filename(clean_double_extension(re.sub(r'[\\/*?:"<>|]', "", filename)))
-        file_path = os.path.join(workspace, filename)
-        
-        f_size = int(r.headers.get("Content-Length", 0))
-        await msg.edit(f"⬇️ **Leeching Google Drive...**\n🎬 `{filename}`")
-        with open(file_path, 'wb') as f:
-            async for chunk in r.content.iter_chunked(1024*1024):
-                f.write(chunk)
-                if f.tell() % (10 * 1024 * 1024) == 0:
-                    try: await msg.edit(get_status_text("GDrive Down", filename, f.tell(), f_size, start_t))
-                    except: pass
-        r.close()
+    file_path = None
+    downloaded = 0
+    f_size = 0
+    filename = custom_name
+    
+    # Retry loop prevents "Connection Closed" from failing the entire task
+    for attempt in range(15):
+        try:
+            async with ClientSession(timeout=timeout) as sess:
+                params = {'id': file_id, 'confirm': 't'}
+                headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+                
+                # If connection dropped previously, resume where we left off
+                if downloaded > 0:
+                    headers['Range'] = f'bytes={downloaded}-'
+                
+                r = await sess.get(base_url, params=params, headers=headers, allow_redirects=True)
+                
+                # Bypass Large File Virus Warning
+                if "text/html" in r.headers.get("Content-Type", ""):
+                    text = await r.text()
+                    confirm_token = None
+                    match = re.search(r'confirm=([a-zA-Z0-9_-]+)', text)
+                    if match: confirm_token = match.group(1)
+                    else:
+                        for k, v in r.cookies.items():
+                            if k.startswith('download_warning'): confirm_token = v.value; break
+                    r.close()
+                    if confirm_token:
+                        params['confirm'] = confirm_token
+                        r = await sess.get(base_url, params=params, headers=headers, allow_redirects=True)
+                
+                # Extract metadata on first attempt
+                if attempt == 0 or not filename:
+                    cd = r.headers.get("Content-Disposition", "")
+                    if not filename and cd:
+                        fn_match = re.search(r'filename="?([^";]+)"?', cd, re.IGNORECASE)
+                        if fn_match: filename = fn_match.group(1)
+                    filename = filename or f"gdrive_{file_id}.mp4"
+                    filename = get_unique_filename(clean_double_extension(re.sub(r'[\\/*?:"<>|]', "", filename)))
+                    file_path = os.path.join(workspace, filename)
+                    
+                    # Compute actual file size securely
+                    if r.status in (200, 206):
+                        content_range = r.headers.get("Content-Range")
+                        if content_range:
+                            f_size = int(content_range.split('/')[-1])
+                        else:
+                            f_size = downloaded + int(r.headers.get("Content-Length", 0))
+
+                await msg.edit(f"⬇️ **Leeching Google Drive...**\n🎬 `{os.path.basename(file_path)}`")
+                
+                # Append if resuming, Write if new
+                mode = 'ab' if downloaded > 0 else 'wb'
+                with open(file_path, mode) as f:
+                    async for chunk in r.content.iter_chunked(1024 * 1024):
+                        if not chunk: break
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        
+                        # Report Progress
+                        if downloaded % (10 * 1024 * 1024) < (1024 * 1024):
+                            try: await msg.edit(get_status_text("GDrive Down", os.path.basename(file_path), downloaded, f_size, start_t))
+                            except: pass
+                r.close()
+                
+                # Success Check
+                if f_size == 0 or downloaded >= f_size:
+                    return file_path
+                    
+        except (aiohttp.ClientError, asyncio.TimeoutError, ConnectionError) as e:
+            if attempt >= 14:
+                raise Exception(f"Failed to leech Drive file after 15 retries. Last error: {str(e)}")
+            await asyncio.sleep(2) # Rest before resuming
+            continue 
+
     return file_path
 
+# 🚀 RESUMABLE & ROBUST DIRECT LINK LEECHER
 async def download_direct(url, workspace, msg, start_t, custom_name=None):
-    timeout = aiohttp.ClientTimeout(total=None, sock_read=300)
-    async with ClientSession(timeout=timeout) as sess:
-        r = await sess.get(url, allow_redirects=True)
-        if "text/html" in r.headers.get("Content-Type", ""): raise ValueError("HTML webpage detected, not a direct file.")
-        f_size = int(r.headers.get("Content-Length", 0))
-        filename = custom_name
-        if not filename:
-            cd = r.headers.get("Content-Disposition", "")
-            if cd:
-                fn_match = re.search(r"filename\*=UTF-8''(.+)", cd, re.IGNORECASE)
-                if fn_match: filename = unquote(fn_match.group(1))
-                else:
-                    fn_match2 = re.search(r'filename="?([^";]+)"?', cd, re.IGNORECASE)
-                    if fn_match2: filename = fn_match2.group(1)
-        filename = filename or unquote(url.split("/")[-1].split("?")[0]) or "video.mp4"
-        if not "." in filename: filename += ".mp4"
-        file_path = os.path.join(workspace, clean_double_extension(re.sub(r'[\\/*?:"<>|]', "", filename)))
-        await msg.edit(f"⬇️ **Leeching Direct Link...**\n🎬 `{os.path.basename(file_path)}`")
-        with open(file_path, 'wb') as f:
-            async for chunk in r.content.iter_chunked(1024*1024):
-                f.write(chunk)
-                if f.tell() % (10 * 1024 * 1024) == 0:
-                    try: await msg.edit(get_status_text("Leeching", os.path.basename(file_path), f.tell(), f_size, start_t))
-                    except: pass
-        r.close()
+    timeout = aiohttp.ClientTimeout(total=None, sock_read=45, sock_connect=30)
+    file_path = None
+    downloaded = 0
+    f_size = 0
+    filename = custom_name
+    
+    for attempt in range(15):
+        try:
+            async with ClientSession(timeout=timeout) as sess:
+                headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+                if downloaded > 0:
+                    headers['Range'] = f'bytes={downloaded}-'
+                
+                r = await sess.get(url, headers=headers, allow_redirects=True)
+                
+                if "text/html" in r.headers.get("Content-Type", "") and attempt == 0: 
+                    raise ValueError("HTML webpage detected, not a direct file.")
+                
+                if attempt == 0 or not filename:
+                    if r.status in (200, 206):
+                        content_range = r.headers.get("Content-Range")
+                        if content_range: f_size = int(content_range.split('/')[-1])
+                        else: f_size = downloaded + int(r.headers.get("Content-Length", 0))
+
+                    if not filename:
+                        cd = r.headers.get("Content-Disposition", "")
+                        if cd:
+                            fn_match = re.search(r"filename\*=UTF-8''(.+)", cd, re.IGNORECASE)
+                            if fn_match: filename = unquote(fn_match.group(1))
+                            else:
+                                fn_match2 = re.search(r'filename="?([^";]+)"?', cd, re.IGNORECASE)
+                                if fn_match2: filename = fn_match2.group(1)
+                    filename = filename or unquote(url.split("/")[-1].split("?")[0]) or "video.mp4"
+                    if not "." in filename: filename += ".mp4"
+                    file_path = os.path.join(workspace, clean_double_extension(re.sub(r'[\\/*?:"<>|]', "", filename)))
+                    await msg.edit(f"⬇️ **Leeching Direct Link...**\n🎬 `{os.path.basename(file_path)}`")
+                
+                mode = 'ab' if downloaded > 0 else 'wb'
+                with open(file_path, mode) as f:
+                    async for chunk in r.content.iter_chunked(1024 * 1024):
+                        if not chunk: break
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        
+                        if downloaded % (10 * 1024 * 1024) < (1024 * 1024):
+                            try: await msg.edit(get_status_text("Leeching", os.path.basename(file_path), downloaded, f_size, start_t))
+                            except: pass
+                r.close()
+                
+                if f_size == 0 or downloaded >= f_size:
+                    return file_path
+                    
+        except (aiohttp.ClientError, asyncio.TimeoutError, ConnectionError) as e:
+            if attempt >= 14:
+                raise Exception(f"Failed direct download after 15 retries: {str(e)}")
+            await asyncio.sleep(2)
+            continue
+            
     return file_path
 
 async def download_any_url(url, workspace, custom_name, msg, start_t):
@@ -849,7 +923,8 @@ async def on_callback(event):
                     async for chunk in client.iter_download(tg_msg.media, request_size=1048576):
                         f.write(chunk)
                         if f.tell() % (10 * 1024 * 1024) == 0: 
-                            await status.edit(get_status_text("TG Down", filename, f.tell(), tg_msg.file.size, start_t))
+                            try: await status.edit(get_status_text("TG Down", filename, f.tell(), tg_msg.file.size, start_t))
+                            except: pass
                 
                 if filename.lower().endswith('.zip'):
                     await status.edit("📦 **Extracting HLS ZIP Archive...**")
