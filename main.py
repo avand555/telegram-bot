@@ -30,6 +30,7 @@ from telethon.tl.functions.upload import SaveBigFilePartRequest, SaveFilePartReq
 from telethon.tl.types import InputFileBig, InputFile
 
 # Web & Storage
+import aiohttp
 from aiohttp import web, ClientSession
 import boto3
 from boto3.s3.transfer import TransferConfig
@@ -619,7 +620,7 @@ async def dashboard_handler(request):
 async def web_delete_handler(request):
     if not check_dashboard_auth(request): return web.Response(status=401, text="Unauthorized")
     if key := request.query.get('key'):
-        try: await asyncio.to_thread(sync_delete_r2_file, key); force_system_ram_purge()
+        try: await asyncio.to_thread(sync_delete_r2_file, key); free_memory()
         except: pass
     raise web.HTTPFound(f"/dashboard?prefix={request.query.get('curr_prefix', '')}")
 
@@ -627,7 +628,7 @@ async def web_delete_handler(request):
 async def web_delete_folder_handler(request):
     if not check_dashboard_auth(request): return web.Response(status=401, text="Unauthorized")
     if pref := request.query.get('prefix'):
-        try: await asyncio.to_thread(sync_delete_r2_folder, pref); force_system_ram_purge()
+        try: await asyncio.to_thread(sync_delete_r2_folder, pref); free_memory()
         except: pass
     raise web.HTTPFound(f"/dashboard?prefix={request.query.get('curr_prefix', '')}")
 
@@ -636,7 +637,7 @@ async def web_rename_handler(request):
     if not check_dashboard_auth(request): return web.Response(status=401, text="Unauthorized")
     old_key, new_key = request.query.get('old_key'), request.query.get('new_key')
     if old_key and new_key and old_key != new_key:
-        try: await asyncio.to_thread(sync_rename_r2_file, old_key, new_key); force_system_ram_purge()
+        try: await asyncio.to_thread(sync_rename_r2_file, old_key, new_key); free_memory()
         except: pass
     raise web.HTTPFound(f"/dashboard?prefix={request.query.get('prefix', '')}")
 
@@ -645,7 +646,7 @@ async def web_rename_folder_handler(request):
     if not check_dashboard_auth(request): return web.Response(status=401, text="Unauthorized")
     old_prefix, new_prefix = request.query.get('old_prefix'), request.query.get('new_prefix')
     if old_prefix and new_prefix and old_prefix != new_prefix:
-        try: await asyncio.to_thread(sync_rename_r2_folder, old_prefix, new_prefix); force_system_ram_purge()
+        try: await asyncio.to_thread(sync_rename_r2_folder, old_prefix, new_prefix); free_memory()
         except: pass
     raise web.HTTPFound(f"/dashboard?prefix={request.query.get('prefix', '')}")
 
@@ -661,7 +662,7 @@ async def web_move_handler(request):
             try: 
                 if item_type in ['HLS', 'FOLDER']: await asyncio.to_thread(sync_rename_r2_folder, old_key, new_key)
                 else: await asyncio.to_thread(sync_rename_r2_file, old_key, new_key)
-                force_system_ram_purge()
+                free_memory()
             except: pass
     raise web.HTTPFound(f"/dashboard?prefix={request.query.get('prefix', '')}")
 
