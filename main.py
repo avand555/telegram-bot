@@ -30,8 +30,8 @@ from telethon.tl.functions.upload import SaveBigFilePartRequest, SaveFilePartReq
 from telethon.tl.types import InputFileBig, InputFile
 
 # Web & Storage
-import aiohttp
 from aiohttp import web, ClientSession
+import aiohttp 
 import boto3
 from boto3.s3.transfer import TransferConfig
 from botocore.config import Config
@@ -65,16 +65,16 @@ routes = web.RouteTableDef()
 link_storage = {}
 active_tasks = {}
 
-# 🚀 INCREASED RETRIES FOR CONNECTION DROPS
+# 🚀 Indestructible Telegram Connection
 client = TelegramClient(
     'bot_session', 
     int(API_ID), 
     API_HASH, 
     connection=ConnectionTcpFull, 
     use_ipv6=False,
-    request_retries=10,
-    connection_retries=10,
-    retry_delay=2
+    request_retries=15,
+    connection_retries=15,
+    retry_delay=3
 )
 
 # ============================================
@@ -90,13 +90,6 @@ def human_size(bytes_val):
         if bytes_val < 1024: return f"{bytes_val:.2f} {unit}"
         bytes_val /= 1024
     return "0 B"
-
-# 🛡️ SAFE MESSAGE EDITING (Prevents "Message not modified" crashes)
-async def edit_msg(msg, *args, **kwargs):
-    try:
-        return await msg.edit(*args, **kwargs)
-    except Exception:
-        return msg
 
 def get_status_text(action, filename, current, total, start_time):
     diff = max(time.time() - start_time, 0.001)
@@ -157,7 +150,7 @@ def get_unique_filename(filepath):
 def get_r2_client():
     clean_id = R2_ACCOUNT_ID.replace("https://", "").replace("http://", "").split(".")[0].strip('/')
     endpoint = f"https://{clean_id}.r2.cloudflarestorage.com"
-    r2_config = Config(region_name='auto', signature_version='s3v4', retries={'max_attempts': 3, 'mode': 'standard'})
+    r2_config = Config(region_name='auto', signature_version='s3v4', retries={'max_attempts': 5, 'mode': 'standard'})
     return boto3.client('s3', endpoint_url=endpoint, aws_access_key_id=R2_ACCESS_KEY_ID, aws_secret_access_key=R2_SECRET_ACCESS_KEY, config=r2_config)
 
 def sync_get_smart_dashboard_data(prefix=""):
@@ -177,39 +170,31 @@ def sync_get_smart_dashboard_data(prefix=""):
     hls_packages = {base: {'name': base, 'size': 0, 'date': None, 'type': 'HLS', 'url_key': f"{base}/master.m3u8"} for base in hls_bases}
     standalone_files = []
     empty_folders = []
-    
     total_size = 0
     mp4_count = 0
     sorted_bases = sorted(list(hls_bases), key=len, reverse=True)
     
     for obj in all_objects:
-        key = obj['Key']
-        size = obj['Size']
-        date = obj['LastModified']
+        key, size, date = obj['Key'], obj['Size'], obj['LastModified']
         total_size += size
-        
         if key.endswith('/') and size == 0:
             if not any(key == (b + '/') or key.startswith(b + '/') for b in sorted_bases):
                 empty_folders.append({'name': key, 'size': 0, 'date': date, 'type': 'FOLDER', 'url_key': key})
             continue
-            
         is_hls_part = False
         for base in sorted_bases:
             if key.startswith(base + '/') or key == base:
                 hls_packages[base]['size'] += size
-                if hls_packages[base]['date'] is None or date > hls_packages[base]['date']:
-                    hls_packages[base]['date'] = date
-                is_hls_part = True
-                break
-                
+                if hls_packages[base]['date'] is None or date > hls_packages[base]['date']: hls_packages[base]['date'] = date
+                is_hls_part = True; break
         if not is_hls_part and not key.endswith('/'):
             standalone_files.append({'name': key, 'size': size, 'date': date, 'type': 'FILE', 'url_key': key})
             if key.lower().endswith('.mp4'): mp4_count += 1
                 
+    hls_count = len(hls_packages)
     all_items = empty_folders + list(hls_packages.values()) + standalone_files
     all_items.sort(key=lambda x: x['date'] if x['date'] else datetime.datetime.min.replace(tzinfo=datetime.timezone.utc), reverse=True)
-    
-    return {'total_size': total_size, 'mp4_count': mp4_count, 'hls_count': len(hls_packages), 'items': all_items}
+    return {'total_size': total_size, 'mp4_count': mp4_count, 'hls_count': hls_count, 'items': all_items}
 
 def sync_delete_r2_file(s3_key):
     get_r2_client().delete_object(Bucket=R2_BUCKET_NAME, Key=s3_key)
@@ -227,6 +212,19 @@ def sync_rename_r2_file(old_key, new_key):
     s3 = get_r2_client()
     s3.copy({'Bucket': R2_BUCKET_NAME, 'Key': old_key}, R2_BUCKET_NAME, new_key)
     s3.delete_object(Bucket=R2_BUCKET_NAME, Key=old_key)
+
+def sync_rename_r2_folder(old_prefix, new_prefix):
+    s3 = get_r2_client()
+    old_prefix = old_prefix.rstrip('/') + '/'
+    new_prefix = new_prefix.rstrip('/') + '/'
+    paginator = s3.get_paginator('list_objects_v2')
+    for page in paginator.paginate(Bucket=R2_BUCKET_NAME, Prefix=old_prefix):
+        if 'Contents' in page:
+            for obj in page['Contents']:
+                old_obj_key = obj['Key']
+                new_obj_key = new_prefix + old_obj_key[len(old_prefix):]
+                s3.copy({'Bucket': R2_BUCKET_NAME, 'Key': old_obj_key}, R2_BUCKET_NAME, new_obj_key)
+                s3.delete_object(Bucket=R2_BUCKET_NAME, Key=old_obj_key)
 
 def sync_r2_upload(file_path, s3_key, loop, msg, start_t):
     s3 = get_r2_client()
@@ -287,12 +285,14 @@ def sync_r2_upload_folder(folder_path, s3_prefix, loop, msg, start_t):
 async def upload_to_r2(file_path, msg, target_folder=None):
     start_t = time.time()
     loop = asyncio.get_running_loop()
-    filename = os.path.basename(file_path)
-    if target_folder: s3_key = f"{target_folder.strip('/')}/{filename}"
-    else: s3_key = f"{datetime.datetime.now().year}/{datetime.datetime.now().month}/{datetime.datetime.now().day}/{filename}"
     
-    await edit_msg(msg, f"⬆️ **Connecting to Cloudflare R2...**\n🎬 `{filename}`")
+    basename = os.path.basename(file_path)
+    if target_folder: s3_key = f"{target_folder.strip('/')}/{basename}"
+    else: s3_key = f"{datetime.datetime.now().year}/{datetime.datetime.now().month}/{datetime.datetime.now().day}/{basename}"
+    
+    await msg.edit(f"⬆️ **Connecting to Cloudflare R2...**\n🎬 `{basename}`")
     await asyncio.to_thread(sync_r2_upload, file_path, s3_key, loop, msg, start_t)
+    
     code = secrets.token_urlsafe(8)
     link_storage[code] = {'s3_key': s3_key}
     return f"{R2_PUBLIC_URL}/{quote(s3_key, safe='/')}", code
@@ -336,6 +336,7 @@ async def download_magnet(url, workspace, custom_name, msg, start_t):
 
     await process.wait()
     active_tasks.pop(task_code, None)
+    
     largest = get_largest_file(workspace)
     if not largest: raise ValueError("Torrent failed.")
     final_name = get_unique_filename(os.path.join(workspace, custom_name if custom_name else os.path.basename(largest)))
@@ -353,170 +354,87 @@ def extract_gdrive_id(url):
     match = re.search(r'(?:file/d/|id=|/d/)([a-zA-Z0-9_-]{25,})', url)
     return match.group(1) if match else None
 
-# 🚀 RESUMABLE & ROBUST GOOGLE DRIVE LEECHER
-async def download_gdrive(url, workspace, custom_name, msg, start_t):
-    file_id = extract_gdrive_id(url)
-    await edit_msg(msg, "🅿️ **Google Drive Detected! Bypassing warnings...**")
-    
+async def get_gdrive_stream(session, file_id):
     base_url = "https://drive.google.com/uc?export=download"
-    timeout = aiohttp.ClientTimeout(total=None, sock_read=45, sock_connect=30)
-    
-    file_path = None
-    downloaded = 0
-    f_size = 0
-    filename = custom_name
-    
-    for attempt in range(15):
-        try:
-            async with ClientSession(timeout=timeout) as sess:
-                params = {'id': file_id, 'confirm': 't'}
-                headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-                
-                if downloaded > 0:
-                    headers['Range'] = f'bytes={downloaded}-'
-                
-                r = await sess.get(base_url, params=params, headers=headers, allow_redirects=True)
-                
-                if "text/html" in r.headers.get("Content-Type", ""):
-                    text = await r.text()
-                    confirm_token = None
-                    match = re.search(r'confirm=([a-zA-Z0-9_-]+)', text)
-                    if match: confirm_token = match.group(1)
-                    else:
-                        for k, v in r.cookies.items():
-                            if k.startswith('download_warning'): confirm_token = v.value; break
-                    r.close()
-                    if confirm_token:
-                        params['confirm'] = confirm_token
-                        r = await sess.get(base_url, params=params, headers=headers, allow_redirects=True)
-                
-                if attempt == 0 or not filename:
-                    cd = r.headers.get("Content-Disposition", "")
-                    if not filename and cd:
-                        fn_match = re.search(r'filename="?([^";]+)"?', cd, re.IGNORECASE)
-                        if fn_match: filename = fn_match.group(1)
-                    filename = filename or f"gdrive_{file_id}.mp4"
-                    filename = get_unique_filename(clean_double_extension(re.sub(r'[\\/*?:"<>|]', "", filename)))
-                    file_path = os.path.join(workspace, filename)
-                    
-                    if r.status in (200, 206):
-                        content_range = r.headers.get("Content-Range")
-                        if content_range:
-                            f_size = int(content_range.split('/')[-1])
-                        else:
-                            f_size = downloaded + int(r.headers.get("Content-Length", 0))
+    params = {'id': file_id, 'confirm': 't'}
+    resp = await session.get(base_url, params=params, allow_redirects=True)
+    if "text/html" in resp.headers.get("Content-Type", ""):
+        text = await resp.text()
+        confirm_token = None
+        token_match = re.search(r'confirm=([a-zA-Z0-9_-]+)', text)
+        if token_match: confirm_token = token_match.group(1)
+        else:
+            for k, v in resp.cookies.items():
+                if k.startswith('download_warning'):
+                    confirm_token = v.value
+                    break
+        resp.close()
+        if confirm_token:
+            params['confirm'] = confirm_token
+            resp = await session.get(base_url, params=params, allow_redirects=True)
+    return resp
 
-                await edit_msg(msg, f"⬇️ **Leeching Google Drive...**\n🎬 `{os.path.basename(file_path)}`")
-                
-                mode = 'ab' if downloaded > 0 else 'wb'
-                with open(file_path, mode) as f:
-                    async for chunk in r.content.iter_chunked(1024 * 1024):
-                        if not chunk: break
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        
-                        if downloaded % (10 * 1024 * 1024) < (1024 * 1024):
-                            await edit_msg(msg, get_status_text("GDrive Down", os.path.basename(file_path), downloaded, f_size, start_t))
-                r.close()
-                
-                if f_size == 0 or downloaded >= f_size:
-                    return file_path
-                    
-        except Exception as e:
-            if attempt >= 14:
-                raise Exception(f"Failed to leech Drive file after 15 retries. Last error: {str(e)}")
-            await asyncio.sleep(2)
-            continue 
+# 🚀 FIX: BULLETPROOF DIRECT DOWNLOADER
+async def download_direct(url, workspace, msg, start_t, custom_name=None, gdrive_id=None):
+    timeout = aiohttp.ClientTimeout(total=None, sock_connect=60, sock_read=300)
+    async with ClientSession(timeout=timeout) as sess:
+        if gdrive_id:
+            await msg.edit("🅿️ **Google Drive Detected! Bypassing warnings...**")
+            r = await get_gdrive_stream(sess, gdrive_id)
+        else:
+            r = await sess.get(url, allow_redirects=True)
 
-    return file_path
-
-# 🚀 RESUMABLE & ROBUST DIRECT LINK LEECHER
-async def download_direct(url, workspace, msg, start_t, custom_name=None):
-    timeout = aiohttp.ClientTimeout(total=None, sock_read=45, sock_connect=30)
-    file_path = None
-    downloaded = 0
-    f_size = 0
-    filename = custom_name
-    
-    for attempt in range(15):
-        try:
-            async with ClientSession(timeout=timeout) as sess:
-                headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-                if downloaded > 0:
-                    headers['Range'] = f'bytes={downloaded}-'
-                
-                r = await sess.get(url, headers=headers, allow_redirects=True)
-                
-                if "text/html" in r.headers.get("Content-Type", "") and attempt == 0: 
-                    raise ValueError("HTML webpage detected, not a direct file.")
-                
-                if attempt == 0 or not filename:
-                    if r.status in (200, 206):
-                        content_range = r.headers.get("Content-Range")
-                        if content_range: f_size = int(content_range.split('/')[-1])
-                        else: f_size = downloaded + int(r.headers.get("Content-Length", 0))
-
-                    if not filename:
-                        cd = r.headers.get("Content-Disposition", "")
-                        if cd:
-                            fn_match = re.search(r"filename\*=UTF-8''(.+)", cd, re.IGNORECASE)
-                            if fn_match: filename = unquote(fn_match.group(1))
-                            else:
-                                fn_match2 = re.search(r'filename="?([^";]+)"?', cd, re.IGNORECASE)
-                                if fn_match2: filename = fn_match2.group(1)
-                    filename = filename or unquote(url.split("/")[-1].split("?")[0]) or "video.mp4"
-                    if not "." in filename: filename += ".mp4"
-                    file_path = os.path.join(workspace, clean_double_extension(re.sub(r'[\\/*?:"<>|]', "", filename)))
-                    await edit_msg(msg, f"⬇️ **Leeching Direct Link...**\n🎬 `{os.path.basename(file_path)}`")
-                
-                mode = 'ab' if downloaded > 0 else 'wb'
-                with open(file_path, mode) as f:
-                    async for chunk in r.content.iter_chunked(1024 * 1024):
-                        if not chunk: break
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        
-                        if downloaded % (10 * 1024 * 1024) < (1024 * 1024):
-                            await edit_msg(msg, get_status_text("Leeching", os.path.basename(file_path), downloaded, f_size, start_t))
-                r.close()
-                
-                if f_size == 0 or downloaded >= f_size:
-                    return file_path
-                    
-        except Exception as e:
-            if attempt >= 14:
-                raise Exception(f"Failed direct download after 15 retries: {str(e)}")
-            await asyncio.sleep(2)
-            continue
+        if "text/html" in r.headers.get("Content-Type", "") and not gdrive_id: 
+            raise ValueError("HTML webpage detected, not a direct file.")
             
+        f_size = int(r.headers.get("Content-Length", 0))
+        
+        filename = custom_name
+        if not filename:
+            cd = r.headers.get("Content-Disposition", "")
+            if cd:
+                fn_match = re.search(r"filename\*=UTF-8''(.+)", cd, re.IGNORECASE)
+                if fn_match: filename = unquote(fn_match.group(1))
+                else:
+                    fn_match2 = re.search(r'filename="?([^";]+)"?', cd, re.IGNORECASE)
+                    if fn_match2: filename = fn_match2.group(1)
+                    
+        filename = filename or unquote(url.split("/")[-1].split("?")[0]) or "video.mp4"
+        if not "." in filename: filename += ".mp4"
+        
+        file_path = os.path.join(workspace, clean_double_extension(re.sub(r'[\\/*?:"<>|]', "", filename)))
+        
+        await msg.edit(f"⬇️ **Leeching Direct Link...**\n🎬 `{os.path.basename(file_path)}`")
+        
+        # Safe Chunk Downloading
+        with open(file_path, 'wb') as f:
+            async for chunk in r.content.iter_chunked(1024*1024):
+                f.write(chunk)
+                if f.tell() % (10 * 1024 * 1024) == 0:
+                    try: await msg.edit(get_status_text("Leeching", os.path.basename(file_path), f.tell(), f_size, start_t))
+                    except: pass
+        r.close()
     return file_path
 
 async def download_any_url(url, workspace, custom_name, msg, start_t):
-    # 1. Magnet Routing
     if url.startswith("magnet:?"):
         return await download_magnet(url, workspace, custom_name, msg, start_t)
 
-    # 2. Google Drive Routing
-    if extract_gdrive_id(url):
-        return await download_gdrive(url, workspace, custom_name, msg, start_t)
-
-    # 3. ZIP / Standard Routing
     is_zip = (custom_name and custom_name.lower().endswith('.zip')) or url.lower().endswith('.zip')
-    if not is_zip:
+    gdrive_id = extract_gdrive_id(url)
+
+    if not is_zip and not gdrive_id:
         try:
-            await edit_msg(msg, "🅿️ **Extracting File Info via yt-dlp...**")
+            await msg.edit("🅿️ **Extracting File Info via yt-dlp...**")
             filename = await asyncio.to_thread(sync_yt_dlp_download, url, workspace, custom_name)
             if filename and os.path.exists(filename) and os.path.getsize(filename) > 0:
-                final_path = os.path.join(workspace, os.path.basename(filename))
-                shutil.move(filename, final_path)
-                return final_path
+                return filename
         except Exception: pass
 
-    # 4. Fallback Direct Downloader
-    return await download_direct(url, workspace, msg, start_t, custom_name)
+    return await download_direct(url, workspace, msg, start_t, custom_name, gdrive_id)
 
 # ============================================
-# --- 5. SECURED WEB DASHBOARD & UI ---
+# --- 5. SECURED SMART WEB DASHBOARD ---
 # ============================================
 def check_dashboard_auth(request):
     auth_header = request.headers.get('Authorization')
@@ -532,10 +450,6 @@ DASHBOARD_CSS = """
     .container { max-width: 1200px; margin: auto; }
     .header-bar { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; margin-bottom: 20px; gap: 15px; }
     h2 { margin: 0; color: var(--text); font-size: 24px; display: flex; align-items: center; gap: 10px; border-bottom: 2px solid var(--border); padding-bottom: 10px; width: 100%; }
-    .breadcrumbs { display: flex; align-items: center; gap: 8px; background: var(--card); padding: 12px 20px; border-radius: 8px; border: 1px solid var(--border); margin-bottom: 20px; font-size: 15px; }
-    .breadcrumb-link { color: var(--accent); text-decoration: none; font-weight: 600; }
-    .breadcrumb-link:hover { text-decoration: underline; }
-    .divider { color: var(--muted); }
     .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 25px; }
     .stat-card { background: var(--card); padding: 15px; border-radius: 10px; border: 1px solid var(--border); box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
     .stat-title { font-size: 12px; color: var(--muted); text-transform: uppercase; font-weight: bold; margin-bottom: 5px; }
@@ -554,6 +468,8 @@ DASHBOARD_CSS = """
     .folder-link:hover { text-decoration: underline; }
     .actions { display: flex; gap: 8px; flex-wrap: wrap; }
     .btn { display: inline-flex; align-items: center; justify-content: center; gap: 5px; padding: 8px 14px; border-radius: 6px; border: none; font-size: 12px; font-weight: 600; cursor: pointer; text-decoration: none; transition: 0.2s; }
+    .btn-create { background: rgba(16, 185, 129, 0.2); color: #34d399; font-size: 14px; padding: 14px 20px; border: 1px solid #10b981; }
+    .btn-create:hover { background: rgba(16, 185, 129, 0.4); }
     .btn-copy { background: rgba(59, 130, 246, 0.1); color: var(--accent); }
     .btn-view { background: rgba(16, 185, 129, 0.1); color: #34d399; }
     .btn-move { background: rgba(167, 139, 250, 0.1); color: #c084fc; }
@@ -574,7 +490,7 @@ DASHBOARD_JS = """
         let dec = decodeURIComponent(key);
         let newKey = prompt('✏️ Rename (Full Path):', dec);
         if (newKey && newKey !== dec) {
-            window.location.href = (isHLS ? '/rename_folder?old_prefix=' : '/rename_file?old_key=') + encodeURIComponent(dec) + (isHLS ? '&new_prefix=' : '&new_key=') + encodeURIComponent(newKey) + '&prefix=' + encodeURIComponent(prefix);
+            window.location.href = (isHLS ? '/rename_folder?old_prefix=' : '/rename_file?old_key=') + encodeURIComponent(dec) + (isHLS ? '&new_prefix=' : '&new_key=') + '&prefix=' + encodeURIComponent(prefix);
         }
     }
     function moveItem(key, isHLS, prefix) {
@@ -583,6 +499,12 @@ DASHBOARD_JS = """
         let target = prompt('📁 Move to Folder (e.g. Movies/2026):', currentDir);
         if (target !== null) {
             window.location.href = '/move_item?old_key=' + encodeURIComponent(dec) + '&target_folder=' + encodeURIComponent(target) + '&type=' + (isHLS ? 'FOLDER' : 'FILE') + '&prefix=' + encodeURIComponent(prefix);
+        }
+    }
+    function createFolder() {
+        let path = prompt('📁 Enter new folder path (e.g. doblaj/movies/):');
+        if (path) {
+            window.location.href = '/create_folder?path=' + encodeURIComponent(path);
         }
     }
     function filterTable() {
@@ -629,6 +551,7 @@ async def dashboard_handler(request):
     file_rows = ""
     try:
         data = await asyncio.to_thread(sync_get_smart_dashboard_data, prefix)
+        
         if 'CommonPrefixes' in data:
             for pref in data['CommonPrefixes']:
                 f_path = pref['Prefix']
@@ -641,20 +564,33 @@ async def dashboard_handler(request):
                         <button class="btn btn-rename" onclick="renameItem('{quote(f_path)}', true, '{quote(prefix)}')">✏️ Rename</button>
                         <button class="btn btn-delete" onclick="deleteItem('{quote(f_path)}', true, '{quote(prefix)}')">🗑️ Delete</button>
                     </div></td></tr>"""
+
         for item in data['items']:
             name = item['name']
             if name == prefix: continue
+            
             size_str = human_size(item['size']) if item['size'] > 0 else "-"
             date_str = item['date'].strftime("%Y-%m-%d %H:%M") if item['date'] else "-"
             url = f"{R2_PUBLIC_URL}/{quote(item['url_key'], safe='/')}"
-            disp_name = name.split('/')[-1] if not item['type'] == 'HLS' else name.rstrip('/').split('/')[-1]
-            if item['type'] == 'HLS':
+            item_type = item['type']
+            disp_name = name.split('/')[-1] if item_type != 'HLS' else name.rstrip('/').split('/')[-1]
+            
+            if item_type == 'HLS':
                 file_rows += f"""<tr style="background: rgba(251, 191, 36, 0.05);">
                     <td data-val="{disp_name}">📦 <span class="file-name"><b>{disp_name}</b> (HLS Package)</span></td>
                     <td data-val="{item['size']}">{size_str}</td><td data-val="{item['date'].timestamp() if item['date'] else 0}">{date_str}</td>
                     <td><div class="actions">
                         <button class="btn btn-copy" onclick="copyText('{url}')">🔗 Copy Master.m3u8</button>
                         <a href="{url}" target="_blank" class="btn btn-view">▶️ Play Stream</a>
+                        <button class="btn btn-move" onclick="moveItem('{quote(name)}', true, '{quote(prefix)}')">📁 Move</button>
+                        <button class="btn btn-rename" onclick="renameItem('{quote(name)}', true, '{quote(prefix)}')">✏️ Rename</button>
+                        <button class="btn btn-delete" onclick="deleteItem('{quote(name)}', true, '{quote(prefix)}')">🗑️ Delete</button>
+                    </div></td></tr>"""
+            elif item_type == 'FOLDER':
+                file_rows += f"""<tr style="background: rgba(167, 139, 250, 0.05);">
+                    <td data-val="{name}"><a href="/dashboard?prefix={quote(name)}" class="folder-link">📁 <span class="file-name">{name}</span></a></td>
+                    <td data-val="0">-</td><td data-val="{item['date'].timestamp() if item['date'] else 0}">{date_str}</td>
+                    <td><div class="actions">
                         <button class="btn btn-move" onclick="moveItem('{quote(name)}', true, '{quote(prefix)}')">📁 Move</button>
                         <button class="btn btn-rename" onclick="renameItem('{quote(name)}', true, '{quote(prefix)}')">✏️ Rename</button>
                         <button class="btn btn-delete" onclick="deleteItem('{quote(name)}', true, '{quote(prefix)}')">🗑️ Delete</button>
@@ -668,46 +604,50 @@ async def dashboard_handler(request):
                         <a href="{url}" target="_blank" class="btn btn-view">▶️ Play MP4</a>
                         <button class="btn btn-move" onclick="moveItem('{quote(name)}', false, '{quote(prefix)}')">📁 Move</button>
                         <button class="btn btn-rename" onclick="renameItem('{quote(name)}', false, '{quote(prefix)}')">✏️ Rename</button>
-                        <button class="btn btn-delete" onclick="deleteItem('{quote(name)}', false, '{quote(prefix)}')">🗑️ Delete File</button>
+                        <button class="btn btn-delete" onclick="deleteItem('{quote(name)}', false, '{quote(prefix)}')">🗑️ Delete</button>
                     </div></td></tr>"""
+                    
         if not file_rows: file_rows = "<tr><td colspan='4' style='text-align:center;'>Directory is empty.</td></tr>"
     except Exception as e: file_rows = f"<tr><td colspan='4' style='color:red;'>Error: {e}</td></tr>"
 
-    html = f"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Cloudflare R2 Manager</title><style>{DASHBOARD_CSS}</style><script>{DASHBOARD_JS}</script></head><body>
-        <div class="container"><div class="header-bar"><h2>🛡️ Cloudflare R2 Smart Dashboard</h2></div>
+    html = f"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Cloudflare Studio</title><style>{DASHBOARD_CSS}</style><script>{DASHBOARD_JS}</script></head><body>
+        <div class="container"><div class="header-bar"><h2>🛡️ Cloudflare Studio Dashboard</h2></div>
             <div class="stats-grid">
                 <div class="stat-card"><div class="stat-title">Total Storage</div><div class="stat-val">{human_size(data.get('total_size', 0))}</div></div>
                 <div class="stat-card"><div class="stat-title">HLS Packages</div><div class="stat-val">{data.get('hls_count', 0)}</div></div>
                 <div class="stat-card"><div class="stat-title">MP4 Files</div><div class="stat-val">{data.get('mp4_count', 0)}</div></div>
             </div>
             <div class="breadcrumbs">{breadcrumbs}</div>
-            <div class="controls"><input type="text" id="searchInput" class="search-box" onkeyup="filterTable()" placeholder="🔍 Global Search..."></div>
-            <div class="table-wrapper"><table><thead><tr><th id="th-0" onclick="sortTable(0, 'str')">Name <span></span></th><th id="th-1" onclick="sortTable(1, 'num')">Total Size <span></span></th><th id="th-2" onclick="sortTable(2, 'num')">Date Uploaded <span>🔽</span></th><th>Actions</th></tr></thead><tbody>{file_rows}</tbody></table></div>
+            <div class="controls">
+                <input type="text" id="searchInput" class="search-box" onkeyup="filterTable()" placeholder="🔍 Search current folder...">
+                <button class="btn btn-create" onclick="createFolder()">📁 Create Folder</button>
+            </div>
+            <div class="table-wrapper"><table><thead><tr><th id="th-0" onclick="sortTable(0, 'str')">Name <span></span></th><th id="th-1" onclick="sortTable(1, 'num')">Size <span></span></th><th id="th-2" onclick="sortTable(2, 'num')">Date Uploaded <span>🔽</span></th><th>Actions</th></tr></thead><tbody>{file_rows}</tbody></table></div>
         </div></body></html>"""
     return web.Response(text=html, content_type='text/html')
 
 @routes.get('/delete_file')
-async def web_delete_handler(request):
+async def web_delete_file(request):
     if not check_dashboard_auth(request): return web.Response(status=401, text="Unauthorized")
     if key := request.query.get('key'):
-        try: await asyncio.to_thread(sync_delete_r2_file, key); free_memory()
+        try: await asyncio.to_thread(sync_delete_r2_file, key); force_system_ram_purge()
         except: pass
     raise web.HTTPFound(f"/dashboard?prefix={request.query.get('curr_prefix', '')}")
 
 @routes.get('/delete_folder')
-async def web_delete_folder_handler(request):
+async def web_delete_folder(request):
     if not check_dashboard_auth(request): return web.Response(status=401, text="Unauthorized")
     if pref := request.query.get('prefix'):
-        try: await asyncio.to_thread(sync_delete_r2_folder, pref); free_memory()
+        try: await asyncio.to_thread(sync_delete_r2_folder, pref); force_system_ram_purge()
         except: pass
     raise web.HTTPFound(f"/dashboard?prefix={request.query.get('curr_prefix', '')}")
 
 @routes.get('/rename_file')
-async def web_rename_handler(request):
+async def web_rename(request):
     if not check_dashboard_auth(request): return web.Response(status=401, text="Unauthorized")
     old_key, new_key = request.query.get('old_key'), request.query.get('new_key')
     if old_key and new_key and old_key != new_key:
-        try: await asyncio.to_thread(sync_rename_r2_file, old_key, new_key); free_memory()
+        try: await asyncio.to_thread(sync_rename_r2_file, old_key, new_key); force_system_ram_purge()
         except: pass
     raise web.HTTPFound(f"/dashboard?prefix={request.query.get('prefix', '')}")
 
@@ -716,12 +656,12 @@ async def web_rename_folder_handler(request):
     if not check_dashboard_auth(request): return web.Response(status=401, text="Unauthorized")
     old_prefix, new_prefix = request.query.get('old_prefix'), request.query.get('new_prefix')
     if old_prefix and new_prefix and old_prefix != new_prefix:
-        try: await asyncio.to_thread(sync_rename_r2_folder, old_prefix, new_prefix); free_memory()
+        try: await asyncio.to_thread(sync_rename_r2_folder, old_prefix, new_prefix); force_system_ram_purge()
         except: pass
     raise web.HTTPFound(f"/dashboard?prefix={request.query.get('prefix', '')}")
 
 @routes.get('/move_item')
-async def web_move_handler(request):
+async def web_move(request):
     if not check_dashboard_auth(request): return web.Response(status=401, text="Unauthorized")
     old_key, target = request.query.get('old_key'), request.query.get('target_folder', '').strip().strip('/')
     item_type = request.query.get('type')
@@ -732,9 +672,23 @@ async def web_move_handler(request):
             try: 
                 if item_type in ['HLS', 'FOLDER']: await asyncio.to_thread(sync_rename_r2_folder, old_key, new_key)
                 else: await asyncio.to_thread(sync_rename_r2_file, old_key, new_key)
-                free_memory()
+                force_system_ram_purge()
             except: pass
     raise web.HTTPFound(f"/dashboard?prefix={request.query.get('prefix', '')}")
+
+def sync_create_r2_folder(folder_path):
+    s3 = get_r2_client()
+    folder_path = folder_path.strip('/') + '/'
+    s3.put_object(Bucket=R2_BUCKET_NAME, Key=folder_path)
+
+@routes.get('/create_folder')
+async def web_create_folder(request):
+    if not check_dashboard_auth(request): return web.Response(status=401, text="Unauthorized")
+    path = request.query.get('path')
+    if path:
+        try: await asyncio.to_thread(sync_create_r2_folder, path)
+        except: pass
+    raise web.HTTPFound('/dashboard')
 
 @routes.get('/')
 async def root(request):
@@ -753,11 +707,48 @@ async def stream_handler(request):
     except: pass
     return resp
 
+# --- 9. TG FAST UPLOAD ---
+async def fast_upload(client, file_path, msg, filename):
+    file_size = os.path.getsize(file_path)
+    part_size, file_id = 512 * 1024, random.getrandbits(63)
+    start_time, uploaded_bytes = time.time(), 0
+    sem = asyncio.Semaphore(15) 
+    
+    async def upload_part(idx):
+        nonlocal uploaded_bytes
+        async with sem:
+            with open(file_path, 'rb') as f:
+                f.seek(idx * part_size); chunk = f.read(part_size)
+            
+            # 🚀 RETRY LOOP: Indestructible Telegram Connection
+            retries = 0
+            while retries < 5:
+                try:
+                    if file_size > 10*1024*1024: await client(SaveBigFilePartRequest(file_id, idx, math.ceil(file_size/part_size), chunk))
+                    else: await client(SaveFilePartRequest(file_id, idx, chunk))
+                    uploaded_bytes += len(chunk)
+                    break
+                except Exception as e:
+                    retries += 1
+                    if retries >= 5: raise e
+                    await asyncio.sleep(2)
+            
+    tasks = [upload_part(i) for i in range(math.ceil(file_size/part_size))]
+    async def updater():
+        while uploaded_bytes < file_size:
+            await asyncio.sleep(4)
+            try: await msg.edit(get_status_text("Uploading to TG", filename, uploaded_bytes, file_size, start_time))
+            except: pass
+    u_task = asyncio.create_task(updater())
+    await asyncio.gather(*tasks); u_task.cancel()
+    return InputFileBig(file_id, math.ceil(file_size/part_size), filename) if file_size > 10*1024*1024 else InputFile(file_id, math.ceil(file_size/part_size), filename, '')
+
 # ============================================
-# --- 6. TELEGRAM HANDLERS ---
+# --- 10. TELEGRAM HANDLERS ---
 # ============================================
 @client.on(events.NewMessage(incoming=True, func=lambda e: e.sender_id == ADMIN_ID))
 async def master_handler(event):
+    
     if event.file:
         await event.reply(
             f"📂 **File Detected:** `{event.file.name or 'file.bin'}`",
@@ -771,11 +762,17 @@ async def master_handler(event):
     if event.text and (event.text.startswith("http") or event.text.startswith("magnet:?")):
         async with global_semaphore:
             raw = event.text.strip()
+            
+            # 🚀 BULLETPROOF COMMAND PARSER
             url = raw.split(" -n ")[0].split(" -f ")[0].strip()
             custom_name, target_folder = None, None
             
-            if " -n " in raw: custom_name = raw.split(" -n ")[1].split(" -f ")[0].strip()
-            if " -f " in raw: target_folder = raw.split(" -f ")[1].strip()
+            if " -n " in raw:
+                n_part = raw.split(" -n ")[1]
+                custom_name = n_part.split(" -f ")[0].strip() if " -f " in n_part else n_part.strip()
+            if " -f " in raw:
+                f_part = raw.split(" -f ")[1]
+                target_folder = f_part.split(" -n ")[0].strip() if " -n " in f_part else f_part.strip()
 
             msg = await event.reply("🔗 **Processing Request...**")
             workspace = f"dl_{uuid.uuid4().hex[:8]}"
@@ -787,10 +784,13 @@ async def master_handler(event):
                 if not final_path or not os.path.exists(final_path): raise ValueError("Download failed.")
                 filename = os.path.basename(final_path)
 
+                # ZIP / HLS Logic (Smart Disk Protection)
                 if filename.lower().endswith('.zip'):
-                    await edit_msg(msg, "📦 **Extracting HLS ZIP Archive...**")
+                    await msg.edit("📦 **Extracting HLS ZIP Archive...**")
                     extract_dir = os.path.join(workspace, "extracted")
                     os.makedirs(extract_dir, exist_ok=True)
+                    
+                    # Extract zip, then DELETE IT IMMEDIATELY to protect disk space
                     await asyncio.to_thread(lambda: zipfile.ZipFile(final_path, 'r').extractall(extract_dir))
                     os.remove(final_path) 
 
@@ -804,60 +804,20 @@ async def master_handler(event):
                         upload_source_dir = extract_dir
                         s3_prefix = target_folder if target_folder else project_name
 
-                    await edit_msg(msg, f"⬆️ **Uploading HLS Pack to R2...**\n📂 `{s3_prefix}`")
+                    await msg.edit(f"⬆️ **Uploading HLS Pack to R2...**\n📂 `{s3_prefix}`")
                     await asyncio.to_thread(sync_r2_upload_folder, upload_source_dir, s3_prefix, asyncio.get_running_loop(), msg, time.time())
                     
                     master_url = f"{R2_PUBLIC_URL}/{quote(s3_prefix, safe='/')}/master.m3u8"
-                    await edit_msg(msg, f"✅ **HLS Uploaded to R2!**\n\n🎬 `{project_name}`\n📺 **Stream Link:**\n`{master_url}`", link_preview=False)
+                    await msg.edit(f"✅ **HLS Uploaded to R2!**\n\n🎬 `{project_name}`\n📺 **Stream Link:**\n`{master_url}`", link_preview=False)
 
                 else:
                     r2_url, code = await upload_to_r2(final_path, msg, target_folder)
-                    await edit_msg(msg, f"✅ **Leeched & Uploaded!**\n\n🎬 `{filename}`\n🔗 `{r2_url}`", buttons=[[Button.inline("🗑️ Delete from R2", data=f"delr2_{code}")]], link_preview=False)
+                    await msg.edit(f"✅ **Leeched & Uploaded!**\n\n🎬 `{filename}`\n🔗 `{r2_url}`", buttons=[[Button.inline("🗑️ Delete from R2", data=f"delr2_{code}")]], link_preview=False)
 
-            except Exception as e: await edit_msg(msg, f"❌ Error: {e}")
+            except Exception as e: await msg.edit(f"❌ Error: {e}")
             finally:
                 shutil.rmtree(workspace, ignore_errors=True)
                 free_memory()
-
-# 🚀 FIX: INDESTRUCTIBLE TELEGRAM UPLOADER
-async def fast_upload(client, file_path, msg, filename):
-    file_size = os.path.getsize(file_path)
-    part_size = 512 * 1024
-    total_parts = math.ceil(file_size / part_size)
-    file_id = random.getrandbits(63)
-    start_time = time.time()
-    uploaded_bytes = 0
-    sem = asyncio.Semaphore(10) 
-
-    async def upload_part(idx):
-        nonlocal uploaded_bytes
-        async with sem:
-            with open(file_path, 'rb') as f:
-                f.seek(idx * part_size)
-                chunk = f.read(part_size)
-            
-            retries = 0
-            while retries < 5:
-                try:
-                    if file_size > 10 * 1024 * 1024: await client(SaveBigFilePartRequest(file_id, idx, total_parts, chunk))
-                    else: await client(SaveFilePartRequest(file_id, idx, chunk))
-                    uploaded_bytes += len(chunk)
-                    break
-                except Exception as e:
-                    retries += 1
-                    if retries >= 5: raise e
-                    await asyncio.sleep(2)
-
-    tasks = [upload_part(i) for i in range(total_parts)]
-    async def updater():
-        while uploaded_bytes < file_size:
-            await asyncio.sleep(4)
-            await edit_msg(msg, get_status_text("Uploading to TG", filename, uploaded_bytes, file_size, start_time))
-    
-    u_task = asyncio.create_task(updater())
-    await asyncio.gather(*tasks)
-    u_task.cancel()
-    return InputFileBig(file_id, total_parts, filename) if file_size > 10*1024*1024 else InputFile(file_id, total_parts, filename, '')
 
 @client.on(events.CallbackQuery)
 async def on_callback(event):
@@ -873,7 +833,8 @@ async def on_callback(event):
                 try: item['process'].terminate()
                 except: pass
             await event.answer("Task cancelled.", alert=True)
-            await edit_msg(event, "🛑 **Task Cancelled.**")
+            try: await event.edit("🛑 **Task Cancelled.**")
+            except: pass
         return
 
     if data.startswith("delr2_"):
@@ -883,8 +844,8 @@ async def on_callback(event):
             await event.answer("Deleting...", alert=False)
             try:
                 await asyncio.to_thread(sync_delete_r2_file, item['s3_key'])
-                await edit_msg(event, f"🗑️ **File Deleted from R2!**\nKey: `{item['s3_key']}`")
-            except Exception as e: await edit_msg(event, f"❌ Delete Error: {e}")
+                await event.edit(f"🗑️ **File Deleted from R2!**\nKey: `{item['s3_key']}`")
+            except Exception as e: await event.edit(f"❌ Delete Error: {e}")
         return
 
     if data.startswith("link_"):
@@ -906,7 +867,7 @@ async def on_callback(event):
         async with global_semaphore:
             workspace = f"dl_{uuid.uuid4().hex[:8]}"
             os.makedirs(workspace, exist_ok=True)
-            filename = clean_double_extension(re.sub(r'[\\/*?:"<>|]', "", tg_msg.file.name or "video.mp4"))
+            filename = get_unique_filename(clean_double_extension(re.sub(r'[\\/*?:"<>|]', "", tg_msg.file.name or "video.mp4")))
             file_path = os.path.join(workspace, filename)
             
             status = await event.respond(f"⬇️ Downloading from Telegram...")
@@ -916,10 +877,10 @@ async def on_callback(event):
                     async for chunk in client.iter_download(tg_msg.media, request_size=1048576):
                         f.write(chunk)
                         if f.tell() % (10 * 1024 * 1024) == 0: 
-                            await edit_msg(status, get_status_text("TG Down", filename, f.tell(), tg_msg.file.size, start_t))
+                            await status.edit(get_status_text("TG Down", filename, f.tell(), tg_msg.file.size, start_t))
                 
                 if filename.lower().endswith('.zip'):
-                    await edit_msg(status, "📦 **Extracting HLS ZIP Archive...**")
+                    await status.edit("📦 **Extracting HLS ZIP Archive...**")
                     extract_dir = os.path.join(workspace, "extracted"); os.makedirs(extract_dir, exist_ok=True)
                     await asyncio.to_thread(lambda: zipfile.ZipFile(file_path, 'r').extractall(extract_dir))
                     os.remove(file_path)
@@ -929,19 +890,19 @@ async def on_callback(event):
                     s_dir = os.path.join(extract_dir, items[0]) if len(items)==1 and os.path.isdir(os.path.join(extract_dir, items[0])) else extract_dir
                     s_pref = items[0] if len(items)==1 and os.path.isdir(os.path.join(extract_dir, items[0])) else proj
                     
-                    await edit_msg(status, f"⬆️ **Uploading HLS...**\n📂 `{s_pref}`")
+                    await status.edit(f"⬆️ **Uploading HLS...**\n📂 `{s_pref}`")
                     await asyncio.to_thread(sync_r2_upload_folder, s_dir, s_pref, asyncio.get_running_loop(), status, time.time())
                     m_url = f"{R2_PUBLIC_URL}/{quote(s_pref, safe='/')}/master.m3u8"
-                    await edit_msg(status, f"✅ **HLS Uploaded!**\n🎬 `{proj}`\n📺 **Stream Link:**\n`{m_url}`", link_preview=False)
+                    await status.edit(f"✅ **HLS Uploaded!**\n🎬 `{proj}`\n📺 **Stream Link:**\n`{m_url}`", link_preview=False)
                 else:
                     r2_url, code = await upload_to_r2(file_path, status)
-                    await edit_msg(status, f"✅ **Cloudflare R2 Complete!**\n🎬 `{filename}`\n🔗 `{r2_url}`", buttons=[[Button.inline("🗑️ Delete from R2", data=f"delr2_{code}")]], link_preview=False)
-            except Exception as e: await edit_msg(status, f"❌ Error: {e}")
+                    await status.edit(f"✅ **Cloudflare R2 Complete!**\n🎬 `{filename}`\n🔗 `{r2_url}`", buttons=[[Button.inline("🗑️ Delete from R2", data=f"delr2_{code}")]], link_preview=False)
+            except Exception as e: await status.edit(f"❌ Error: {e}")
             finally:
                 shutil.rmtree(workspace, ignore_errors=True)
                 free_memory()
 
-# --- 7. STARTUP ---
+# --- 11. STARTUP ---
 async def main():
     app = web.Application()
     app.add_routes(routes)
