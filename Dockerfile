@@ -1,41 +1,30 @@
 FROM python:3.12-slim
 
+# Install system dependencies (aria2, ffmpeg, curl for health checks)
+RUN apt-get update && apt-get install -y \
+    aria2 \
+    ffmpeg \
+    wget \
+    curl \
+    procps \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
-# Install system dependencies
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-        ffmpeg \
-        wget \
-        ca-certificates \
-        unzip \
-        tar \
-        aria2 \
-        curl && \
-    rm -rf /var/lib/apt/lists/* && \
-    apt-get clean
-
-# Install aria2c if not available
-RUN if ! command -v aria2c &> /dev/null; then \
-        wget -q https://github.com/aria2/aria2/releases/download/release-1.37.0/aria2-1.37.0-linux-gnu-64bit-build1.tar.bz2 && \
-        tar -xjf aria2-1.37.0-linux-gnu-64bit-build1.tar.bz2 && \
-        mv aria2-1.37.0-linux-gnu-64bit-build1/aria2c /usr/local/bin/ && \
-        chmod +x /usr/local/bin/aria2c && \
-        rm -rf aria2-1.37.0-linux-gnu-64bit-build1* ; \
-    fi
-
+# Install Python requirements
 COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
-
+# Copy application files
 COPY . .
 
-ENV PYTHONUNBUFFERED=1
-ENV PYTHONDONTWRITEBYTECODE=1
+# Expose Koyeb's expected port
+ENV PORT=8000
+EXPOSE 8000
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+# Docker Healthcheck (Pings the /health route in main.py)
+HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
 
+# Start the bot
 CMD ["python", "main.py"]
