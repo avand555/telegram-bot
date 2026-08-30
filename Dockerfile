@@ -1,25 +1,23 @@
-FROM python:3.10-slim
-
-# Install core Linux tools natively
-RUN apt-get update && apt-get install -y \
-    aria2 \
-    ffmpeg \
-    wget \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
+FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install Python requirements
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        ffmpeg \
+        wget \
+        ca-certificates \
+        unzip \
+        tar && \
+    rm -rf /var/lib/apt/lists/*
 
-# Copy your bot code
+COPY requirements.txt .
+
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
+
 COPY . .
 
-# Expose Port for Koyeb Health Checks
-ENV PORT=8000
-EXPOSE 8000
+ENV PYTHONUNBUFFERED=1
 
-# Start the Bot
-CMD ["python", "main.py"]
+CMD ["python", "bot.py"]
