@@ -343,37 +343,41 @@ def extract_gdrive_id(url):
     return match.group(1) if match else None
 
 async def get_gdrive_stream(session, file_id):
-    # Added a real User-Agent to prevent Google from blocking the request
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36'
-    }
-    base_url = "https://drive.google.com/uc?export=download"
-    params = {'id': file_id}
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36'}
+    base_url = f"https://drive.google.com/uc?export=download&id={file_id}"
     
-    resp = await session.get(base_url, params=params, headers=headers, allow_redirects=True)
+    resp = await session.get(base_url, headers=headers, allow_redirects=True)
     
-    # If Google shows the "Large File Warning" page
     if "text/html" in resp.headers.get("Content-Type", ""):
         text = await resp.text()
+        resp.close()
+        
+        # Google's new warning page has an explicit URL with 'confirm' and often 'uuid'
+        # We look for href="..." or action="..." containing confirm=
+        match = re.search(r'(?:href|action)="([^"]+confirm=[^"]+)"', text)
+        if match:
+            # Clean up HTML entities and build the final download link
+            next_url = match.group(1).replace('&amp;', '&')
+            if next_url.startswith('/'):
+                next_url = "https://drive.google.com" + next_url
+            return await session.get(next_url, headers=headers, allow_redirects=True)
+            
+        # If no button is found, check cookies for download_warning token
+        cookies = session.cookie_jar.filter_cookies(resp.url)
         confirm_token = None
-        # Look for the confirmation code in the HTML
-        token_match = re.search(r'confirm=([a-zA-Z0-9_-]+)', text)
-        if token_match: 
-            confirm_token = token_match.group(1)
-        else:
-            # Check cookies for the warning bypass
-            for k, v in resp.cookies.items():
-                if k.startswith('download_warning'):
-                    confirm_token = v.value
-                    break
+        for k, v in cookies.items():
+            if k.startswith('download_warning'):
+                confirm_token = v.value
+                break
         
         if confirm_token:
-            resp.close()
-            params['confirm'] = confirm_token
-            return await session.get(base_url, params=params, headers=headers, allow_redirects=True)
+            return await session.get(f"{base_url}&confirm={confirm_token}", headers=headers, allow_redirects=True)
             
+        # If all bypasses fail (e.g., file is Private or Quota Exceeded)
+        # Return a fresh request to let download_direct throw the proper error
+        return await session.get(base_url, headers=headers, allow_redirects=True)
+        
     return resp
-
 async def download_direct(url, workspace, msg, start_t, custom_name=None, gdrive_id=None):
     async with ClientSession() as sess:
         if gdrive_id:
@@ -640,8 +644,9 @@ async def master_handler(event):
                         r2_url, code = await upload_to_r2(final_path, msg, target_folder)
                         await msg.edit(f"✅ **Leeched & Uploaded!**\n\n🎬 `{filename}`\n🔗 `{r2_url}`", buttons=[[Button.inline("🗑️ Delete from R2", data=f"delr2_{code}")]], link_preview=False)
 
-                except Exception as e: 
-                    await msg.edit(f"❌ Error with link `{url[:30]}`:\n{e}")
+except Exception as e: 
+                    # Truncating to 70 chars instead of 30 so you can actually see the ID
+                    await msg.edit(f"❌ **Error with link:**\n`{url[:70]}...`\n\n**Reason:** {e}")
                 finally:
                     shutil.rmtree(workspace, ignore_errors=True)
                     free_memory()
