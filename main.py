@@ -30,6 +30,7 @@ mimetypes.add_type("video/mp2t", ".ts")
 # ============================================================
 from telethon import TelegramClient, events, Button
 from telethon.network import ConnectionTcpFull
+from telethon.errors import FloodWaitError
 from telethon.tl.functions.upload import (
     SaveBigFilePartRequest,
     SaveFilePartRequest,
@@ -85,6 +86,11 @@ R2_PUBLIC_URL = required_env("R2_PUBLIC_URL").rstrip("/")
 DASHBOARD_USER = os.environ.get("DASHBOARD_USER", "admin").strip()
 DASHBOARD_PASS = os.environ.get("DASHBOARD_PASS", "admin123").strip()
 
+if DASHBOARD_USER == "admin":
+    print("⚠️ SECURITY WARNING: Using default DASHBOARD_USER='admin'. Please set a custom DASHBOARD_USER.")
+if DASHBOARD_PASS == "admin123":
+    print("⚠️ SECURITY WARNING: Using default DASHBOARD_PASS='admin123'. Please set a strong DASHBOARD_PASS.")
+
 # Koyeb
 PORT = int(os.environ.get("PORT", "8000"))
 KOYEB_PUBLIC_URL = os.environ.get("KOYEB_PUBLIC_URL", "").strip().rstrip("/")
@@ -120,29 +126,41 @@ client = TelegramClient(
 # ============================================================
 
 def force_system_ram_purge():
-    try: gc.collect()
-    except: pass
+    try:
+        gc.collect()
+    except Exception:
+        pass
     try:
         import ctypes
         libc = ctypes.CDLL("libc.so.6")
         libc.malloc_trim(0)
-    except: pass
+    except Exception:
+        pass
 
 def free_memory():
     force_system_ram_purge()
 
 def human_size(value):
-    try: value = float(value)
-    except Exception: return "0 B"
+    try:
+        value = float(value)
+    except Exception:
+        return "0 B"
     for unit in ["B", "KB", "MB", "GB", "TB"]:
-        if value < 1024: return f"{value:.2f} {unit}"
+        if value < 1024:
+            return f"{value:.2f} {unit}"
         value /= 1024
     return f"{value:.2f} PB"
 
 def get_status_text(action, filename, current, total, start_time):
     elapsed = max(time.time() - start_time, 0.001)
-    current = int(current) if current else 0
-    total = int(total) if total else 0
+    try:
+        current = int(current)
+    except Exception:
+        current = 0
+    try:
+        total = int(total)
+    except Exception:
+        total = 0
     percent = (current / total) * 100 if total else 0
     speed = current / elapsed
     blocks = min(10, int(percent // 10))
@@ -189,8 +207,10 @@ def get_largest_file(folder_path):
     for root, _, files in os.walk(folder_path):
         for filename in files:
             path = os.path.join(root, filename)
-            try: size = os.path.getsize(path)
-            except OSError: continue
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                continue
             if size > max_size:
                 max_size = size
                 largest = path
@@ -210,68 +230,103 @@ def sanitize_filename(filename):
 
 def get_unique_filename(filepath):
     filepath = clean_double_extension(filepath)
-    if not os.path.exists(filepath): return filepath
+    if not os.path.exists(filepath):
+        return filepath
     base, ext = os.path.splitext(filepath)
     counter = 1
-    while os.path.exists(f"{base}_{counter}{ext}"): counter += 1
+    while os.path.exists(f"{base}_{counter}{ext}"):
+        counter += 1
     return f"{base}_{counter}{ext}"
 
 # ============================================================
-# 3. R2 CLIENT
+# 3. R2
 # ============================================================
 
 def get_r2_client():
     account_id = R2_ACCOUNT_ID.strip()
+    # Clean account ID - remove any URL prefixes if mistakenly provided
     if "://" in account_id:
         account_id = account_id.split("://")[-1].split(".")[0].split("/")[0]
+    
     endpoint = f"https://{account_id}.r2.cloudflarestorage.com"
-    r2_config = Config(region_name="auto", signature_version="s3v4", retries={"max_attempts": 10, "mode": "adaptive"}, connect_timeout=30, read_timeout=300)
-    return boto3.client("s3", endpoint_url=endpoint, aws_access_key_id=R2_ACCESS_KEY_ID, aws_secret_access_key=R2_SECRET_ACCESS_KEY, config=r2_config)
+    
+    r2_config = Config(
+        region_name="auto",
+        signature_version="s3v4",
+        retries={"max_attempts": 10, "mode": "adaptive"},
+        connect_timeout=30,
+        read_timeout=300,
+    )
+    
+    return boto3.client(
+        "s3",
+        endpoint_url=endpoint,
+        aws_access_key_id=R2_ACCESS_KEY_ID,
+        aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+        config=r2_config,
+    )
 
 def sync_get_smart_dashboard_data(prefix=""):
     s3 = get_r2_client()
     paginator = s3.get_paginator("list_objects_v2")
     pages = paginator.paginate(Bucket=R2_BUCKET_NAME, Prefix=prefix, Delimiter="/")
     
-    all_objects, common_prefixes = [], []
+    all_objects = []
+    common_prefixes = []
     for page in pages:
-        if "Contents" in page: all_objects.extend(page["Contents"])
-        if "CommonPrefixes" in page: common_prefixes.extend(page["CommonPrefixes"])
+        if "Contents" in page:
+            all_objects.extend(page["Contents"])
+        if "CommonPrefixes" in page:
+            common_prefixes.extend(page["CommonPrefixes"])
             
     hls_bases = set()
     for obj in all_objects:
         key = obj["Key"]
-        if key.endswith("master.m3u8"): hls_bases.add(os.path.dirname(key))
+        if key.endswith("master.m3u8"):
+            hls_bases.add(os.path.dirname(key))
             
     hls_packages = {}
     for base in hls_bases:
         hls_packages[base] = {"name": base, "size": 0, "date": None, "type": "HLS", "url_key": f"{base}/master.m3u8"}
         
     standalone_files = []
-    total_size, mp4_count = 0, 0
+    total_size = 0
+    mp4_count = 0
     sorted_bases = sorted(list(hls_bases), key=len, reverse=True)
     
     for obj in all_objects:
-        key, size, date = obj["Key"], obj["Size"], obj["LastModified"]
+        key = obj["Key"]
+        size = obj["Size"]
+        date = obj["LastModified"]
         total_size += size
-        if key.endswith("/") and size == 0: continue
+        if key.endswith("/") and size == 0:
+            continue
             
         is_hls_part = False
         for base in sorted_bases:
             if key.startswith(base + "/") or key == base:
                 hls_packages[base]["size"] += size
                 current_date = hls_packages[base]["date"]
-                if current_date is None or date > current_date: hls_packages[base]["date"] = date
+                if current_date is None or date > current_date:
+                    hls_packages[base]["date"] = date
                 is_hls_part = True
                 break
                 
         if not is_hls_part and not key.endswith("/"):
             standalone_files.append({"name": key, "size": size, "date": date, "type": "FILE", "url_key": key})
-            if key.lower().endswith(".mp4"): mp4_count += 1
+            if key.lower().endswith(".mp4"):
+                mp4_count += 1
                 
     items = list(hls_packages.values()) + standalone_files
     items.sort(key=lambda x: (x["date"] if x["date"] else datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)), reverse=True)
-    return {"total_size": total_size, "mp4_count": mp4_count, "hls_count": len(hls_packages), "items": items, "common_prefixes": common_prefixes}
+    
+    return {
+        "total_size": total_size,
+        "mp4_count": mp4_count,
+        "hls_count": len(hls_packages),
+        "items": items,
+        "common_prefixes": common_prefixes,
+    }
 
 def sync_delete_r2_file(s3_key):
     s3 = get_r2_client()
@@ -294,7 +349,8 @@ def sync_rename_r2_file(old_key, new_key):
 
 def sync_rename_r2_folder(old_prefix, new_prefix):
     s3 = get_r2_client()
-    old_prefix, new_prefix = old_prefix.rstrip("/") + "/", new_prefix.rstrip("/") + "/"
+    old_prefix = old_prefix.rstrip("/") + "/"
+    new_prefix = new_prefix.rstrip("/") + "/"
     paginator = s3.get_paginator("list_objects_v2")
     for page in paginator.paginate(Bucket=R2_BUCKET_NAME, Prefix=old_prefix):
         for obj in page.get("Contents", []):
@@ -311,13 +367,19 @@ def sync_r2_upload(file_path, s3_key, loop, msg, start_t):
     mime_type = mime_type or "application/octet-stream"
     
     class ProgressCallback:
-        def __init__(self): self.seen = 0; self.last = 0
+        def __init__(self):
+            self.seen = 0
+            self.last = 0
         def __call__(self, amount):
             self.seen += amount
             if time.time() - self.last < 4: return
             self.last = time.time()
-            try: asyncio.run_coroutine_threadsafe(msg.edit(get_status_text("R2 Uploading", filename, self.seen, file_size, start_t)), loop)
-            except Exception: pass
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    msg.edit(get_status_text("R2 Uploading", filename, self.seen, file_size, start_t)), loop
+                )
+            except Exception:
+                pass
                 
     extra_args = {"ContentType": mime_type}
     if not filename.lower().endswith((".m3u8", ".ts")):
@@ -333,20 +395,29 @@ def sync_r2_upload_folder(folder_path, s3_prefix, loop, msg, start_t):
     for root, _, filenames in os.walk(folder_path):
         for filename in filenames:
             path = os.path.join(root, filename)
-            try: size = os.path.getsize(path)
-            except OSError: continue
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                continue
             files.append(path)
             total_size += size
             
     class ProgressCallback:
-        def __init__(self): self.seen = 0; self.last = 0; self.lock = threading.Lock()
+        def __init__(self):
+            self.seen = 0
+            self.last = 0
+            self.lock = threading.Lock()
         def __call__(self, amount):
             with self.lock:
                 self.seen += amount
                 if time.time() - self.last < 4: return
                 self.last = time.time()
-                try: asyncio.run_coroutine_threadsafe(msg.edit(get_status_text("R2 HLS Sync", s3_prefix, self.seen, total_size, start_t)), loop)
-                except Exception: pass
+                try:
+                    asyncio.run_coroutine_threadsafe(
+                        msg.edit(get_status_text("R2 HLS Sync", s3_prefix, self.seen, total_size, start_t)), loop
+                    )
+                except Exception:
+                    pass
                     
     callback = ProgressCallback()
     def upload_one(path):
@@ -355,7 +426,8 @@ def sync_r2_upload_folder(folder_path, s3_prefix, loop, msg, start_t):
         content_type, _ = mimetypes.guess_type(path)
         extra_args = {"ContentType": content_type or "application/octet-stream"}
         ext = os.path.splitext(path)[1].lower()
-        if ext not in [".m3u8", ".ts"]: extra_args["ContentDisposition"] = "inline"
+        if ext not in [".m3u8", ".ts"]:
+            extra_args["ContentDisposition"] = "inline"
         s3.upload_file(path, R2_BUCKET_NAME, s3_key, Callback=callback, ExtraArgs=extra_args)
         
     with ThreadPoolExecutor(max_workers=10) as executor:
@@ -366,7 +438,8 @@ async def upload_to_r2(file_path, msg, target_folder=None):
     loop = asyncio.get_running_loop()
     basename = os.path.basename(file_path)
     
-    if target_folder: s3_key = f"{target_folder.strip('/')}/{basename}"
+    if target_folder:
+        s3_key = f"{target_folder.strip('/')}/{basename}"
     else:
         now = datetime.datetime.now()
         s3_key = f"{now.year}/{now.month:02d}/{now.day:02d}/{basename}"
@@ -395,7 +468,9 @@ def get_aria2_executable():
         subprocess.run(["apt-get", "update"], check=True, capture_output=True, timeout=60)
         subprocess.run(["apt-get", "install", "-y", "aria2"], check=True, capture_output=True, timeout=120)
         system_aria = shutil.which("aria2c")
-        if system_aria: return system_aria
+        if system_aria:
+            print("✅ aria2c installed successfully via apt")
+            return system_aria
     except Exception as apt_error:
         print(f"⚠️ apt installation failed: {apt_error}")
         try:
@@ -407,16 +482,25 @@ def get_aria2_executable():
                 aria_url = "https://github.com/aria2/aria2/releases/download/release-1.37.0/aria2-1.37.0-linux-gnu-32bit-build1.tar.bz2"
             
             subprocess.run(
-                f"wget -q {aria_url} -O aria2.tar.bz2 && tar -xjf aria2.tar.bz2 && mv aria2-1.37.0-linux-gnu-*/aria2c ./aria2c && chmod +x ./aria2c && rm -rf aria2.tar.bz2 aria2-1.37.0-linux-gnu-*",
+                f"wget -q {aria_url} -O aria2.tar.bz2 && "
+                "tar -xjf aria2.tar.bz2 && "
+                "mv aria2-1.37.0-linux-gnu-*/aria2c ./aria2c && "
+                "chmod +x ./aria2c && "
+                "rm -rf aria2.tar.bz2 aria2-1.37.0-linux-gnu-*",
                 shell=True, check=True, timeout=180
             )
-            if os.path.exists(local): return local
-        except Exception: return None
+            if os.path.exists(local):
+                print("✅ aria2c downloaded successfully")
+                return local
+        except Exception as download_error:
+            print(f"❌ aria2c installation failed: {download_error}")
+            return None
     return shutil.which("aria2c")
 
 async def download_magnet(url, workspace, custom_name, msg, start_t):
     aria2 = get_aria2_executable()
-    if not aria2: raise RuntimeError("aria2c is not available.")
+    if not aria2:
+        raise RuntimeError("aria2c is not available. Cannot download magnet links.")
         
     cmd = [
         aria2, "--seed-time=0", "--max-connection-per-server=16", "--split=16",
@@ -442,24 +526,32 @@ async def download_magnet(url, workspace, custom_name, msg, start_t):
             active_file = "Fetching Metadata..."
             for _, _, files in os.walk(workspace):
                 for filename in files:
-                    if not filename.endswith(".aria2"): active_file = filename; break
+                    if not filename.endswith(".aria2"):
+                        active_file = filename
+                        break
                         
             p_text = format_saas_progress("Download", active_file, int(match.group("percent") or 0), match.group("downloaded"), match.group("total"), match.group("speed") + "/s", match.group("eta") or "Calc...", match.group("cn"), elapsed, task_code)
             try:
                 await msg.edit(p_text, buttons=[[Button.inline("❌ Cancel", data=f"canceltask_{task_code}")]])
                 last_update = time.time()
-            except Exception: pass
+            except Exception:
+                pass
                 
     await process.wait()
     active_tasks.pop(task_code, None)
+    
+    if process.returncode not in (0, None):
+        raise RuntimeError(f"aria2c failed with exit code {process.returncode}")
         
     largest = get_largest_file(workspace)
-    if not largest: raise ValueError("Torrent failed: no downloaded file.")
+    if not largest:
+        raise ValueError("Torrent failed: no downloaded file.")
         
     target = custom_name or os.path.basename(largest)
     final_name = get_unique_filename(os.path.join(workspace, sanitize_filename(target)))
     
-    if os.path.abspath(largest) != os.path.abspath(final_name): shutil.move(largest, final_name)
+    if os.path.abspath(largest) != os.path.abspath(final_name):
+        shutil.move(largest, final_name)
     return final_name
 
 # ============================================================
@@ -467,8 +559,10 @@ async def download_magnet(url, workspace, custom_name, msg, start_t):
 # ============================================================
 
 def sync_yt_dlp_download(url, workspace, custom_name=None):
-    if custom_name: output = os.path.join(workspace, sanitize_filename(custom_name))
-    else: output = os.path.join(workspace, "%(title)s.%(ext)s")
+    if custom_name:
+        output = os.path.join(workspace, sanitize_filename(custom_name))
+    else:
+        output = os.path.join(workspace, "%(title)s.%(ext)s")
         
     ydl_opts = {
         "outtmpl": output, "quiet": True, "no_warnings": True, "nocheckcertificate": True,
@@ -519,19 +613,23 @@ async def gdrive_request(session, file_id):
                 allow_redirects=True, timeout=ClientTimeout(total=300)
             ) as response:
                 content_type = response.headers.get("Content-Type", "").lower()
-                if response.status == 200 and "text/html" not in content_type: return response
+                if response.status == 200 and "text/html" not in content_type:
+                    return response
                 
                 html_content = await response.text(errors="ignore")
+                
                 confirm_token = None
                 token_patterns = [r'name="confirm"\s+value="([^"]+)"', r'confirm=([a-zA-Z0-9_-]{10,})', r'"confirm"\s*:\s*"([^"]+)"']
                 for pattern in token_patterns:
                     match = re.search(pattern, html_content, re.IGNORECASE)
-                    if match: confirm_token = match.group(1); break
+                    if match:
+                        confirm_token = match.group(1)
+                        break
                 
                 if "quota" in html_content.lower() or "too many users" in html_content.lower():
-                    raise RuntimeError("Google Drive quota exceeded. Try later.")
+                    raise RuntimeError("Google Drive download quota exceeded. Try again later.")
                 if "permission" in html_content.lower() or "request access" in html_content.lower():
-                    raise RuntimeError("Google Drive file is not public.")
+                    raise RuntimeError("Google Drive file is not publicly accessible.")
                 
                 if confirm_token:
                     params_with_confirm = request_config["params"].copy()
@@ -544,12 +642,14 @@ async def gdrive_request(session, file_id):
                         content_type = confirm_response.headers.get("Content-Type", "").lower()
                         if confirm_response.status == 200 and "text/html" not in content_type:
                             return confirm_response
+                        
                         error_text = await confirm_response.text(errors="ignore")
                         if "virus scan" in error_text.lower():
-                            raise RuntimeError("Google Drive requires virus scan confirmation.")
+                            raise RuntimeError("Google Drive requires virus scan confirmation. File is too large for automatic download.")
+                
                 last_error = RuntimeError("Google Drive returned HTML instead of file")
         except asyncio.TimeoutError:
-            last_error = RuntimeError(f"Google Drive request timed out")
+            last_error = RuntimeError(f"Google Drive request timed out (attempt {attempt})")
             continue
         except aiohttp.ClientError as e:
             last_error = RuntimeError(f"Google Drive connection error: {str(e)}")
@@ -557,7 +657,8 @@ async def gdrive_request(session, file_id):
         except Exception as e:
             last_error = RuntimeError(f"Google Drive error: {str(e)}")
             continue
-    raise last_error or RuntimeError("Google Drive download failed")
+            
+    raise last_error or RuntimeError("Google Drive download failed after all attempts")
 
 async def get_gdrive_stream(session, file_id):
     return await gdrive_request(session, file_id)
@@ -583,14 +684,17 @@ async def download_direct(url, workspace, msg, start_t, custom_name=None, gdrive
                         url, allow_redirects=True,
                         headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36"}
                     )
-                    if response.status < 400: break
+                    if response.status < 400:
+                        break
                     await close_response(response)
                     last_error = RuntimeError(f"HTTP {response.status}")
                 except Exception as e:
                     last_error = e
-                    if attempt < max_retries - 1: await asyncio.sleep(2 ** attempt)
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(2 ** attempt)
                     continue
-            else: raise last_error or RuntimeError("Download failed after retries")
+            else:
+                raise last_error or RuntimeError("Download failed after retries")
             
             content_type = response.headers.get("Content-Type", "").lower()
             if "text/html" in content_type:
@@ -598,24 +702,30 @@ async def download_direct(url, workspace, msg, start_t, custom_name=None, gdrive
                 raise ValueError("HTML webpage detected. This is not a direct file URL.")
 
         content_length = response.headers.get("Content-Length")
-        try: file_size = int(content_length) if content_length else 0
-        except Exception: file_size = 0
+        try:
+            file_size = int(content_length) if content_length else 0
+        except Exception:
+            file_size = 0
 
         filename = sanitize_filename(custom_name) if custom_name else None
         if not filename:
             content_disposition = response.headers.get("Content-Disposition", "")
             match = re.search(r"filename\*=UTF-8''([^;]+)", content_disposition, re.IGNORECASE)
-            if match: filename = sanitize_filename(match.group(1))
+            if match:
+                filename = sanitize_filename(match.group(1))
             if not filename:
                 match = re.search(r'filename="?([^";]+)"?', content_disposition, re.IGNORECASE)
-                if match: filename = sanitize_filename(match.group(1))
+                if match:
+                    filename = sanitize_filename(match.group(1))
         
         if not filename and not gdrive_id:
             parsed = urlparse(url)
             filename = sanitize_filename(os.path.basename(unquote(parsed.path)))
         
-        if not filename: filename = "download.bin"
-        if "." not in filename: filename += ".mp4"
+        if not filename:
+            filename = "download.bin"
+        if "." not in filename:
+            filename += ".mp4"
             
         file_path = os.path.join(workspace, filename)
         file_path = get_unique_filename(file_path)
@@ -632,14 +742,19 @@ async def download_direct(url, workspace, msg, start_t, custom_name=None, gdrive
                     file.write(chunk)
                     downloaded += len(chunk)
                     if time.time() - last_update >= 4:
-                        try: await msg.edit(get_status_text("Leeching", os.path.basename(file_path), downloaded, file_size, start_t))
-                        except Exception: pass
+                        try:
+                            await msg.edit(get_status_text("Leeching", os.path.basename(file_path), downloaded, file_size, start_t))
+                        except Exception:
+                            pass
                         last_update = time.time()
         finally:
             await close_response(response)
             
-        if not os.path.exists(file_path): raise RuntimeError("Download produced no file.")
-        if os.path.getsize(file_path) <= 0:
+        if not os.path.exists(file_path):
+            raise RuntimeError("Download produced no file.")
+            
+        actual_size = os.path.getsize(file_path)
+        if actual_size <= 0:
             try: os.remove(file_path)
             except Exception: pass
             raise RuntimeError("Downloaded file is empty.")
@@ -667,23 +782,30 @@ async def download_any_url(url, workspace, custom_name, msg, start_t):
         filename = await asyncio.to_thread(sync_yt_dlp_download, url, workspace, custom_name)
         if filename and os.path.exists(filename) and os.path.getsize(filename) > 0:
             return filename
-    except Exception: pass
+    except Exception:
+        pass
         
     return await download_direct(url, workspace, msg, start_t, custom_name)
 
 # ============================================================
-# 9. DASHBOARD AUTH & RES
+# 9. DASHBOARD AUTH
 # ============================================================
 
 def check_dashboard_auth(request):
     auth_header = request.headers.get("Authorization")
-    if not auth_header or not auth_header.startswith("Basic "): return False
+    if not auth_header or not auth_header.startswith("Basic "):
+        return False
     try:
         encoded = auth_header.split(" ", 1)[1]
         decoded = base64.b64decode(encoded).decode("utf-8")
         user, password = decoded.split(":", 1)
         return user == DASHBOARD_USER and password == DASHBOARD_PASS
-    except Exception: return False
+    except Exception:
+        return False
+
+# ============================================================
+# 10. DASHBOARD CSS / JS
+# ============================================================
 
 DASHBOARD_CSS = """
 :root { --bg: #0f172a; --card: #1e293b; --text: #f8fafc; --muted: #94a3b8; --accent: #38bdf8; --border: #334155; }
@@ -770,6 +892,10 @@ function sortTable(colIndex, type) {
 }
 """
 
+# ============================================================
+# 11. DASHBOARD
+# ============================================================
+
 @routes.get("/dashboard")
 async def dashboard_handler(request):
     if not check_dashboard_auth(request):
@@ -792,7 +918,8 @@ async def dashboard_handler(request):
         for pref in data.get("common_prefixes", []):
             folder_path = pref["Prefix"]
             folder_name = folder_path.rstrip("/").split("/")[-1]
-            file_rows += f"""<tr>
+            file_rows += f"""
+<tr>
 <td data-val="{html.escape(folder_name)}"><a href="/dashboard?prefix={quote(folder_path)}" class="folder-link">📁 <span class="file-name">{html.escape(folder_name)}</span></a></td>
 <td data-val="0">-</td><td data-val="0">Folder</td>
 <td><div class="actions">
@@ -814,19 +941,23 @@ async def dashboard_handler(request):
             url = f"{R2_PUBLIC_URL}/{quote(item['url_key'], safe='/')}"
             safe_name = html.escape(display_name)
             
-            actions = f"""<button class="btn btn-copy" onclick="copyText('{html.escape(url)}')">🔗 Copy {'Master.m3u8' if item_type == 'HLS' else 'URL'}</button>
+            actions = f"""
+<button class="btn btn-copy" onclick="copyText('{html.escape(url)}')">🔗 Copy {'Master.m3u8' if item_type == 'HLS' else 'URL'}</button>
 <a href="{html.escape(url)}" target="_blank" class="btn btn-view">▶️ {'Play' if item_type == 'HLS' else 'Open'}</a>
 <button class="btn btn-move" onclick="moveItem('{quote(name)}', {str(item_type == 'HLS').lower()}, '{quote(prefix)}')">📁 Move</button>
 <button class="btn btn-rename" onclick="renameItem('{quote(name)}', {str(item_type == 'HLS').lower()}, '{quote(prefix)}')">✏️ Rename</button>
-<button class="btn btn-delete" onclick="deleteItem('{quote(name)}', {str(item_type == 'HLS').lower()}, '{quote(prefix)}')">🗑️ Delete</button>"""
-            file_rows += f"""<tr>
+<button class="btn btn-delete" onclick="deleteItem('{quote(name)}', {str(item_type == 'HLS').lower()}, '{quote(prefix)}')">🗑️ Delete</button>
+"""
+            file_rows += f"""
+<tr>
 <td data-val="{safe_name}">{'📦' if item_type == 'HLS' else '🎬'} <span class="file-name">{'<b>' + safe_name + '</b> (HLS)' if item_type == 'HLS' else safe_name}</span></td>
 <td data-val="{size}">{size_str}</td>
 <td data-val="{date_val}">{date_str}</td>
 <td><div class="actions">{actions}</div></td>
 </tr>"""
             
-        if not file_rows: file_rows = '<tr><td colspan="4" style="text-align:center;">Directory is empty.</td></tr>'
+        if not file_rows:
+            file_rows = '<tr><td colspan="4" style="text-align:center;">Directory is empty.</td></tr>'
             
         html_page = f"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Cloudflare Studio</title>
 <style>{DASHBOARD_CSS}</style><script>{DASHBOARD_JS}</script></head><body><div class="container">
@@ -842,7 +973,12 @@ async def dashboard_handler(request):
 <div class="table-wrapper"><table><thead><tr><th onclick="sortTable(0, 'str')">Name</th><th onclick="sortTable(1, 'num')">Size</th><th onclick="sortTable(2, 'num')">Date Uploaded</th><th>Actions</th></tr></thead><tbody>{file_rows}</tbody></table></div>
 </div></body></html>"""
         return web.Response(text=html_page, content_type="text/html")
-    except Exception as exc: return web.Response(text=f"<h2>Dashboard error</h2><pre>{html.escape(str(exc))}</pre>", content_type="text/html", status=500)
+    except Exception as exc:
+        return web.Response(text=f"<h2>Dashboard error</h2><pre>{html.escape(str(exc))}</pre>", content_type="text/html", status=500)
+
+# ============================================================
+# 12. DASHBOARD ACTIONS
+# ============================================================
 
 @routes.get("/delete_file")
 async def web_delete_file(request):
@@ -910,6 +1046,11 @@ async def web_move_item(request):
         force_system_ram_purge()
     raise web.HTTPFound("/dashboard?prefix=" + quote(request.query.get("prefix", "")))
 
+def sync_create_r2_folder(folder_path):
+    s3 = get_r2_client()
+    folder_path = folder_path.strip("/") + "/"
+    s3.put_object(Bucket=R2_BUCKET_NAME, Key=folder_path)
+
 @routes.get("/create_folder")
 async def web_create_folder(request):
     if not check_dashboard_auth(request): return web.Response(status=401, text="Unauthorized")
@@ -920,7 +1061,46 @@ async def web_create_folder(request):
     raise web.HTTPFound("/dashboard")
 
 # ============================================================
-# 11. TELEGRAM DIRECT LINK & STREAM
+# 13. HEALTH CHECK
+# ============================================================
+
+@routes.get("/health")
+async def health_handler(request):
+    health_status = {
+        "status": "ok", "service": "telegram-r2-bot", "timestamp": datetime.datetime.utcnow().isoformat(),
+        "checks": {"telegram": "unknown", "r2": "unknown"}
+    }
+    try:
+        if client.is_connected(): health_status["checks"]["telegram"] = "connected"
+        else:
+            health_status["checks"]["telegram"] = "disconnected"
+            health_status["status"] = "degraded"
+    except Exception:
+        health_status["checks"]["telegram"] = "error"
+        health_status["status"] = "degraded"
+        
+    try:
+        s3 = get_r2_client()
+        s3.head_bucket(Bucket=R2_BUCKET_NAME)
+        health_status["checks"]["r2"] = "connected"
+    except Exception:
+        health_status["checks"]["r2"] = "error"
+        health_status["status"] = "degraded"
+        
+    # FORCE 200 OK so Koyeb doesn't kill the container during FloodWait
+    return web.json_response(health_status, status=200)
+
+@routes.get("/")
+async def root_handler(request):
+    return web.Response(text="""
+<html><body style="background:#0f172a; color:#38bdf8; text-align:center; padding-top:120px; font-family:sans-serif;">
+<h1>✅ System Online</h1><p>Telegram R2 Leech Bot</p>
+<p><a href="/health" style="color:#0f172a; background:#38bdf8; padding:12px 20px; text-decoration:none; border-radius:6px;">Health Check</a></p>
+<p><a href="/dashboard" style="color:#0f172a; background:#34d399; padding:12px 20px; text-decoration:none; border-radius:6px;">Dashboard</a></p>
+</body></html>""", content_type="text/html")
+
+# ============================================================
+# 14. TELEGRAM DIRECT LINK
 # ============================================================
 
 def get_public_base_url():
@@ -928,37 +1108,16 @@ def get_public_base_url():
     if KOYEB_APP_NAME: return f"https://{KOYEB_APP_NAME}.koyeb.app"
     return ""
 
-async def robust_tg_download(client, media, file_path, msg, filename, file_size, start_t):
-    # 🚀 BULLETPROOF TG DOWNLOAD ENGINE - RESUMES ON DROP!
-    downloaded = 0
-    chunk_size = 1048576
-    retries = 0
-    max_retries = 15
-    last_update = 0
-    
-    while downloaded < file_size:
-        try:
-            with open(file_path, "ab") as f:
-                async for chunk in client.iter_download(media, offset=downloaded, request_size=chunk_size):
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    now = time.time()
-                    if now - last_update > 4:
-                        try: await msg.edit(get_status_text("TG Download", filename, downloaded, file_size, start_t))
-                        except Exception: pass
-                        last_update = now
-            break
-        except Exception as e:
-            retries += 1
-            if retries >= max_retries: raise RuntimeError(f"Telegram drop limit reached: {e}")
-            await asyncio.sleep(2)
-
 @routes.get("/{code}/{filename}")
 async def stream_handler(request):
     code = request.match_info["code"]
     data = link_storage.get(code)
     if not data: return web.Response(text="Expired", status=410)
     
+    if time.time() - data.get("timestamp", time.time()) > 86400:
+        link_storage.pop(code, None)
+        return web.Response(text="Expired", status=410)
+        
     msg = data.get("msg")
     if not msg: return web.Response(text="File unavailable", status=410)
     
@@ -974,7 +1133,8 @@ async def stream_handler(request):
             if match.group(2): end = int(match.group(2))
             if end >= file_size: end = file_size - 1
             
-    if start >= file_size: return web.Response(status=416, headers={"Content-Range": f"bytes */{file_size}"})
+    if start >= file_size:
+        return web.Response(status=416, headers={"Content-Range": f"bytes */{file_size}"})
         
     content_length = end - start + 1
     headers = {
@@ -991,18 +1151,24 @@ async def stream_handler(request):
         offset = (start // 1048576) * 1048576
         skipped = start - offset
         remaining = content_length
+        
         async for chunk in client.iter_download(msg.media, offset=offset, request_size=1048576):
-            if skipped: chunk = chunk[skipped:]; skipped = 0
+            if skipped:
+                chunk = chunk[skipped:]
+                skipped = 0
             if not chunk: continue
             if len(chunk) > remaining: chunk = chunk[:remaining]
             await response.write(chunk)
             remaining -= len(chunk)
             if remaining <= 0: break
     except Exception: pass
+    
+    try: await response.write_eof()
+    except Exception: pass
     return response
 
 # ============================================================
-# 12. TELEGRAM FAST UPLOAD
+# 15. TELEGRAM FAST UPLOAD
 # ============================================================
 
 async def fast_upload(tg_client, file_path, msg, filename):
@@ -1020,32 +1186,37 @@ async def fast_upload(tg_client, file_path, msg, filename):
             with open(file_path, "rb") as file:
                 file.seek(index * part_size)
                 chunk = file.read(part_size)
-            # 🚀 FIX: UPLOAD RETRY LOOP TO PREVENT DROPS
-            for attempt in range(10):
+            for attempt in range(5):
                 try:
-                    if file_size > 10 * 1024 * 1024: await tg_client(SaveBigFilePartRequest(file_id, index, total_parts, chunk))
-                    else: await tg_client(SaveFilePartRequest(file_id, index, chunk))
+                    if file_size > 10 * 1024 * 1024:
+                        await tg_client(SaveBigFilePartRequest(file_id, index, total_parts, chunk))
+                    else:
+                        await tg_client(SaveFilePartRequest(file_id, index, chunk))
                     uploaded_bytes += len(chunk)
                     return
                 except Exception:
-                    if attempt >= 9: raise
+                    if attempt >= 4: raise
                     await asyncio.sleep(2)
                     
     async def updater():
         while uploaded_bytes < file_size:
             await asyncio.sleep(4)
-            try: await msg.edit(get_status_text("Uploading to TG", filename, uploaded_bytes, file_size, start_time))
+            try:
+                await msg.edit(get_status_text("Uploading to TG", filename, uploaded_bytes, file_size, start_time))
             except Exception: pass
             
     updater_task = asyncio.create_task(updater())
-    try: await asyncio.gather(*[upload_part(i) for i in range(total_parts)])
-    finally: updater_task.cancel()
+    try:
+        await asyncio.gather(*[upload_part(i) for i in range(total_parts)])
+    finally:
+        updater_task.cancel()
         
-    if file_size > 10 * 1024 * 1024: return InputFileBig(file_id, total_parts, filename)
+    if file_size > 10 * 1024 * 1024:
+        return InputFileBig(file_id, total_parts, filename)
     return InputFile(file_id, total_parts, filename, "")
 
 # ============================================================
-# 13. TELEGRAM HANDLERS
+# 16. TELEGRAM MASTER HANDLER
 # ============================================================
 
 @client.on(events.NewMessage(incoming=True, func=lambda e: e.sender_id == ADMIN_ID))
@@ -1077,7 +1248,9 @@ async def master_handler(event):
             
             try:
                 final_path = await download_any_url(url, workspace, custom_name, msg, start_t)
-                if not final_path or not os.path.exists(final_path): raise ValueError("Download failed.")
+                if not final_path or not os.path.exists(final_path):
+                    raise ValueError("Download failed.")
+                    
                 filename = os.path.basename(final_path)
                 
                 if filename.lower().endswith(".zip"):
@@ -1109,10 +1282,15 @@ async def master_handler(event):
                     r2_url, code = await upload_to_r2(final_path, msg, target_folder)
                     await msg.edit(f"✅ **Leeched & Uploaded!**\n\n🎬 `{filename}`\n🔗 `{r2_url}`", buttons=[[Button.inline("🗑️ Delete from R2", data=f"delr2_{code}")]], link_preview=False)
                     
-            except Exception as exc: await msg.edit(f"❌ **Error:** `{exc}`")
+            except Exception as exc:
+                await msg.edit(f"❌ **Error:** `{exc}`")
             finally:
                 shutil.rmtree(workspace, ignore_errors=True)
                 free_memory()
+
+# ============================================================
+# 17. TELEGRAM CALLBACKS
+# ============================================================
 
 @client.on(events.CallbackQuery)
 async def on_callback(event):
@@ -1142,7 +1320,8 @@ async def on_callback(event):
                 await asyncio.to_thread(sync_delete_r2_file, item["s3_key"])
                 link_storage.pop(code, None)
                 await event.edit(f"🗑️ **File Deleted from R2!**\nKey: `{item['s3_key']}`")
-            except Exception as exc: await event.edit(f"❌ Delete Error: {exc}")
+            except Exception as exc:
+                await event.edit(f"❌ Delete Error: {exc}")
         return
         
     if data.startswith("link_"):
@@ -1169,7 +1348,9 @@ async def on_callback(event):
         msg_id = int(data.split("_", 1)[1])
         await event.answer("Uploading...", alert=False)
         tg_msg = await client.get_messages(event.chat_id, ids=msg_id)
-        if not tg_msg or not tg_msg.file: return await event.respond("❌ File not found.")
+        if not tg_msg or not tg_msg.file:
+            await event.respond("❌ File not found.")
+            return
             
         async with global_semaphore:
             workspace = f"dl_{uuid.uuid4().hex[:8]}"
@@ -1181,8 +1362,15 @@ async def on_callback(event):
             start_t = time.time()
             
             try:
-                # 🚀 FIX: ROBUST TELEGRAM DOWNLOAD ENGINE
-                await robust_tg_download(client, tg_msg.media, file_path, status, filename, tg_msg.file.size, start_t)
+                with open(file_path, "wb") as file:
+                    downloaded = 0
+                    async for chunk in client.iter_download(tg_msg.media, request_size=1024 * 1024):
+                        file.write(chunk)
+                        downloaded += len(chunk)
+                        if time.time() - start_t > 3 and downloaded % (10 * 1024 * 1024) < len(chunk):
+                            try:
+                                await status.edit(get_status_text("TG Download", filename, downloaded, tg_msg.file.size, start_t))
+                            except Exception: pass
                             
                 if filename.lower().endswith(".zip"):
                     await status.edit("📦 **Extracting HLS ZIP Archive...**")
@@ -1220,7 +1408,7 @@ async def on_callback(event):
                 free_memory()
 
 # ============================================================
-# 19. STARTUP
+# 18. STARTUP
 # ============================================================
 
 async def main():
@@ -1237,14 +1425,34 @@ async def main():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
+    print(f"HTTP server listening on 0.0.0.0:{PORT}")
     
-    try:
-        print("Connecting to Telegram...")
-        await client.start(bot_token=BOT_TOKEN)
-        print("✅ BOT ONLINE")
-        await client.run_until_disconnected()
-    finally:
-        await runner.cleanup()
+    print("Connecting to Telegram...")
+    while True:
+        try:
+            await client.start(bot_token=BOT_TOKEN)
+            break
+        except FloodWaitError as e:
+            print(f"⚠️ Telegram FloodWait: Must wait {e.seconds} seconds before logging in.")
+            print("Sleeping... Do not restart Koyeb!")
+            await asyncio.sleep(e.seconds + 5)
+        except Exception as e:
+            print(f"⚠️ Telegram Login Error: {e}. Retrying in 10s...")
+            await asyncio.sleep(10)
+            
+    me = await client.get_me()
+    print(f"Telegram connected: @{getattr(me, 'username', None)}")
+    print("====================================")
+    print("BOT ONLINE")
+    print("====================================")
+    await client.run_until_disconnected()
+    await runner.cleanup()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
+    except Exception as exc:
+        print("FATAL STARTUP ERROR:", repr(exc), flush=True)
+        raise
