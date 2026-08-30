@@ -608,14 +608,16 @@ async def master_handler(event):
 
             # Process EACH link found in the message
             for url in links:
-                msg = await event.reply(f"🔗 **Processing Link:**\n`{url[:50]}...`")
+                msg = await event.reply(f"🔗 **Processing Link:**\n`{url[:70]}...`")
                 workspace = f"dl_{uuid.uuid4().hex[:8]}"
                 os.makedirs(workspace, exist_ok=True)
                 start_t = time.time()
                 
                 try:
                     final_path = await download_any_url(url, workspace, custom_name, msg, start_t)
-                    if not final_path or not os.path.exists(final_path): raise ValueError("Download failed.")
+                    if not final_path or not os.path.exists(final_path): 
+                        raise ValueError("Download failed.")
+                    
                     filename = os.path.basename(final_path)
 
                     if filename.lower().endswith('.zip'):
@@ -644,14 +646,11 @@ async def master_handler(event):
                         r2_url, code = await upload_to_r2(final_path, msg, target_folder)
                         await msg.edit(f"✅ **Leeched & Uploaded!**\n\n🎬 `{filename}`\n🔗 `{r2_url}`", buttons=[[Button.inline("🗑️ Delete from R2", data=f"delr2_{code}")]], link_preview=False)
 
-except Exception as e: 
-                    # Truncating to 70 chars instead of 30 so you can actually see the ID
+                except Exception as e: 
                     await msg.edit(f"❌ **Error with link:**\n`{url[:70]}...`\n\n**Reason:** {e}")
                 finally:
                     shutil.rmtree(workspace, ignore_errors=True)
                     free_memory()
-
-@client.on(events.CallbackQuery)
 async def on_callback(event):
     if event.sender_id != ADMIN_ID: return
     data = event.data.decode()
