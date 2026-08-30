@@ -289,61 +289,110 @@ async def upload_to_r2(file_path, msg, target_folder=None):
 # ============================================
 # --- 4. DOWNLOAD ENGINES (MAGNET/YT-DLP/GDRIVE) ---
 # ============================================
+
 def get_aria2_executable():
-    if shutil.which('aria2c'): return 'aria2c'
+    if shutil.which('aria2c'):
+        return 'aria2c'
+    
     local = os.path.abspath('./aria2c')
-    if os.path.exists(local): return local
-    try:
-        subprocess.run("wget -qO- https://github.com/P3TERX/aria2-builder/releases/download/1.36.0/aria2-1.36.0-static-linux-amd64.tar.gz | tar -xz", shell=True, check=True)
-        os.chmod('./aria2c', 0o755)
+    if os.path.exists(local):
         return local
-    except: return 'aria2c'
+    
+    # Only attempt to download the Linux static binary on Linux x86_64 systems
+    if sys.platform == 'linux' and platform.machine() == 'x86_64':
+        try:
+            subprocess.run(
+                "wget -qO- https://github.com/P3TERX/aria2-builder/releases/download/1.36.0/aria2-1.36.0-static-linux-amd64.tar.gz | tar -xz",
+                shell=True, check=True, capture_output=True
+            )
+            os.chmod('./aria2c', 0o755)
+            return local
+        except subprocess.CalledProcessError:
+            pass  # Fall back to default 'aria2c', which will raise a clear FileNotFoundError if missing
+            
+    return 'aria2c'
+
 
 async def download_magnet(url, workspace, custom_name, msg, start_t):
-    cmd = [get_aria2_executable(), "--seed-time=0", "--max-connection-per-server=16", "--split=16",
-           "--summary-interval=3", "--bt-stop-timeout=120", f"--bt-tracker={PUBLIC_TRACKERS}", f"--dir={workspace}", url]
-    process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE)
+    cmd = [
+        get_aria2_executable(), "--seed-time=0", "--max-connection-per-server=16", "--split=16",
+        "--summary-interval=3", "--bt-stop-timeout=120", f"--bt-tracker={PUBLIC_TRACKERS}", f"--dir={workspace}", url
+    ]
+    # Capture stderr as well for better debugging if aria2c fails
+    process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     task_code = secrets.token_urlsafe(8)
     active_tasks[task_code] = {'process': process, 'cancel_event': asyncio.Event(), 'dir': workspace}
+    
     aria_re = re.compile(r'\[#(?P<gid>\w+)\s+(?P<downloaded>[^\s/]+)/(?P<total>[^\s\(\)]+)(?:\((?P<percent>\d+)%\))?\s+CN:(?P<cn>\d+)\s+SPD:(?P<speed>[^\s\]]+)(?:\s+ETA:(?P<eta>[^\s\]]+))?\]')
     
     last_update = 0
     while process.returncode is None:
         line_bytes = await process.stdout.readline()
-        if not line_bytes: break
+        if not line_bytes:
+            break
+        
         line = line_bytes.decode('utf-8', errors='ignore').strip()
         match = aria_re.search(line)
+        
         if match and time.time() - last_update > 4:
             elapsed = get_readable_time(int(time.time() - start_t))
             active_file = "Fetching Metadata..."
+            
             for _, _, files in os.walk(workspace):
                 for f in files:
-                    if not f.endswith('.aria2'): active_file = f; break
-            p_text = format_saas_progress("Download", active_file, int(match.group('percent') or 0), match.group('downloaded'), match.group('total'), match.group('speed')+"/s", match.group('eta') or "Calc...", match.group('cn'), elapsed, task_code)
-            try: await msg.edit(p_text, buttons=[[Button.inline("❌ Cancel", data=f"canceltask_{task_code}")]]); last_update = time.time()
-            except: pass
+                    if not f.endswith('.aria2'):
+                        active_file = f
+                        break
+            
+            p_text = format_saas_progress(
+                "Download", active_file, int(match.group('percent') or 0),
+                match.group('downloaded'), match.group('total'), match.group('speed')+"/s",
+                match.group('eta') or "Calc...", match.group('cn'), elapsed, task_code
+            )
+            try:
+                await msg.edit(p_text, buttons=[[Button.inline("❌ Cancel", data=f"canceltask_{task_code}")]])
+                last_update = time.time()
+            except Exception:
+                pass  # Ignore Telegram message edit flood limits or deletion errors
+                
     await process.wait()
     active_tasks.pop(task_code, None)
     
     largest = get_largest_file(workspace)
-    if not largest: raise ValueError("Torrent failed.")
+    if not largest:
+        raise ValueError("Torrent failed or no files were downloaded.")
+        
     final_name = get_unique_filename(os.path.join(workspace, custom_name if custom_name else os.path.basename(largest)))
     shutil.move(largest, final_name)
     return final_name
 
+
 def sync_yt_dlp_download(url, workspace, custom_name=None):
+    # Note: If custom_name is a fixed filename (e.g., "video.mp4"), yt-dlp may append 
+    # format IDs (e.g., "video.mp4.f137") during separate A/V downloads before merging.
+    # ydl.prepare_filename(info) at the end correctly resolves the final merged filename.
     out_tmpl = os.path.join(workspace, custom_name if custom_name else '%(title)s.%(ext)s')
-    ydl_opts = {'outtmpl': out_tmpl, 'quiet': True, 'no_warnings': True, 'nocheckcertificate': True, 'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'}
+    ydl_opts = {
+        'outtmpl': out_tmpl,
+        'quiet': True,
+        'no_warnings': True,
+        'nocheckcertificate': True,
+        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
+    }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
         return clean_double_extension(ydl.prepare_filename(info))
+
 
 def extract_gdrive_id(url):
     match = re.search(r'(?:file/d/|id=|/d/)([a-zA-Z0-9_-]{25,})', url)
     return match.group(1) if match else None
 
+
 async def get_gdrive_stream(session, file_id):
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36'}
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36'
+    }
     base_url = f"https://drive.google.com/uc?export=download&id={file_id}"
     
     resp = await session.get(base_url, headers=headers, allow_redirects=True)
@@ -352,17 +401,16 @@ async def get_gdrive_stream(session, file_id):
         text = await resp.text()
         resp.close()
         
-        # Google's new warning page has an explicit URL with 'confirm' and often 'uuid'
-        # We look for href="..." or action="..." containing confirm=
+        # Look for href or action containing 'confirm='
         match = re.search(r'(?:href|action)="([^"]+confirm=[^"]+)"', text)
         if match:
-            # Clean up HTML entities and build the final download link
-            next_url = match.group(1).replace('&amp;', '&')
+            # Use html.unescape for robust cleaning of &amp;, &#39;, etc.
+            next_url = html.unescape(match.group(1))
             if next_url.startswith('/'):
                 next_url = "https://drive.google.com" + next_url
             return await session.get(next_url, headers=headers, allow_redirects=True)
             
-        # If no button is found, check cookies for download_warning token
+        # Fallback: check cookies for download_warning token
         cookies = session.cookie_jar.filter_cookies(resp.url)
         confirm_token = None
         for k, v in cookies.items():
@@ -373,46 +421,58 @@ async def get_gdrive_stream(session, file_id):
         if confirm_token:
             return await session.get(f"{base_url}&confirm={confirm_token}", headers=headers, allow_redirects=True)
             
-        # If all bypasses fail (e.g., file is Private or Quota Exceeded)
-        # Return a fresh request to let download_direct throw the proper error
+        # If all bypasses fail (e.g., file is Private or Quota Exceeded), 
+        # return a fresh request to let download_direct throw the proper error.
         return await session.get(base_url, headers=headers, allow_redirects=True)
         
     return resp
+
+
 async def download_direct(url, workspace, msg, start_t, custom_name=None, gdrive_id=None):
-    async with ClientSession() as sess:
+    # Prevent indefinite hanging on slow/dead servers
+    timeout = aiohttp.ClientTimeout(total=3600)  # 1 hour max
+    
+    async with aiohttp.ClientSession(timeout=timeout) as sess:
         if gdrive_id:
             await msg.edit("🅿️ **Google Drive Fallback Detected...**")
             r = await get_gdrive_stream(sess, gdrive_id)
         else:
             r = await sess.get(url, allow_redirects=True)
 
-        # If it's an HTML page, fail immediately instead of faking an MP4
         if "text/html" in r.headers.get("Content-Type", ""): 
             r.close()
             raise ValueError("Google Drive blocked the download (Virus Scan warning or Private File). Try sharing it publicly.")
             
         f_size = int(r.headers.get("Content-Length", 0))
         filename = custom_name
-        if not filename:
-            if "Content-Disposition" in r.headers:
-                matches = re.findall('filename="?([^"]+)"?', r.headers["Content-Disposition"])
-                if matches: filename = matches[0]
+        
+        if not filename and "Content-Disposition" in r.headers:
+            matches = re.findall('filename="?([^"]+)"?', r.headers["Content-Disposition"])
+            if matches:
+                filename = matches[0]
         
         filename = filename or unquote(url.split("/")[-1].split("?")[0]) or "video.mp4"
-        if filename.lower() == "view" or not "." in filename: 
+        if filename.lower() == "view" or "." not in filename: 
             filename += ".mp4"
         
-        file_path = os.path.join(workspace, clean_double_extension(re.sub(r'[\\/*?:"<>|]', "", filename)))
+        # Sanitize filename
+        safe_filename = re.sub(r'[\\/*?:"<>|]', "", filename)
+        file_path = os.path.join(workspace, clean_double_extension(safe_filename))
         
         await msg.edit(f"⬇️ **Leeching Direct Link...**\n🎬 `{os.path.basename(file_path)}`")
+        
         with open(file_path, 'wb') as f:
-            async for chunk in r.content.iter_chunked(1024*1024):
+            async for chunk in r.content.iter_chunked(1024 * 1024):  # 1MB chunks
                 f.write(chunk)
-                if f.tell() % (10 * 1024 * 1024) == 0:
-                    try: await msg.edit(get_status_text("Leeching", os.path.basename(file_path), f.tell(), f_size, start_t))
-                    except: pass
+                if f.tell() % (10 * 1024 * 1024) == 0:  # Update every 10MB
+                    try:
+                        await msg.edit(get_status_text("Leeching", os.path.basename(file_path), f.tell(), f_size, start_t))
+                    except Exception:
+                        pass  # Ignore Telegram edit limits
         r.close()
+        
     return file_path
+
 
 async def download_any_url(url, workspace, custom_name, msg, start_t):
     if url.startswith("magnet:?"):
@@ -432,11 +492,10 @@ async def download_any_url(url, workspace, custom_name, msg, start_t):
             filename = await asyncio.to_thread(sync_yt_dlp_download, url, workspace, custom_name)
             if filename and os.path.exists(filename) and os.path.getsize(filename) > 0:
                 return filename
-        except Exception: 
-            pass # If yt-dlp fails, it will fall back to direct download below
+        except Exception:
+            pass  # If yt-dlp fails, it will fall back to direct download below
 
     return await download_direct(url, workspace, msg, start_t, custom_name, gdrive_id)
-
 # ============================================
 # --- 5. SECURED SMART WEB DASHBOARD ---
 # ============================================
