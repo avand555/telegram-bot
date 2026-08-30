@@ -343,38 +343,49 @@ def extract_gdrive_id(url):
     return match.group(1) if match else None
 
 async def get_gdrive_stream(session, file_id):
+    # Added a real User-Agent to prevent Google from blocking the request
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36'
+    }
     base_url = "https://drive.google.com/uc?export=download"
     params = {'id': file_id}
-    resp = await session.get(base_url, params=params, allow_redirects=True)
+    
+    resp = await session.get(base_url, params=params, headers=headers, allow_redirects=True)
+    
+    # If Google shows the "Large File Warning" page
     if "text/html" in resp.headers.get("Content-Type", ""):
         text = await resp.text()
         confirm_token = None
+        # Look for the confirmation code in the HTML
         token_match = re.search(r'confirm=([a-zA-Z0-9_-]+)', text)
-        if token_match: confirm_token = token_match.group(1)
+        if token_match: 
+            confirm_token = token_match.group(1)
         else:
+            # Check cookies for the warning bypass
             for k, v in resp.cookies.items():
                 if k.startswith('download_warning'):
                     confirm_token = v.value
                     break
-        resp.close()
+        
         if confirm_token:
+            resp.close()
             params['confirm'] = confirm_token
-            resp = await session.get(base_url, params=params, allow_redirects=True)
-        else:
-            params['confirm'] = 't'
-            resp = await session.get(base_url, params=params, allow_redirects=True)
+            return await session.get(base_url, params=params, headers=headers, allow_redirects=True)
+            
     return resp
 
 async def download_direct(url, workspace, msg, start_t, custom_name=None, gdrive_id=None):
     async with ClientSession() as sess:
         if gdrive_id:
-            await msg.edit("🅿️ **Google Drive Detected! Bypassing warnings...**")
+            await msg.edit("🅿️ **Google Drive Fallback Detected...**")
             r = await get_gdrive_stream(sess, gdrive_id)
         else:
             r = await sess.get(url, allow_redirects=True)
 
-        if "text/html" in r.headers.get("Content-Type", "") and not gdrive_id: 
-            raise ValueError("HTML webpage detected.")
+        # If it's an HTML page, fail immediately instead of faking an MP4
+        if "text/html" in r.headers.get("Content-Type", ""): 
+            r.close()
+            raise ValueError("Google Drive blocked the download (Virus Scan warning or Private File). Try sharing it publicly.")
             
         f_size = int(r.headers.get("Content-Length", 0))
         filename = custom_name
@@ -382,8 +393,10 @@ async def download_direct(url, workspace, msg, start_t, custom_name=None, gdrive
             if "Content-Disposition" in r.headers:
                 matches = re.findall('filename="?([^"]+)"?', r.headers["Content-Disposition"])
                 if matches: filename = matches[0]
+        
         filename = filename or unquote(url.split("/")[-1].split("?")[0]) or "video.mp4"
-        if not "." in filename: filename += ".mp4"
+        if filename.lower() == "view" or not "." in filename: 
+            filename += ".mp4"
         
         file_path = os.path.join(workspace, clean_double_extension(re.sub(r'[\\/*?:"<>|]', "", filename)))
         
@@ -404,13 +417,19 @@ async def download_any_url(url, workspace, custom_name, msg, start_t):
     is_zip = (custom_name and custom_name.lower().endswith('.zip')) or url.lower().endswith('.zip')
     gdrive_id = extract_gdrive_id(url)
 
-    if not is_zip and not gdrive_id:
+    # Let yt-dlp handle Google Drive links (it bypasses warnings perfectly)
+    if not is_zip:
         try:
-            await msg.edit("🅿️ **Extracting File Info via yt-dlp...**")
+            if gdrive_id:
+                await msg.edit("🅿️ **Google Drive Link Detected! Extracting via yt-dlp...**")
+            else:
+                await msg.edit("🅿️ **Extracting File Info via yt-dlp...**")
+                
             filename = await asyncio.to_thread(sync_yt_dlp_download, url, workspace, custom_name)
             if filename and os.path.exists(filename) and os.path.getsize(filename) > 0:
                 return filename
-        except Exception: pass
+        except Exception: 
+            pass # If yt-dlp fails, it will fall back to direct download below
 
     return await download_direct(url, workspace, msg, start_t, custom_name, gdrive_id)
 
@@ -571,53 +590,61 @@ async def master_handler(event):
 
     if event.text and (event.text.startswith("http") or event.text.startswith("magnet:?")):
         async with global_semaphore:
-            raw = event.text.strip()
-            url = raw.split(" -n ")[0].split(" -f ")[0].strip()
+            input_text = event.text.strip()
+            
+            # Split the text to extract the base links (removing -n and -f args)
+            clean_text = input_text.split(" -n ")[0].split(" -f ")[0].strip()
+            
+            # Extract multiple links separated by commas, spaces, or newlines
+            links = [l.strip().strip(',') for l in re.split(r'[\n, ]+', clean_text) if l.strip()]
+
             custom_name, target_folder = None, None
-            
-            if " -n " in raw: custom_name = raw.split(" -n ")[1].split(" -f ")[0].strip()
-            if " -f " in raw: target_folder = raw.split(" -f ")[1].strip()
+            if " -n " in input_text: custom_name = input_text.split(" -n ")[1].split(" -f ")[0].strip()
+            if " -f " in input_text: target_folder = input_text.split(" -f ")[1].strip()
 
-            msg = await event.reply("🔗 **Processing Request...**")
-            workspace = f"dl_{uuid.uuid4().hex[:8]}"
-            os.makedirs(workspace, exist_ok=True)
-            start_t = time.time()
-            
-            try:
-                final_path = await download_any_url(url, workspace, custom_name, msg, start_t)
-                if not final_path or not os.path.exists(final_path): raise ValueError("Download failed.")
-                filename = os.path.basename(final_path)
+            # Process EACH link found in the message
+            for url in links:
+                msg = await event.reply(f"🔗 **Processing Link:**\n`{url[:50]}...`")
+                workspace = f"dl_{uuid.uuid4().hex[:8]}"
+                os.makedirs(workspace, exist_ok=True)
+                start_t = time.time()
+                
+                try:
+                    final_path = await download_any_url(url, workspace, custom_name, msg, start_t)
+                    if not final_path or not os.path.exists(final_path): raise ValueError("Download failed.")
+                    filename = os.path.basename(final_path)
 
-                if filename.lower().endswith('.zip'):
-                    await msg.edit("📦 **Extracting HLS ZIP Archive...**")
-                    extract_dir = os.path.join(workspace, "extracted")
-                    os.makedirs(extract_dir, exist_ok=True)
-                    await asyncio.to_thread(lambda: zipfile.ZipFile(final_path, 'r').extractall(extract_dir))
+                    if filename.lower().endswith('.zip'):
+                        await msg.edit("📦 **Extracting HLS ZIP Archive...**")
+                        extract_dir = os.path.join(workspace, "extracted")
+                        os.makedirs(extract_dir, exist_ok=True)
+                        await asyncio.to_thread(lambda: zipfile.ZipFile(final_path, 'r').extractall(extract_dir))
 
-                    project_name = os.path.splitext(filename)[0]
-                    extracted_items = os.listdir(extract_dir)
-                    
-                    if len(extracted_items) == 1 and os.path.isdir(os.path.join(extract_dir, extracted_items[0])):
-                        upload_source_dir = os.path.join(extract_dir, extracted_items[0])
-                        s3_prefix = target_folder if target_folder else extracted_items[0]
+                        project_name = os.path.splitext(filename)[0]
+                        extracted_items = os.listdir(extract_dir)
+                        
+                        if len(extracted_items) == 1 and os.path.isdir(os.path.join(extract_dir, extracted_items[0])):
+                            upload_source_dir = os.path.join(extract_dir, extracted_items[0])
+                            s3_prefix = target_folder if target_folder else extracted_items[0]
+                        else:
+                            upload_source_dir = extract_dir
+                            s3_prefix = target_folder if target_folder else project_name
+
+                        await msg.edit(f"⬆️ **Uploading HLS Pack to R2...**\n📂 `{s3_prefix}`")
+                        await asyncio.to_thread(sync_r2_upload_folder, upload_source_dir, s3_prefix, asyncio.get_running_loop(), msg, time.time())
+                        
+                        master_url = f"{R2_PUBLIC_URL}/{quote(s3_prefix, safe='/')}/master.m3u8"
+                        await msg.edit(f"✅ **HLS Uploaded to R2!**\n\n🎬 `{project_name}`\n📺 **Stream Link:**\n`{master_url}`", link_preview=False)
+
                     else:
-                        upload_source_dir = extract_dir
-                        s3_prefix = target_folder if target_folder else project_name
+                        r2_url, code = await upload_to_r2(final_path, msg, target_folder)
+                        await msg.edit(f"✅ **Leeched & Uploaded!**\n\n🎬 `{filename}`\n🔗 `{r2_url}`", buttons=[[Button.inline("🗑️ Delete from R2", data=f"delr2_{code}")]], link_preview=False)
 
-                    await msg.edit(f"⬆️ **Uploading HLS Pack to R2...**\n📂 `{s3_prefix}`")
-                    await asyncio.to_thread(sync_r2_upload_folder, upload_source_dir, s3_prefix, asyncio.get_running_loop(), msg, time.time())
-                    
-                    master_url = f"{R2_PUBLIC_URL}/{quote(s3_prefix, safe='/')}/master.m3u8"
-                    await msg.edit(f"✅ **HLS Uploaded to R2!**\n\n🎬 `{project_name}`\n📺 **Stream Link:**\n`{master_url}`", link_preview=False)
-
-                else:
-                    r2_url, code = await upload_to_r2(final_path, msg, target_folder)
-                    await msg.edit(f"✅ **Leeched & Uploaded!**\n\n🎬 `{filename}`\n🔗 `{r2_url}`", buttons=[[Button.inline("🗑️ Delete from R2", data=f"delr2_{code}")]], link_preview=False)
-
-            except Exception as e: await msg.edit(f"❌ Error: {e}")
-            finally:
-                shutil.rmtree(workspace, ignore_errors=True)
-                free_memory()
+                except Exception as e: 
+                    await msg.edit(f"❌ Error with link `{url[:30]}`:\n{e}")
+                finally:
+                    shutil.rmtree(workspace, ignore_errors=True)
+                    free_memory()
 
 @client.on(events.CallbackQuery)
 async def on_callback(event):
