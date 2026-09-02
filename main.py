@@ -639,9 +639,11 @@ async def stream_handler(request):
 # ============================================
 # --- 6. TELEGRAM HANDLERS ---
 # ============================================
-@client.on(events.NewMessage(incoming=True, func=lambda e: e.sender_id == ADMIN_ID))
+@client.on(events.NewMessage(incoming=True))
 async def master_handler(event):
-    
+    # Check if the sender is in the admin list
+    if event.sender_id not in ADMIN_IDS: 
+        return
     if event.file:
         await event.reply(
             f"📂 **File Detected:** `{event.file.name or 'file.bin'}`",
@@ -711,8 +713,13 @@ async def master_handler(event):
                 finally:
                     shutil.rmtree(workspace, ignore_errors=True)
                     free_memory()
+@client.on(events.CallbackQuery)
 async def on_callback(event):
-    if event.sender_id != ADMIN_ID: return
+    # Check if the sender is in the admin list
+    if event.sender_id not in ADMIN_IDS: 
+        return
+    
+    # ... rest of your code ...
     data = event.data.decode()
 
     if data.startswith("canceltask_"):
