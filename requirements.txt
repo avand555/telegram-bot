@@ -5,3 +5,4 @@ boto3
 yt-dlp
 nest_asyncio
 aiofiles
+gdown==6.1.0
