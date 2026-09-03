@@ -78,9 +78,9 @@ def env_float(name: str, default: float) -> float:
 API_ID = env_int("API_ID", 0)
 API_HASH = os.getenv("API_HASH", "").strip()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-ADMIN_IDSS = {
+ADMIN_IDS = {
     int(x.strip())
-    for x in os.environ.get("ADMIN_IDSS", "").split(",")
+    for x in os.environ.get("ADMIN_IDS", "").split(",")
     if x.strip()
 }
 
@@ -1835,7 +1835,7 @@ def task_cancel_button(task_code: str):
 @client.on(
     events.NewMessage(
         incoming=True,
-        func=lambda e: e.sender_id in ADMIN_IDSS
+        func=lambda e: e.sender_id in ADMIN_IDS
     )
 )
 async def master_handler(event):
@@ -2009,7 +2009,7 @@ async def download_telegram_to_file(
 
 @client.on(events.CallbackQuery)
 async def on_callback(event):
-if event.sender_id not in ADMIN_IDSS:
+if event.sender_id not in ADMIN_IDS:
     return
 
     purge_expired_link_storage()
