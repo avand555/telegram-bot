@@ -78,7 +78,11 @@ def env_float(name: str, default: float) -> float:
 API_ID = env_int("API_ID", 0)
 API_HASH = os.getenv("API_HASH", "").strip()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-ADMIN_ID = env_int("ADMIN_ID", 0)
+ADMIN_IDSS = {
+    int(x.strip())
+    for x in os.environ.get("ADMIN_IDSS", "").split(",")
+    if x.strip()
+}
 
 R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID", "").strip()
 R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID", "").strip()
@@ -139,8 +143,8 @@ def validate_startup_config() -> None:
         missing.append("API_HASH")
     if not BOT_TOKEN:
         missing.append("BOT_TOKEN")
-    if ADMIN_ID <= 0:
-        missing.append("ADMIN_ID")
+    if ADMIN_IDS <= 0:
+        missing.append("ADMIN_IDS")
 
     if missing:
         raise RuntimeError(
@@ -1828,7 +1832,12 @@ def task_cancel_button(task_code: str):
     return [[Button.inline("🛑 Cancel", data=f"cancel_{task_code}")]]
 
 
-@client.on(events.NewMessage(incoming=True, func=lambda event: event.sender_id == ADMIN_ID))
+@client.on(
+    events.NewMessage(
+        incoming=True,
+        func=lambda e: e.sender_id in ADMIN_IDSS
+    )
+)
 async def master_handler(event):
     purge_expired_link_storage()
 
@@ -2000,8 +2009,8 @@ async def download_telegram_to_file(
 
 @client.on(events.CallbackQuery)
 async def on_callback(event):
-    if event.sender_id != ADMIN_ID:
-        return
+if event.sender_id not in ADMIN_IDSS:
+    return
 
     purge_expired_link_storage()
     data = event.data.decode("utf-8", errors="ignore")
