@@ -351,159 +351,130 @@ async def upload_to_r2(file_path, msg, target_folder=None):
 # ============================================
 # --- 4. DOWNLOAD ENGINES (MAGNET/YT-DLP/GDRIVE) ---
 # ============================================
-def get_aria2_executable():
-    if shutil.which('aria2c'):
-        return 'aria2c'
-    local = os.path.abspath('./aria2c')
-    if os.path.exists(local):
-        return local
-    try:
-        subprocess.run(
-            "wget -qO- https://github.com/P3TERX/aria2-builder/releases/download/1.36.0/aria2-1.36.0-static-linux-amd64.tar.gz | tar -xz",
-            shell=True, check=True
-        )
-        os.chmod(local, 0o755)
-        return local
-    except Exception:
-        return 'aria2c'
-
-async def download_magnet(url, workspace, custom_name, msg, start_t):
-    cmd = [
-        get_aria2_executable(),
-        "--seed-time=0",
-        "--max-connection-per-server=16",
-        "--split=16",
-        "--summary-interval=3",
-        "--bt-stop-timeout=120",
-        f"--bt-tracker={}",
-        f"--dir={}",
-        url
-    ]
-    process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
-    task_code = secrets.token_urlsafe(8)
-    active_tasks[task_code] = {'process': process, 'cancel_event': asyncio.Event(), 'dir': workspace}
-    aria_re = re.compile(
-        r'\[#(?P<gid>\w+)\s+(?P<downloaded>[^\s/]+)/(?P<total>[^\s\(\)]+)(?:\((?P<percent>\d+)%\))?\s+CN:(?P<cn>\d+)\s+SPD:(?P<speed>[^\s\]]+)(?:\s+ETA:(?P<eta>[^\s\]]+))?\]'
-    )
-
-    last_update = 0
-    while process.returncode is None:
-        line_bytes = await process.stdout.readline()
-        if not line_bytes:
-            break
-        line = line_bytes.decode('utf-8', errors='ignore').strip()
-        match = aria_re.search(line)
-        if match and time.time() - last_update > 4:
-            elapsed = get_readable_time(int(time.time() - start_t))
-            active_file = "Fetching Metadata..."
-            for _, _, files in os.walk(workspace):
-                for f in files:
-                    if not f.endswith('.aria2'):
-                        active_file = f
-                        break
-            p_text = format_saas_progress(
-                "Torrent Download",
-                active_file,
-                int(match.group('percent') or 0),
-                match.group('downloaded'),
-                match.group('total'),
-                match.group('speed') + "/s",
-                match.group('eta') or "Calc...",
-                match.group('cn'),
-                elapsed,
-                task_code
-            )
-            try:
-                await msg.edit(p_text, buttons=[[Button.inline("❌ Cancel", data=f"canceltask_{}")]])
-                last_update = time.time()
-            except Exception:
-                pass
-
-    await process.wait()
-    active_tasks.pop(task_code, None)
-
-    largest = get_largest_file(workspace)
-    if not largest:
-        raise ValueError("Torrent failed or no downloadable content found.")
-    target_name = custom_name if custom_name else os.path.basename(largest)
-    final_name = get_unique_filename(os.path.join(workspace, target_name))
-    shutil.move(largest, final_name)
-    return final_name
-
-def sync_yt_dlp_download(url, workspace, custom_name=None):
-    out_tmpl = os.path.join(workspace, custom_name if custom_name else '%(title)s.%(ext)s')
-    ydl_opts = {
-        'outtmpl': out_tmpl,
-        'quiet': True,
-        'no_warnings': True,
-        'nocheckcertificate': True,
-        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
-    }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        return clean_double_extension(ydl.prepare_filename(info))
-
-def extract_gdrive_id(url):
-    match = re.search(r'(?:file/d/|id=|/d/)([a-zA-Z0-9_-]{25,})', url)
+def extract_gdrive_id(url: str):
+    """Extracts Google Drive file ID from any standard sharing or direct URL."""
+    match = re.search(r'(?:file/d/|id=|/d/|open\?id=)([a-zA-Z0-9_-]{25,})', url)
     return match.group(1) if match else None
 
-async def get_gdrive_stream(session, file_id):
+def extract_filename_from_headers(headers) -> str:
+    """Extracts filename cleanly from Content-Disposition headers."""
+    cd = headers.get("Content-Disposition", "")
+    if not cd:
+        return ""
+    # Check RFC 5987 UTF-8 encoded filename
+    star_match = re.search(r"filename\*=UTF-8''([^;]+)", cd, re.IGNORECASE)
+    if star_match:
+        return unquote(star_match.group(1).strip('"\' '))
+    # Check standard filename attribute
+    norm_match = re.search(r'filename="?([^";]+)"?', cd, re.IGNORECASE)
+    if norm_match:
+        return unquote(norm_match.group(1).strip('"\' '))
+    return ""
+
+async def get_gdrive_stream(session: ClientSession, file_id: str):
+    """
+    Robust multi-stage Google Drive downloader:
+    1. Attempts direct download with confirm token.
+    2. Parses modern hidden form fields (confirm, uuid, id).
+    3. Handles cookie warnings and detects quota/permission errors.
+    """
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
     }
-    base_url = f"https://drive.google.com/uc?export=download&id={}"
-    resp = await session.get(base_url, headers=headers, allow_redirects=True)
 
-    if "text/html" in resp.headers.get("Content-Type", ""):
-        text = await resp.text()
-        resp.close()
+    # Step 1: Attempt direct download via usercontent domain
+    primary_url = f"https://drive.usercontent.google.com/download?id={}&export=download&confirm=t"
+    resp = await session.get(primary_url, headers=headers, allow_redirects=True)
 
-        match = re.search(r'(?:href|action)="([^"]+confirm=[^"]+)"', text)
-        if match:
-            next_url = match.group(1).replace('&amp;', '&')
-            if next_url.startswith('/'):
-                next_url = "https://drive.google.com" + next_url
-            return await session.get(next_url, headers=headers, allow_redirects=True)
+    # If already streaming binary content, return immediately
+    if "text/html" not in resp.headers.get("Content-Type", ""):
+        return resp, None
 
-        cookies = session.cookie_jar.filter_cookies(resp.url)
-        confirm_token = None
-        for k, v in cookies.items():
-            if k.startswith('download_warning'):
-                confirm_token = v.value
-                break
+    # Step 2: Parse the warning page HTML
+    html = await resp.text()
+    resp.close()
 
-        if confirm_token:
-            return await session.get(f"{}&confirm={}", headers=headers, allow_redirects=True)
+    # Detect quota limits or private files
+    if "Too many users have viewed or downloaded this file" in html or "Quota exceeded" in html:
+        raise ValueError("Google Drive download quota exceeded for this file. Try again later.")
+    if "You need access" in html or "Authorization required" in html:
+        raise ValueError("Google Drive file is private. Set sharing permissions to 'Anyone with the link'.")
 
-    return resp
+    # Attempt to extract original filename from HTML
+    detected_name = None
+    name_match = re.search(r'class=["\']uc-name-size["\'][^>]*>\s*(?:<a[^>]*>)?([^<]+)', html)
+    if name_match:
+        detected_name = name_match.group(1).strip()
+
+    # Step 3: Parse modern <form> with hidden inputs (confirm, uuid, id, export)
+    form_match = re.search(r'<form[^>]*action=["\']([^"\']+)["\'][^>]*>(.*?)</form>', html, re.DOTALL | re.IGNORECASE)
+    if form_match:
+        action_url = form_match.group(1).replace('&amp;', '&')
+        form_body = form_match.group(2)
+        params = {}
+        for inp in re.finditer(r'<input\s+[^>]*>', form_body, re.IGNORECASE):
+            tag = inp.group(0)
+            n = re.search(r'name=["\']([^"\']+)["\']', tag, re.IGNORECASE)
+            v = re.search(r'value=["\']([^"\']*)["\']', tag, re.IGNORECASE)
+            if n and v:
+                params[n.group(1)] = v.group(1)
+
+        if action_url.startswith('/'):
+            action_url = "https://drive.usercontent.google.com" + action_url
+
+        second_resp = await session.get(action_url, params=params, headers=headers, allow_redirects=True)
+        if "text/html" not in second_resp.headers.get("Content-Type", ""):
+            return second_resp, detected_name
+        second_resp.close()
+
+    # Step 4: Fallback to checking download_warning cookie
+    cookie_token = None
+    for k, v in session.cookie_jar.filter_cookies(resp.url).items():
+        if k.startswith('download_warning'):
+            cookie_token = v.value
+            break
+
+    if cookie_token:
+        fallback_url = f"https://drive.google.com/uc?export=download&id={}&confirm={cookie_token}"
+        third_resp = await session.get(fallback_url, headers=headers, allow_redirects=True)
+        if "text/html" not in third_resp.headers.get("Content-Type", ""):
+            return third_resp, detected_name
+        third_resp.close()
+
+    raise ValueError("Failed to bypass Google Drive virus scan warning. The file may be restricted or corrupted.")
 
 async def download_direct(url, workspace, msg, start_t, custom_name=None, gdrive_id=None):
     async with ClientSession() as sess:
+        detected_name = None
         if gdrive_id:
-            await msg.edit("🅿️ **Google Drive Fallback Detected...**")
-            r = await get_gdrive_stream(sess, gdrive_id)
+            await msg.edit("🅿️ **Google Drive Link Detected! Bypassing scan warning...**")
+            r, detected_name = await get_gdrive_stream(sess, gdrive_id)
         else:
             r = await sess.get(url, allow_redirects=True)
 
         if "text/html" in r.headers.get("Content-Type", ""):
             r.close()
-            raise ValueError("Direct link returned HTML (Access blocked, virus scan notice, or private file).")
+            raise ValueError("Direct link returned an HTML page instead of a file.")
 
         f_size = int(r.headers.get("Content-Length", 0))
+
+        # Determine best filename
         filename = custom_name
         if not filename:
-            if "Content-Disposition" in r.headers:
-                matches = re.findall(r'filename="?([^";]+)"?', r.headers["Content-Disposition"])
-                if matches:
-                    filename = matches[0]
+            filename = extract_filename_from_headers(r.headers) or detected_name
+        if not filename:
+            filename = unquote(url.split("/")[-1].split("?")[0]) or "downloaded_file.bin"
 
-        filename = filename or unquote(url.split("/")[-1].split("?")[0]) or "video.mp4"
+        # Sanitize name
+        filename = clean_double_extension(re.sub(r'[\\/*?:"<>|]', "", filename))
         if filename.lower() == "view" or "." not in filename:
             filename += ".mp4"
 
-        file_path = os.path.join(workspace, clean_double_extension(re.sub(r'[\\/*?:"<>|]', "", filename)))
+        file_path = os.path.join(workspace, filename)
 
-        await msg.edit(f"⬇️ **Leeching Direct Link...**\n🎬 `{os.path.basename(file_path)}`")
+        await msg.edit(f"⬇️ **Leeching...**\n🎬 `{os.path.basename(file_path)}`")
         with open(file_path, 'wb') as f:
             async for chunk in r.content.iter_chunked(1024 * 1024):
                 f.write(chunk)
@@ -516,27 +487,31 @@ async def download_direct(url, workspace, msg, start_t, custom_name=None, gdrive
         return file_path
 
 async def download_any_url(url, workspace, custom_name, msg, start_t):
+    # 1. Magnet links
     if url.startswith("magnet:?"):
         return await download_magnet(url, workspace, custom_name, msg, start_t)
 
-    is_zip = (custom_name and custom_name.lower().endswith('.zip')) or url.lower().endswith('.zip')
+    # 2. Google Drive links (Direct route, skips yt-dlp delays)
     gdrive_id = extract_gdrive_id(url)
+    if gdrive_id:
+        return await download_direct(url, workspace, msg, start_t, custom_name, gdrive_id=gdrive_id)
 
+    # 3. Direct Zip archives
+    is_zip = (custom_name and custom_name.lower().endswith('.zip')) or url.lower().endswith('.zip')
+
+    # 4. Media links (YouTube, Twitter, etc.) via yt-dlp
     if not is_zip:
         try:
-            if gdrive_id:
-                await msg.edit("🅿️ **Google Drive Link Detected! Extracting via yt-dlp...**")
-            else:
-                await msg.edit("🅿️ **Extracting File Info via yt-dlp...**")
-
+            await msg.edit("🅿️ **Extracting Media via yt-dlp...**")
             filename = await asyncio.to_thread(sync_yt_dlp_download, url, workspace, custom_name)
             if filename and os.path.exists(filename) and os.path.getsize(filename) > 0:
                 return filename
         except Exception:
             pass
 
-    return await download_direct(url, workspace, msg, start_t, custom_name, gdrive_id)
-
+    # 5. Standard Direct Links
+    return await download_direct(url, workspace, msg, start_t, custom_name)
+    
 # ============================================
 # --- 5. SECURED SMART WEB DASHBOARD ---
 # ============================================
