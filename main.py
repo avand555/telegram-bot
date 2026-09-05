@@ -110,7 +110,7 @@ KOYEB_PUBLIC_URL = os.getenv("KOYEB_PUBLIC_URL", "").strip().rstrip("/")
 KOYEB_APP_NAME = os.getenv("KOYEB_APP_NAME", "").strip()
 
 PORT = env_int("PORT", 8000)
-MAX_CONCURRENT_JOBS = max(1, env_int("MAX_CONCURRENT_JOBS", 4))
+MAX_CONCURRENT_JOBS = max(1, env_int("MAX_CONCURRENT_JOBS", 1))
 R2_UPLOAD_WORKERS = max(1, env_int("R2_UPLOAD_WORKERS", 8))
 R2_MULTIPART_CONCURRENCY = max(1, env_int("R2_MULTIPART_CONCURRENCY", 4))
 R2_MULTIPART_CHUNK_MB = max(5, env_int("R2_MULTIPART_CHUNK_MB", 8))
@@ -302,6 +302,68 @@ def get_largest_file(folder_path: str) -> str | None:
                 max_size = size
                 largest = path
     return largest
+
+
+def disk_status(path: str = "/") -> dict:
+    total, used, free = shutil.disk_usage(path)
+    return {
+        "total": total,
+        "used": used,
+        "free": free,
+        "percent": (used / total * 100.0) if total else 0.0,
+    }
+
+
+def cleanup_stale_temp_storage(max_age_seconds: int = 6 * 3600) -> None:
+    """Remove stale workspaces created by this application only."""
+    now = time.time()
+    roots = ("/tmp", "/app")
+    prefixes = ("dl_", "torrent_select_", "torrent_dl_")
+
+    for root in roots:
+        try:
+            for name in os.listdir(root):
+                if not name.startswith(prefixes):
+                    continue
+
+                path = os.path.join(root, name)
+                try:
+                    age = now - os.path.getmtime(path)
+                    if age < max_age_seconds:
+                        continue
+                    if os.path.isdir(path):
+                        shutil.rmtree(path, ignore_errors=True)
+                    elif os.path.isfile(path):
+                        os.remove(path)
+                except (OSError, ValueError):
+                    continue
+        except OSError:
+            continue
+
+    # gdown's cache is disposable and can accumulate after failed downloads.
+    cache = os.path.expanduser("~/.cache/gdown")
+    if os.path.isdir(cache):
+        try:
+            shutil.rmtree(cache, ignore_errors=True)
+        except Exception:
+            pass
+
+
+def ensure_disk_space(min_free_gb: float = 1.0) -> None:
+    status = disk_status("/")
+    logger.info(
+        "Disk: %s free / %s total (%.1f%% used)",
+        human_size(status["free"]),
+        human_size(status["total"]),
+        status["percent"],
+    )
+
+    minimum = int(min_free_gb * 1024**3)
+    if status["free"] < minimum:
+        raise RuntimeError(
+            f"Not enough local disk space: {human_size(status['free'])} free. "
+            f"At least {min_free_gb:.1f} GB is required."
+        )
 
 
 def build_public_base_url() -> str:
@@ -850,91 +912,82 @@ async def download_google_drive(
     custom_name: str | None = None,
     task_code: str | None = None,
 ) -> str:
-    """
-    Download a public Google Drive file using gdown.
-
-    gdown 6.1.0 accepts Drive share links directly and can resolve the real
-    filename before downloading. See the current gdown documentation/release notes.
-    """
+    """Download a public Google Drive file without a separate probe/download pass."""
     file_id = extract_gdrive_id(url)
     if not file_id:
         raise ValueError("Invalid or unsupported Google Drive file URL.")
 
+    cleanup_stale_temp_storage()
+    ensure_disk_space(1.0)
     os.makedirs(workspace, exist_ok=True)
 
     await msg.edit(
         "☁️ **Google Drive detected**\n"
-        "🔎 Resolving file information...",
+        "⬇️ Starting download...",
         buttons=[[Button.inline("🛑 Cancel", data=f"cancel_{task_code}")]] if task_code else None,
     )
 
-    detected_name = None
-    try:
-        info = await asyncio.to_thread(
-            gdown.download,
-            url=url,
-            output=None,
-            quiet=True,
-            skip_download=True,
-        )
-        detected_name = getattr(info, "path", None) if info else None
-    except Exception as exc:
-        logger.warning("Google Drive filename resolution failed: %s", exc)
-
-    if task_cancelled(task_code):
-        raise asyncio.CancelledError()
-
-    detected_name = sanitize_filename(detected_name, f"{file_id}.bin")
-
-    if custom_name:
-        requested = sanitize_filename(custom_name, detected_name)
-        detected_ext = os.path.splitext(detected_name)[1]
-        if "." not in requested and detected_ext:
-            requested += detected_ext
-        filename = requested
-    else:
-        filename = detected_name
-
-    output_path = get_unique_filename(os.path.join(workspace, filename))
-
-    await msg.edit(
-        f"⬇️ **Downloading from Google Drive...**\n"
-        f"🎬 `{os.path.basename(output_path)}`",
-        buttons=[[Button.inline("🛑 Cancel", data=f"cancel_{task_code}")]] if task_code else None,
-    )
+    # Download into a dedicated directory so gdown can determine the real filename.
+    before = {
+        os.path.realpath(os.path.join(workspace, name))
+        for name in os.listdir(workspace)
+    }
 
     try:
         result = await asyncio.to_thread(
             gdown.download,
-            url=url,
-            output=output_path,
+            id=file_id,
+            output=workspace,
             quiet=True,
             resume=True,
         )
     except Exception as exc:
+        disk = disk_status("/")
+        if "No space left on device" in str(exc) or disk["free"] < 256 * 1024**2:
+            cleanup_stale_temp_storage()
+            raise ValueError(
+                f"Google Drive download stopped because local disk space is exhausted. "
+                f"Free space after cleanup: {human_size(disk_status('/')['free'])}."
+            ) from exc
+
         raise ValueError(
-            "Google Drive download failed. Make sure the file is shared as "
-            "'Anyone with the link' and that Google has not throttled the file. "
+            "Google Drive download failed. Make sure the file is public ('Anyone with the link') "
+            "and that Google has not throttled it. "
             f"Details: {exc}"
         ) from exc
 
     if task_cancelled(task_code):
         raise asyncio.CancelledError()
 
-    file_path = result or output_path
-    if not os.path.isfile(file_path):
-        # Defensive fallback in case gdown changes the returned path.
-        candidates = [
-            os.path.join(workspace, item)
-            for item in os.listdir(workspace)
-            if os.path.isfile(os.path.join(workspace, item))
-        ]
-        if not candidates:
-            raise ValueError("Google Drive download produced no file.")
+    candidates = []
+    for name in os.listdir(workspace):
+        path = os.path.realpath(os.path.join(workspace, name))
+        if path not in before and os.path.isfile(path):
+            candidates.append(path)
+
+    file_path = None
+    if result and os.path.isfile(result):
+        file_path = os.path.realpath(result)
+    elif candidates:
         file_path = max(candidates, key=os.path.getsize)
+
+    if not file_path or not os.path.isfile(file_path):
+        raise ValueError("Google Drive download produced no file.")
 
     if os.path.getsize(file_path) <= 0:
         raise ValueError("Google Drive returned an empty file.")
+
+    if custom_name:
+        custom = sanitize_filename(custom_name)
+        current_ext = os.path.splitext(file_path)[1]
+        if "." not in custom and current_ext:
+            custom += current_ext
+        target = get_unique_filename(
+            os.path.join(workspace, custom)
+        )
+        if os.path.abspath(target) != os.path.abspath(file_path):
+            os.replace(file_path, target)
+            file_path = target
 
     await msg.edit(
         f"✅ **Google Drive Downloaded**\n"
@@ -3040,6 +3093,8 @@ async def upload_to_r2(
 
 async def main():
     validate_startup_config()
+    cleanup_stale_temp_storage()
+    ensure_disk_space(1.0)
 
     app = web.Application(client_max_size=0)
     app.add_routes(routes)
@@ -3050,6 +3105,7 @@ async def main():
     await site.start()
 
     logger.info("HTTP server started on port %s", PORT)
+    logger.info("Configured admins: %d | max concurrent jobs: %d", len(ADMIN_IDS), MAX_CONCURRENT_JOBS)
 
     try:
         await client.start(bot_token=BOT_TOKEN)
