@@ -78,11 +78,23 @@ def env_float(name: str, default: float) -> float:
 API_ID = env_int("API_ID", 0)
 API_HASH = os.getenv("API_HASH", "").strip()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-ADMIN_IDS = {
-    int(x.strip())
-    for x in os.environ.get("ADMIN_IDS", "").split(",")
-    if x.strip()
-}
+def parse_admin_ids(value: str) -> set[int]:
+    ids: set[int] = set()
+    for raw in value.split(","):
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            ids.add(int(raw))
+        except ValueError as exc:
+            raise RuntimeError(
+                f"Invalid ADMIN_IDS value: {raw!r}. "
+                "Use comma-separated numeric Telegram user IDs."
+            ) from exc
+    return ids
+
+
+ADMIN_IDS = parse_admin_ids(os.environ.get("ADMIN_IDS", ""))
 
 R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID", "").strip()
 R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID", "").strip()
@@ -123,6 +135,7 @@ global_semaphore = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
 routes = web.RouteTableDef()
 link_storage: dict[str, dict] = {}
 active_tasks: dict[str, dict] = {}
+pending_torrent_selections: dict[tuple[int, int], dict] = {}
 
 client = TelegramClient(
     "bot_session",
@@ -143,7 +156,7 @@ def validate_startup_config() -> None:
         missing.append("API_HASH")
     if not BOT_TOKEN:
         missing.append("BOT_TOKEN")
-    if ADMIN_IDS <= 0:
+    if not ADMIN_IDS:
         missing.append("ADMIN_IDS")
 
     if missing:
@@ -365,6 +378,17 @@ def purge_expired_link_storage() -> None:
             expired_tasks.append(code)
     for code in expired_tasks:
         active_tasks.pop(code, None)
+
+    expired_pending = []
+    for key, item in pending_torrent_selections.items():
+        created_at = float(item.get("created_at", now))
+        if now - created_at > 900:
+            expired_pending.append(key)
+
+    for key in expired_pending:
+        item = pending_torrent_selections.pop(key, None)
+        if item:
+            shutil.rmtree(item.get("workdir", ""), ignore_errors=True)
 
 
 # ============================================
@@ -1133,6 +1157,629 @@ async def sync_yt_dlp_download(
     return result_path
 
 
+
+# ============================================
+# --- TORRENT METADATA / MANUAL FILE SELECTOR ---
+# ============================================
+
+def normalize_magnet(value: str) -> str:
+    value = (value or "").strip()
+    value = value.replace("\\&", "&")
+    value = value.replace("\\:", ":")
+    return value
+
+
+def is_torrent_source(url: str) -> bool:
+    lower = (url or "").lower().strip()
+    return lower.startswith("magnet:?") or lower.endswith(".torrent")
+
+
+def parse_aria2_torrent_info(torrent_path: str) -> tuple[str, list[dict]]:
+    try:
+        output = subprocess.check_output(
+            ["aria2c", "-S", torrent_path],
+            text=True,
+            stderr=subprocess.STDOUT,
+            timeout=90,
+        )
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(
+            f"aria2c could not inspect the torrent: {exc.output[-1200:]}"
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("Torrent metadata inspection timed out.") from exc
+
+    name_match = re.search(r"(?im)^\s*Name:\s*(.+?)\s*$", output)
+    torrent_name = (
+        name_match.group(1).strip()
+        if name_match else Path(torrent_path).stem
+    )
+
+    files = []
+    current_idx = None
+    current_path = None
+
+    for raw_line in output.splitlines():
+        line = raw_line.rstrip()
+
+        match = re.match(r"^\s*(\d+)\|(.+?)\s*$", line)
+        if match:
+            current_idx = int(match.group(1))
+            current_path = match.group(2).strip()
+            continue
+
+        if current_idx is not None and current_path is not None:
+            size_match = re.match(r"^\s*\|(.+?)\s*$", line)
+            if size_match:
+                files.append({
+                    "idx": current_idx,
+                    "path": current_path,
+                    "size": size_match.group(1).strip(),
+                })
+                current_idx = None
+                current_path = None
+
+    if not files:
+        raise RuntimeError(
+            "No files were detected in torrent metadata."
+        )
+
+    return torrent_name, files
+
+
+def fetch_torrent_metadata_sync(source: str, workdir: str) -> str:
+    os.makedirs(workdir, exist_ok=True)
+    source = normalize_magnet(source)
+
+    if source.lower().startswith("magnet:?"):
+        cmd = [
+            "aria2c",
+            "--bt-metadata-only=true",
+            "--bt-save-metadata=true",
+            "--enable-dht=true",
+            "--bt-enable-lpd=false",
+            "--disable-ipv6=true",
+            "--summary-interval=0",
+            "--console-log-level=warn",
+            "--seed-time=0",
+            "--dir", workdir,
+            source,
+        ]
+    else:
+        cmd = [
+            "aria2c",
+            "--dir", workdir,
+            "--out", "source.torrent",
+            "--max-tries=3",
+            "--retry-wait=2",
+            "--console-log-level=warn",
+            source,
+        ]
+
+    completed = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=300,
+    )
+
+    if completed.returncode != 0:
+        raise RuntimeError(
+            "Could not fetch torrent metadata:\n"
+            + completed.stdout[-1500:]
+        )
+
+    torrent_files = [
+        os.path.join(workdir, name)
+        for name in os.listdir(workdir)
+        if name.lower().endswith(".torrent")
+        and os.path.isfile(os.path.join(workdir, name))
+    ]
+
+    if not torrent_files:
+        raise RuntimeError(
+            "No .torrent metadata file was produced."
+        )
+
+    return max(torrent_files, key=os.path.getmtime)
+
+
+def build_torrent_selection_messages(
+    torrent_name: str,
+    files: list[dict],
+    max_chars: int = 3400,
+) -> list[str]:
+    header = (
+        f"📦 **Torrent:** `{torrent_name}`\n\n"
+        "**Files inside torrent:**\n\n"
+    )
+    footer = (
+        "\n➡️ **Reply with:**\n"
+        "`1,3,5` • `1-5` • `all` • `cancel`"
+    )
+
+    pages = []
+    current = header
+
+    for item in files:
+        row = (
+            f"**[{item['idx']}]** `{item['path']}`\n"
+            f"    📦 `{item['size']}`\n"
+        )
+
+        if (
+            len(current) + len(row) + len(footer) > max_chars
+            and current != header
+        ):
+            pages.append(current + footer)
+            current = header
+
+        current += row
+
+    pages.append(current + footer)
+    return pages
+
+
+def parse_torrent_selection(
+    selection: str,
+    valid_indices: set[int],
+) -> list[int]:
+    selection = selection.strip().lower()
+
+    if selection == "all":
+        return sorted(valid_indices)
+
+    selected = set()
+
+    for token in re.split(r"[,\s]+", selection):
+        if not token:
+            continue
+
+        if re.fullmatch(r"\d+-\d+", token):
+            left, right = map(
+                int,
+                token.split("-", 1),
+            )
+
+            if left > right:
+                left, right = right, left
+
+            if right - left > 5000:
+                raise ValueError(
+                    "Selection range is too large."
+                )
+
+            selected.update(range(left, right + 1))
+
+        elif token.isdigit():
+            selected.add(int(token))
+
+        else:
+            raise ValueError(
+                f"Invalid selection token: `{token}`"
+            )
+
+    selected &= valid_indices
+
+    if not selected:
+        raise ValueError(
+            "No valid torrent files were selected."
+        )
+
+    return sorted(selected)
+
+
+def find_downloaded_selected_files(
+    workspace: str,
+    selected_items: list[dict],
+) -> list[str]:
+    local_files = []
+
+    for root, _, names in os.walk(workspace):
+        for name in names:
+            path = os.path.join(root, name)
+            if os.path.isfile(path):
+                local_files.append(path)
+
+    normalized = {}
+
+    for path in local_files:
+        rel = os.path.relpath(
+            path,
+            workspace,
+        ).replace(os.sep, "/")
+        normalized[rel] = path
+
+    results = []
+
+    for item in selected_items:
+        target = (
+            item["path"]
+            .replace("\\", "/")
+            .lstrip("./")
+        )
+
+        if target in normalized:
+            results.append(normalized[target])
+            continue
+
+        matches = [
+            path
+            for rel, path in normalized.items()
+            if rel == target
+            or rel.endswith("/" + target)
+        ]
+
+        if matches:
+            results.append(
+                min(
+                    matches,
+                    key=lambda p: len(
+                        os.path.relpath(p, workspace)
+                    ),
+                )
+            )
+
+    unique = []
+    seen = set()
+
+    for path in results:
+        real = os.path.realpath(path)
+        if real not in seen:
+            seen.add(real)
+            unique.append(path)
+
+    return unique
+
+
+async def start_torrent_selection(
+    event,
+    source: str,
+    target_folder: str | None,
+) -> bool:
+    source = normalize_magnet(source)
+
+    if not is_torrent_source(source):
+        return False
+
+    key = (event.chat_id, event.sender_id)
+
+    old = pending_torrent_selections.pop(key, None)
+    if old:
+        shutil.rmtree(
+            old.get("workdir", ""),
+            ignore_errors=True,
+        )
+
+    workdir = os.path.join(
+        "/tmp",
+        f"torrent_select_{uuid.uuid4().hex[:10]}",
+    )
+    os.makedirs(workdir, exist_ok=True)
+
+    status = await event.reply(
+        "🔎 **Reading torrent metadata...**\n"
+        "⏳ Please wait."
+    )
+
+    try:
+        torrent_path = await asyncio.to_thread(
+            fetch_torrent_metadata_sync,
+            source,
+            workdir,
+        )
+
+        torrent_name, files = await asyncio.to_thread(
+            parse_aria2_torrent_info,
+            torrent_path,
+        )
+
+        pending_torrent_selections[key] = {
+            "torrent_path": torrent_path,
+            "workdir": workdir,
+            "torrent_name": torrent_name,
+            "files": files,
+            "target_folder": target_folder,
+            "source": source,
+            "created_at": time.time(),
+        }
+
+        pages = build_torrent_selection_messages(
+            torrent_name,
+            files,
+        )
+
+        await status.delete()
+
+        for page_index, page in enumerate(pages, start=1):
+            if len(pages) > 1:
+                page = (
+                    f"📄 **Page {page_index}/{len(pages)}**\n\n"
+                    + page
+                )
+            await event.reply(page)
+
+        return True
+
+    except Exception as exc:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+        await status.edit(
+            f"❌ **Torrent metadata error:**\n"
+            f"`{str(exc)[:1800]}`"
+        )
+        return True
+
+
+async def download_selected_torrent(
+    torrent_path: str,
+    selected_indices: list[int],
+    workspace: str,
+    msg,
+    task_code: str,
+) -> None:
+    selection = ",".join(
+        str(i) for i in selected_indices
+    )
+
+    cmd = [
+        "aria2c",
+        "--seed-time=0",
+        "--bt-stop-timeout=300",
+        "--summary-interval=2",
+        "--console-log-level=warn",
+        "--disable-ipv6=true",
+        "--bt-enable-lpd=false",
+        "--enable-dht=true",
+        "--bt-max-peers=128",
+        "--max-tries=5",
+        "--retry-wait=3",
+        "--file-allocation=none",
+        "--continue=true",
+        "--split=8",
+        "--min-split-size=1M",
+        f"--select-file={selection}",
+        "--dir", workspace,
+        "-T", torrent_path,
+    ]
+
+    await msg.edit(
+        f"⬇️ **Downloading selected torrent files...**\n\n"
+        f"📑 **Selected:** `{selection}`",
+        buttons=task_cancel_button(task_code),
+    )
+
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+
+    active_tasks[task_code]["process"] = process
+    last_update = 0.0
+
+    try:
+        while True:
+            if task_cancelled(task_code):
+                try:
+                    process.terminate()
+                except ProcessLookupError:
+                    pass
+                raise asyncio.CancelledError()
+
+            line = await process.stdout.readline()
+            if not line:
+                break
+
+            now = time.time()
+
+            if now - last_update >= PROGRESS_UPDATE_SECONDS:
+                last_update = now
+
+                line_text = line.decode(
+                    "utf-8",
+                    errors="replace",
+                ).strip()
+
+                if line_text:
+                    try:
+                        await msg.edit(
+                            f"⬇️ **Torrent Download**\n\n"
+                            f"📑 Selected: `{selection}`\n"
+                            f"🌀 `{line_text[-1200:]}`",
+                            buttons=task_cancel_button(
+                                task_code
+                            ),
+                        )
+                    except Exception:
+                        pass
+
+        return_code = await process.wait()
+
+        if return_code != 0:
+            raise RuntimeError(
+                f"aria2c exited with code {return_code}."
+            )
+
+    finally:
+        if process.returncode is None:
+            try:
+                process.terminate()
+            except ProcessLookupError:
+                pass
+
+
+async def finish_selected_torrent_to_r2(
+    event,
+    pending: dict,
+    selected_indices: list[int],
+) -> None:
+    task_code, _ = new_task(
+        "torrent-selection"
+    )
+
+    workspace = os.path.join(
+        "/tmp",
+        f"torrent_dl_{uuid.uuid4().hex[:10]}",
+    )
+    os.makedirs(workspace, exist_ok=True)
+
+    status = await event.reply(
+        f"✅ **Selection received:** "
+        f"`{','.join(map(str, selected_indices))}`\n\n"
+        f"⬇️ **Starting selected-file download...**",
+        buttons=task_cancel_button(task_code),
+    )
+
+    index_set = set(selected_indices)
+
+    selected_items = [
+        item
+        for item in pending["files"]
+        if int(item["idx"]) in index_set
+    ]
+
+    try:
+        await download_selected_torrent(
+            pending["torrent_path"],
+            selected_indices,
+            workspace,
+            status,
+            task_code,
+        )
+
+        downloaded_files = await asyncio.to_thread(
+            find_downloaded_selected_files,
+            workspace,
+            selected_items,
+        )
+
+        if len(downloaded_files) != len(selected_items):
+            raise RuntimeError(
+                f"Only {len(downloaded_files)} of "
+                f"{len(selected_items)} selected files "
+                "were found after downloading."
+            )
+
+        await status.edit(
+            f"✅ **Selected files downloaded.**\n\n"
+            f"📑 Files: `{len(downloaded_files)}`\n"
+            f"📤 **Uploading to Cloudflare R2...**"
+        )
+
+        uploaded = []
+
+        for local_path in downloaded_files:
+            if task_cancelled(task_code):
+                raise asyncio.CancelledError()
+
+            filename = sanitize_filename(
+                os.path.basename(local_path),
+                "downloaded_file",
+            )
+
+            rel_path = os.path.relpath(
+                local_path,
+                workspace,
+            ).replace(os.sep, "/")
+
+            base_folder = pending.get(
+                "target_folder"
+            )
+
+            if base_folder:
+                r2_folder = sanitize_prefix(
+                    base_folder,
+                    "uploads",
+                )
+            else:
+                r2_folder = sanitize_prefix(
+                    pending["torrent_name"],
+                    "torrent",
+                )
+
+            s3_key = f"{r2_folder}/{rel_path}"
+
+            await status.edit(
+                f"📤 **Uploading to R2...**\n"
+                f"🎬 `{filename}`"
+            )
+
+            await asyncio.to_thread(
+                sync_r2_upload,
+                local_path,
+                s3_key,
+                asyncio.get_running_loop(),
+                status,
+                time.time(),
+            )
+
+            uploaded.append(
+                (filename, build_r2_public_url(s3_key), s3_key)
+            )
+
+        result = [
+            "✅ **Torrent selection complete!**",
+            "",
+            f"📦 **Uploaded files:** `{len(uploaded)}`",
+            "",
+        ]
+
+        buttons = []
+
+        for number, (filename, url, s3_key) in enumerate(
+            uploaded,
+            start=1,
+        ):
+            result.append(
+                f"**{number}.** `{filename}`\n"
+                f"🔗 `{url}`"
+            )
+
+            code = secrets.token_urlsafe(10)
+            link_storage[code] = {
+                "kind": "r2",
+                "s3_key": s3_key,
+                "created_at": time.time(),
+            }
+
+            buttons.append([
+                Button.inline(
+                    f"🗑️ Delete {filename[:35]}",
+                    data=f"delr2_{code}",
+                )
+            ])
+
+        await status.edit(
+            "\n".join(result)[:3900],
+            buttons=buttons[:20],
+            link_preview=False,
+        )
+
+    except asyncio.CancelledError:
+        await status.edit(
+            "🛑 **Torrent task cancelled.**"
+        )
+
+    except Exception as exc:
+        logger.exception(
+            "Selected torrent → R2 failed"
+        )
+        await status.edit(
+            f"❌ **Torrent/R2 Error:**\n"
+            f"`{str(exc)[:1800]}`"
+        )
+
+    finally:
+        remove_task(task_code)
+        shutil.rmtree(
+            workspace,
+            ignore_errors=True,
+        )
+        free_memory()
+
+
 async def download_magnet(
     magnet: str,
     workspace: str,
@@ -1835,19 +2482,106 @@ def task_cancel_button(task_code: str):
 @client.on(
     events.NewMessage(
         incoming=True,
-        func=lambda e: e.sender_id in ADMIN_IDS
+        func=lambda e: e.sender_id in ADMIN_IDS,
     )
 )
 async def master_handler(event):
     purge_expired_link_storage()
 
+    pending_key = (
+        event.chat_id,
+        event.sender_id,
+    )
+
+    # =========================================================
+    # Pending torrent selection response
+    # =========================================================
+    pending = pending_torrent_selections.get(
+        pending_key
+    )
+
+    if pending and event.text:
+        selection_text = event.text.strip()
+
+        if selection_text.lower() == "cancel":
+            pending_torrent_selections.pop(
+                pending_key,
+                None,
+            )
+
+            shutil.rmtree(
+                pending.get("workdir", ""),
+                ignore_errors=True,
+            )
+
+            await event.reply(
+                "🛑 **Torrent selection cancelled.**"
+            )
+            return
+
+        valid_indices = {
+            int(item["idx"])
+            for item in pending["files"]
+        }
+
+        try:
+            selected = parse_torrent_selection(
+                selection_text,
+                valid_indices,
+            )
+        except ValueError as exc:
+            await event.reply(
+                f"❌ `{str(exc)}`\n\n"
+                "**Examples:**\n"
+                "`1,3,5`\n"
+                "`1-5`\n"
+                "`all`\n"
+                "`cancel`"
+            )
+            return
+
+        pending_torrent_selections.pop(
+            pending_key,
+            None,
+        )
+
+        await finish_selected_torrent_to_r2(
+            event,
+            pending,
+            selected,
+        )
+
+        shutil.rmtree(
+            pending.get("workdir", ""),
+            ignore_errors=True,
+        )
+
+        return
+
+    # =========================================================
+    # Telegram file
+    # =========================================================
     if event.file:
-        filename = sanitize_filename(event.file.name, "file.bin")
+        filename = sanitize_filename(
+            event.file.name,
+            "file.bin",
+        )
+
         await event.reply(
             f"📂 **File Detected:** `{filename}`",
             buttons=[
-                [Button.inline("🔗 Generate Direct Link", data=f"link_{event.id}")],
-                [Button.inline("🛡️ Upload to Cloudflare R2", data=f"r2_{event.id}")],
+                [
+                    Button.inline(
+                        "🔗 Generate Direct Link",
+                        data=f"link_{event.id}",
+                    )
+                ],
+                [
+                    Button.inline(
+                        "🛡️ Upload to Cloudflare R2",
+                        data=f"r2_{event.id}",
+                    )
+                ],
             ],
         )
         return
@@ -1855,25 +2589,69 @@ async def master_handler(event):
     if not event.text:
         return
 
+    text_value = event.text.strip()
+
     if not (
-        event.text.strip().lower().startswith("http")
-        or event.text.strip().lower().startswith("magnet:?")
+        text_value.lower().startswith("http")
+        or text_value.lower().startswith("magnet:?")
     ):
         return
 
-    urls, custom_name, target_folder = parse_admin_input(event.text)
-    if not urls:
-        return await event.reply("❌ No supported URL found.")
+    urls, custom_name, target_folder = parse_admin_input(
+        text_value
+    )
 
+    if not urls:
+        await event.reply(
+            "❌ **No supported URL found.**"
+        )
+        return
+
+    # Manual torrent selection is one torrent at a time.
+    torrent_urls = [
+        url
+        for url in urls
+        if is_torrent_source(url)
+    ]
+
+    if torrent_urls:
+        if len(urls) != 1:
+            await event.reply(
+                "⚠️ **Send one torrent URL at a time "
+                "when using manual file selection.**"
+            )
+            return
+
+        if await start_torrent_selection(
+            event,
+            torrent_urls[0],
+            target_folder,
+        ):
+            return
+
+    # =========================================================
+    # Existing non-torrent URL pipeline
+    # =========================================================
     async with global_semaphore:
         for url in urls:
             task_code, _ = new_task("url")
+
             msg = await event.reply(
-                f"🔗 **Processing Link:**\n`{url[:120]}`",
-                buttons=task_cancel_button(task_code),
+                f"🔗 **Processing Link:**\n"
+                f"`{url[:120]}`",
+                buttons=task_cancel_button(
+                    task_code
+                ),
             )
-            workspace = f"dl_{uuid.uuid4().hex[:10]}"
-            os.makedirs(workspace, exist_ok=True)
+
+            workspace = (
+                f"dl_{uuid.uuid4().hex[:10]}"
+            )
+            os.makedirs(
+                workspace,
+                exist_ok=True,
+            )
+
             start_t = time.time()
 
             try:
@@ -1889,10 +2667,17 @@ async def master_handler(event):
                 if task_cancelled(task_code):
                     raise asyncio.CancelledError()
 
-                if not final_path or not os.path.isfile(final_path):
-                    raise ValueError("Downloader returned no usable file.")
+                if (
+                    not final_path
+                    or not os.path.isfile(final_path)
+                ):
+                    raise ValueError(
+                        "Downloader returned no usable file."
+                    )
 
-                filename = os.path.basename(final_path)
+                filename = os.path.basename(
+                    final_path
+                )
 
                 if filename.lower().endswith(".zip"):
                     kind, hls_url = await upload_zip_or_hls(
@@ -1907,7 +2692,9 @@ async def master_handler(event):
                         await msg.edit(
                             f"✅ **HLS Uploaded to R2!**\n\n"
                             f"📦 `{filename}`\n"
-                            f"📺 **Master Stream:**\n`{hls_url}`"
+                            f"📺 **Master Stream:**\n"
+                            f"`{hls_url}`",
+                            link_preview=False,
                         )
                     else:
                         r2_url, code = await upload_to_r2(
@@ -1915,11 +2702,19 @@ async def master_handler(event):
                             msg,
                             target_folder,
                         )
+
                         await msg.edit(
                             f"✅ **ZIP Uploaded to R2!**\n\n"
                             f"📦 `{filename}`\n"
                             f"🔗 `{r2_url}`",
-                            buttons=[[Button.inline("🗑️ Delete from R2", data=f"delr2_{code}")]],
+                            buttons=[
+                                [
+                                    Button.inline(
+                                        "🗑️ Delete from R2",
+                                        data=f"delr2_{code}",
+                                    )
+                                ]
+                            ],
                             link_preview=False,
                         )
                 else:
@@ -1928,31 +2723,54 @@ async def master_handler(event):
                         msg,
                         target_folder,
                     )
+
                     await msg.edit(
                         f"✅ **Downloaded & Uploaded!**\n\n"
                         f"🎬 `{filename}`\n"
                         f"🔗 `{r2_url}`",
-                        buttons=[[Button.inline("🗑️ Delete from R2", data=f"delr2_{code}")]],
+                        buttons=[
+                            [
+                                Button.inline(
+                                    "🗑️ Delete from R2",
+                                    data=f"delr2_{code}",
+                                )
+                            ]
+                        ],
                         link_preview=False,
                     )
 
             except asyncio.CancelledError:
                 try:
-                    await msg.edit("🛑 **Task cancelled.**")
-                except Exception:
-                    pass
-            except Exception as exc:
-                logger.exception("URL processing failed: %s", url)
-                try:
                     await msg.edit(
-                        f"❌ **Error**\n`{url[:120]}`\n\n"
-                        f"**Reason:** `{str(exc)[:1500]}`"
+                        "🛑 **Task cancelled.**"
                     )
                 except Exception:
                     pass
+
+            except Exception as exc:
+                logger.exception(
+                    "URL processing failed: %s",
+                    url,
+                )
+
+                try:
+                    await msg.edit(
+                        f"❌ **Error**\n"
+                        f"`{url[:120]}`\n\n"
+                        f"**Reason:** "
+                        f"`{str(exc)[:1500]}`"
+                    )
+                except Exception:
+                    pass
+
             finally:
                 remove_task(task_code)
-                shutil.rmtree(workspace, ignore_errors=True)
+
+                shutil.rmtree(
+                    workspace,
+                    ignore_errors=True,
+                )
+
                 free_memory()
 
 
@@ -2009,8 +2827,8 @@ async def download_telegram_to_file(
 
 @client.on(events.CallbackQuery)
 async def on_callback(event):
-if event.sender_id not in ADMIN_IDS:
-    return
+    if event.sender_id not in ADMIN_IDS:
+        return
 
     purge_expired_link_storage()
     data = event.data.decode("utf-8", errors="ignore")
