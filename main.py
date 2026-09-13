@@ -51,6 +51,14 @@ import nest_asyncio
 
 nest_asyncio.apply()
 
+# Keep gdown cache in a controlled disposable location. Recent gdown versions
+# create it on demand, but explicitly creating it also prevents missing-path
+# errors on fresh Koyeb containers.
+os.environ.setdefault("GDOWN_CACHE_DIR", "/tmp/gdown-cache")
+os.environ.setdefault("XDG_CACHE_HOME", "/tmp")
+os.makedirs(os.getenv("GDOWN_CACHE_DIR", "/tmp/gdown-cache"), exist_ok=True)
+os.makedirs(os.path.expanduser("~/.cache/gdown"), exist_ok=True)
+
 # ============================================
 # --- 2. CONFIGURATION ---
 # ============================================
@@ -111,6 +119,9 @@ KOYEB_APP_NAME = os.getenv("KOYEB_APP_NAME", "").strip()
 
 PORT = env_int("PORT", 8000)
 MAX_CONCURRENT_JOBS = max(1, env_int("MAX_CONCURRENT_JOBS", 1))
+MIN_FREE_DISK_GB = max(0.25, env_float("MIN_FREE_DISK_GB", 1.0))
+GDOWN_CACHE_DIR = os.getenv("GDOWN_CACHE_DIR", "/tmp/gdown-cache").strip() or "/tmp/gdown-cache"
+DOWNLOAD_ROOT = os.getenv("DOWNLOAD_ROOT", "/tmp/telegram-r2-bot").strip() or "/tmp/telegram-r2-bot"
 R2_UPLOAD_WORKERS = max(1, env_int("R2_UPLOAD_WORKERS", 8))
 R2_MULTIPART_CONCURRENCY = max(1, env_int("R2_MULTIPART_CONCURRENCY", 4))
 R2_MULTIPART_CHUNK_MB = max(5, env_int("R2_MULTIPART_CHUNK_MB", 8))
@@ -315,18 +326,33 @@ def disk_status(path: str = "/") -> dict:
 
 
 def cleanup_stale_temp_storage(max_age_seconds: int = 6 * 3600) -> None:
-    """Remove stale workspaces created by this application only."""
+    """Remove stale temporary data created by this application/downloaders."""
     now = time.time()
-    roots = ("/tmp", "/app")
-    prefixes = ("dl_", "torrent_select_", "torrent_dl_")
+
+    roots = (DOWNLOAD_ROOT, "/tmp")
+    prefixes = (
+        "dl_",
+        "torrent_select_",
+        "torrent_dl_",
+        "gdown-",
+        "gdown_",
+    )
 
     for root in roots:
         try:
+            if not os.path.isdir(root):
+                continue
             for name in os.listdir(root):
-                if not name.startswith(prefixes):
+                path = os.path.join(root, name)
+
+                # Never delete the base DOWNLOAD_ROOT itself.
+                if os.path.abspath(path) == os.path.abspath(DOWNLOAD_ROOT):
                     continue
 
-                path = os.path.join(root, name)
+                # On /tmp only remove known application prefixes.
+                if root == "/tmp" and not name.startswith(prefixes):
+                    continue
+
                 try:
                     age = now - os.path.getmtime(path)
                     if age < max_age_seconds:
@@ -340,17 +366,34 @@ def cleanup_stale_temp_storage(max_age_seconds: int = 6 * 3600) -> None:
         except OSError:
             continue
 
-    # gdown's cache is disposable and can accumulate after failed downloads.
-    cache = os.path.expanduser("~/.cache/gdown")
-    if os.path.isdir(cache):
-        try:
-            shutil.rmtree(cache, ignore_errors=True)
-        except Exception:
-            pass
+    # Remove old temporary torrent/DHT files produced by older versions.
+    for pattern in ("/tmp/meta_*.torrent", "/tmp/dht_*.dat", "/tmp/*.torrent"):
+        for path in __import__("glob").glob(pattern):
+            try:
+                if os.path.isfile(path):
+                    age = now - os.path.getmtime(path)
+                    if age >= 3600:
+                        os.remove(path)
+            except OSError:
+                pass
+
+    # Only the custom disposable cache is removed. Preserve ~/.cache/gdown
+    # because it may contain a deliberately supplied cookies.txt session.
+    try:
+        if os.path.isdir(GDOWN_CACHE_DIR):
+            shutil.rmtree(GDOWN_CACHE_DIR, ignore_errors=True)
+        os.makedirs(GDOWN_CACHE_DIR, exist_ok=True)
+        os.makedirs(os.path.expanduser("~/.cache/gdown"), exist_ok=True)
+    except OSError:
+        pass
+
+    free_memory()
 
 
-def ensure_disk_space(min_free_gb: float = 1.0) -> None:
+def ensure_disk_space(min_free_gb: float | None = None) -> None:
     status = disk_status("/")
+    required_gb = MIN_FREE_DISK_GB if min_free_gb is None else max(0.1, min_free_gb)
+
     logger.info(
         "Disk: %s free / %s total (%.1f%% used)",
         human_size(status["free"]),
@@ -358,11 +401,26 @@ def ensure_disk_space(min_free_gb: float = 1.0) -> None:
         status["percent"],
     )
 
-    minimum = int(min_free_gb * 1024**3)
+    minimum = int(required_gb * 1024**3)
     if status["free"] < minimum:
         raise RuntimeError(
             f"Not enough local disk space: {human_size(status['free'])} free. "
-            f"At least {min_free_gb:.1f} GB is required."
+            f"At least {required_gb:.1f} GB must remain available. "
+            "Clean old downloads or increase the instance disk."
+        )
+
+
+def ensure_file_space(expected_bytes: int | None = None) -> None:
+    """Ensure enough disk exists for a local-download path."""
+    status = disk_status("/")
+    reserve = max(int(MIN_FREE_DISK_GB * 1024**3), 512 * 1024**2)
+    required = reserve + max(0, int(expected_bytes or 0))
+
+    if status["free"] < required:
+        raise RuntimeError(
+            "Not enough local disk space for this download: "
+            f"{human_size(status['free'])} free, but approximately "
+            f"{human_size(required)} is required."
         )
 
 
@@ -912,14 +970,15 @@ async def download_google_drive(
     custom_name: str | None = None,
     task_code: str | None = None,
 ) -> str:
-    """Download a public Google Drive file without a separate probe/download pass."""
+    """Download a public Google Drive file using current gdown with cache recovery."""
     file_id = extract_gdrive_id(url)
     if not file_id:
         raise ValueError("Invalid or unsupported Google Drive file URL.")
 
-    cleanup_stale_temp_storage()
-    ensure_disk_space(1.0)
+    cleanup_stale_temp_storage(max_age_seconds=0)
+    ensure_disk_space()
     os.makedirs(workspace, exist_ok=True)
+    os.makedirs(GDOWN_CACHE_DIR, exist_ok=True)
 
     await msg.edit(
         "☁️ **Google Drive detected**\n"
@@ -927,41 +986,72 @@ async def download_google_drive(
         buttons=[[Button.inline("🛑 Cancel", data=f"cancel_{task_code}")]] if task_code else None,
     )
 
-    # Download into a dedicated directory so gdown can determine the real filename.
+    output_dir = os.path.abspath(workspace)
     before = {
-        os.path.realpath(os.path.join(workspace, name))
-        for name in os.listdir(workspace)
+        os.path.realpath(os.path.join(output_dir, name))
+        for name in os.listdir(output_dir)
     }
 
-    try:
-        result = await asyncio.to_thread(
-            gdown.download,
-            id=file_id,
-            output=workspace,
-            quiet=True,
-            resume=True,
-        )
-    except Exception as exc:
-        disk = disk_status("/")
-        if "No space left on device" in str(exc) or disk["free"] < 256 * 1024**2:
-            cleanup_stale_temp_storage()
-            raise ValueError(
-                f"Google Drive download stopped because local disk space is exhausted. "
-                f"Free space after cleanup: {human_size(disk_status('/')['free'])}."
-            ) from exc
+    last_error = None
 
+    for attempt in range(2):
+        try:
+            result = await asyncio.to_thread(
+                gdown.download,
+                id=file_id,
+                output=output_dir,
+                quiet=True,
+                resume=True,
+            )
+            last_error = None
+            break
+        except FileNotFoundError as exc:
+            last_error = exc
+            logger.warning(
+                "gdown cache/path error on attempt %d: %s",
+                attempt + 1,
+                exc,
+            )
+            # A common fresh-container problem is a missing cookies.txt/cache path.
+            try:
+                shutil.rmtree(GDOWN_CACHE_DIR, ignore_errors=True)
+                os.makedirs(GDOWN_CACHE_DIR, exist_ok=True)
+                os.makedirs(os.path.expanduser("~/.cache/gdown"), exist_ok=True)
+            except OSError:
+                pass
+            if attempt == 0:
+                continue
+        except Exception as exc:
+            last_error = exc
+            logger.warning(
+                "gdown failed on attempt %d: %s",
+                attempt + 1,
+                exc,
+            )
+            if "No space left on device" in str(exc):
+                cleanup_stale_temp_storage(max_age_seconds=0)
+                continue
+            break
+
+    if last_error is not None:
+        if "No space left on device" in str(last_error):
+            raise ValueError(
+                "Google Drive download stopped because the Koyeb instance ran out of local disk space. "
+                f"Free space now: {human_size(disk_status('/')['free'])}. "
+                "Increase disk size or remove old temporary files."
+            ) from last_error
         raise ValueError(
-            "Google Drive download failed. Make sure the file is public ('Anyone with the link') "
-            "and that Google has not throttled it. "
-            f"Details: {exc}"
-        ) from exc
+            "Google Drive download failed. The file must be publicly accessible ('Anyone with the link'), "
+            "and Google may also throttle heavily accessed files. "
+            f"Details: {last_error}"
+        ) from last_error
 
     if task_cancelled(task_code):
         raise asyncio.CancelledError()
 
     candidates = []
-    for name in os.listdir(workspace):
-        path = os.path.realpath(os.path.join(workspace, name))
+    for name in os.listdir(output_dir):
+        path = os.path.realpath(os.path.join(output_dir, name))
         if path not in before and os.path.isfile(path):
             candidates.append(path)
 
@@ -983,7 +1073,7 @@ async def download_google_drive(
         if "." not in custom and current_ext:
             custom += current_ext
         target = get_unique_filename(
-            os.path.join(workspace, custom)
+            os.path.join(output_dir, custom)
         )
         if os.path.abspath(target) != os.path.abspath(file_path):
             os.replace(file_path, target)
@@ -995,6 +1085,226 @@ async def download_google_drive(
         f"📦 `{human_size(os.path.getsize(file_path))}`"
     )
     return file_path
+
+
+async def probe_direct_url(url: str) -> dict | None:
+    """HEAD-probe a URL to determine whether it is a binary file rather than HTML."""
+    timeout = ClientTimeout(total=30, connect=15, sock_read=15)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; TelegramR2Bot/1.0)",
+        "Accept": "*/*",
+    }
+
+    try:
+        async with ClientSession(timeout=timeout, headers=headers) as session:
+            async with session.head(url, allow_redirects=True) as response:
+                content_type = response.headers.get("Content-Type", "").lower()
+                return {
+                    "status": response.status,
+                    "content_type": content_type,
+                    "content_length": int(response.headers.get("Content-Length", 0) or 0),
+                    "content_disposition": response.headers.get("Content-Disposition", ""),
+                    "final_url": str(response.url),
+                }
+    except Exception as exc:
+        logger.info("HEAD probe failed for %s: %s", url[:120], exc)
+        return None
+
+
+def content_disposition_filename(header: str) -> str:
+    if not header:
+        return ""
+    match = re.search(
+        r"filename\*=UTF-8''([^;]+)|filename=[\"']?([^\"';]+)",
+        header,
+        re.IGNORECASE,
+    )
+    if not match:
+        return ""
+    return unquote(match.group(1) or match.group(2) or "").strip()
+
+
+async def stream_direct_url_to_r2(
+    url: str,
+    msg,
+    start_t: float,
+    custom_name: str | None,
+    target_folder: str | None,
+    task_code: str,
+) -> tuple[str, str, str] | None:
+    """
+    Stream a public HTTP(S) file directly into R2 using multipart upload.
+    This avoids storing large direct downloads on the small Koyeb disk.
+    Returns (public_url, action_code, filename), or None if the URL looks like HTML.
+    """
+    probe = await probe_direct_url(url)
+    if not probe or probe["status"] < 200 or probe["status"] >= 400:
+        return None
+
+    content_type = probe["content_type"]
+    if "text/html" in content_type or "application/json" in content_type:
+        return None
+
+    lower_path = urlparse(probe["final_url"]).path.lower()
+    if lower_path.endswith(".zip") or (custom_name and custom_name.lower().endswith(".zip")):
+        # ZIP/HLS needs local storage for extraction.
+        return None
+
+    filename = content_disposition_filename(probe["content_disposition"])
+    if not filename:
+        filename = unquote(urlparse(probe["final_url"]).path.rsplit("/", 1)[-1])
+    filename = sanitize_filename(custom_name or filename, "download.bin")
+
+    if filename.lower() in {"download", "view", "uc", ""}:
+        extension = mimetypes.guess_extension(content_type) or ""
+        filename = f"download{extension or '.bin'}"
+
+    now = dt.datetime.now(dt.timezone.utc)
+    prefix = sanitize_prefix(
+        target_folder,
+        f"{now.year}/{now.month:02d}/{now.day:02d}",
+    )
+    s3_key = f"{prefix}/{filename}"
+
+    s3 = get_r2_client()
+    extra = r2_extra_args(filename)
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; TelegramR2Bot/1.0)",
+        "Accept": "*/*",
+    }
+    timeout = ClientTimeout(
+        total=None,
+        connect=30,
+        sock_read=HTTP_TIMEOUT_SECONDS,
+    )
+
+    multipart = None
+    uploaded_parts = []
+    part_number = 0
+    transferred = 0
+    total = int(probe.get("content_length") or 0)
+    chunk_size = max(5, R2_MULTIPART_CHUNK_MB) * 1024 * 1024
+    buffer = bytearray()
+
+    async def upload_part(part: bytes):
+        nonlocal part_number, transferred
+        part_number += 1
+        response = await asyncio.to_thread(
+            s3.upload_part,
+            Bucket=R2_BUCKET_NAME,
+            Key=s3_key,
+            UploadId=multipart["UploadId"],
+            PartNumber=part_number,
+            Body=part,
+        )
+        uploaded_parts.append({
+            "ETag": response["ETag"],
+            "PartNumber": part_number,
+        })
+        transferred += len(part)
+
+        percent = (transferred / total * 100.0) if total else 0.0
+        text = (
+            f"📤 **Direct → R2**\n"
+            f"🎬 `{filename}`\n\n"
+            f"🌀 **Progress:** `{percent:.2f}%`\n"
+            f"⚡ **Transferred:** `{human_size(transferred)}`"
+        )
+        if total:
+            text += f" / `{human_size(total)}`"
+
+        schedule_message_edit(
+            asyncio.get_running_loop(),
+            msg,
+            text,
+            buttons=task_cancel_button(task_code),
+        )
+
+    try:
+        multipart = await asyncio.to_thread(
+            s3.create_multipart_upload,
+            Bucket=R2_BUCKET_NAME,
+            Key=s3_key,
+            **extra,
+        )
+
+        await msg.edit(
+            f"📤 **Streaming directly to Cloudflare R2...**\n"
+            f"🎬 `{filename}`",
+            buttons=task_cancel_button(task_code),
+        )
+
+        async with ClientSession(timeout=timeout, headers=headers) as session:
+            async with session.get(url, allow_redirects=True) as response:
+                response.raise_for_status()
+
+                actual_type = response.headers.get("Content-Type", "").lower()
+                if "text/html" in actual_type:
+                    raise ValueError("The URL returned HTML instead of a file.")
+
+                async for chunk in response.content.iter_chunked(1024 * 1024):
+                    if task_cancelled(task_code):
+                        raise asyncio.CancelledError()
+
+                    buffer.extend(chunk)
+
+                    while len(buffer) >= chunk_size:
+                        piece = bytes(buffer[:chunk_size])
+                        del buffer[:chunk_size]
+                        await upload_part(piece)
+
+                if buffer:
+                    await upload_part(bytes(buffer))
+
+        if not uploaded_parts:
+            raise ValueError("The direct URL returned no file data.")
+
+        complete = await asyncio.to_thread(
+            s3.complete_multipart_upload,
+            Bucket=R2_BUCKET_NAME,
+            Key=s3_key,
+            UploadId=multipart["UploadId"],
+            MultipartUpload={"Parts": uploaded_parts},
+        )
+
+        if not complete:
+            raise ValueError("R2 multipart completion returned no result.")
+
+    except asyncio.CancelledError:
+        if multipart:
+            try:
+                await asyncio.to_thread(
+                    s3.abort_multipart_upload,
+                    Bucket=R2_BUCKET_NAME,
+                    Key=s3_key,
+                    UploadId=multipart["UploadId"],
+                )
+            except Exception:
+                pass
+        raise
+    except Exception:
+        if multipart:
+            try:
+                await asyncio.to_thread(
+                    s3.abort_multipart_upload,
+                    Bucket=R2_BUCKET_NAME,
+                    Key=s3_key,
+                    UploadId=multipart["UploadId"],
+                )
+            except Exception:
+                pass
+        raise
+
+    purge_expired_link_storage()
+    code = secrets.token_urlsafe(10)
+    link_storage[code] = {
+        "kind": "r2",
+        "s3_key": s3_key,
+        "created_at": time.time(),
+    }
+
+    return build_r2_public_url(s3_key), code, filename
 
 
 async def download_direct(
@@ -1016,6 +1326,12 @@ async def download_direct(
         "Accept": "*/*",
     }
 
+    # For local downloads, reserve enough disk before opening the response.
+    probe = await probe_direct_url(url)
+    expected_size = int(probe.get("content_length", 0)) if probe else 0
+    ensure_file_space(expected_size or None)
+
+    file_path = None
     async with ClientSession(timeout=timeout, headers=headers) as session:
         try:
             async with session.get(url, allow_redirects=True) as response:
@@ -1068,31 +1384,45 @@ async def download_direct(
                 last_update = 0.0
                 chunk_size = DOWNLOAD_CHUNK_MB * 1024 * 1024
 
-                with open(file_path, "wb") as output:
-                    async for chunk in response.content.iter_chunked(chunk_size):
-                        if task_cancelled(task_code):
-                            raise asyncio.CancelledError()
-                        output.write(chunk)
-                        downloaded += len(chunk)
+                try:
+                    with open(file_path, "wb") as output:
+                        async for chunk in response.content.iter_chunked(chunk_size):
+                            if task_cancelled(task_code):
+                                raise asyncio.CancelledError()
+                            output.write(chunk)
+                            downloaded += len(chunk)
 
-                        now = time.time()
-                        if now - last_update >= PROGRESS_UPDATE_SECONDS or (
-                            total and downloaded >= total
-                        ):
-                            last_update = now
-                            try:
-                                await msg.edit(
-                                    get_status_text(
-                                        "Downloading",
-                                        os.path.basename(file_path),
-                                        downloaded,
-                                        total,
-                                        start_t,
-                                    ),
-                                    buttons=[[Button.inline("🛑 Cancel", data=f"cancel_{task_code}")]] if task_code else None,
-                                )
-                            except Exception:
-                                pass
+                            now = time.time()
+                            if now - last_update >= PROGRESS_UPDATE_SECONDS or (
+                                total and downloaded >= total
+                            ):
+                                last_update = now
+                                try:
+                                    await msg.edit(
+                                        get_status_text(
+                                            "Downloading",
+                                            os.path.basename(file_path),
+                                            downloaded,
+                                            total,
+                                            start_t,
+                                        ),
+                                        buttons=[[Button.inline("🛑 Cancel", data=f"cancel_{task_code}")]] if task_code else None,
+                                    )
+                                except Exception:
+                                    pass
+                except OSError as exc:
+                    if getattr(exc, "errno", None) == 28:
+                        try:
+                            if file_path and os.path.exists(file_path):
+                                os.remove(file_path)
+                        except OSError:
+                            pass
+                        cleanup_stale_temp_storage(max_age_seconds=0)
+                        raise RuntimeError(
+                            "No space left on the Koyeb local disk while downloading this file. "
+                            f"Free space after cleanup: {human_size(disk_status('/')['free'])}."
+                        ) from exc
+                    raise
 
         except ClientResponseError as exc:
             raise ValueError(
@@ -1506,7 +1836,7 @@ async def start_torrent_selection(
         )
 
     workdir = os.path.join(
-        "/tmp",
+        DOWNLOAD_ROOT,
         f"torrent_select_{uuid.uuid4().hex[:10]}",
     )
     os.makedirs(workdir, exist_ok=True)
@@ -1673,7 +2003,7 @@ async def finish_selected_torrent_to_r2(
     )
 
     workspace = os.path.join(
-        "/tmp",
+        DOWNLOAD_ROOT,
         f"torrent_dl_{uuid.uuid4().hex[:10]}",
     )
     os.makedirs(workspace, exist_ok=True)
@@ -2697,17 +3027,40 @@ async def master_handler(event):
                 ),
             )
 
-            workspace = (
+            workspace = os.path.join(
+                DOWNLOAD_ROOT,
                 f"dl_{uuid.uuid4().hex[:10]}"
             )
-            os.makedirs(
-                workspace,
-                exist_ok=True,
-            )
+            os.makedirs(workspace, exist_ok=True)
 
             start_t = time.time()
 
             try:
+                # Large direct HTTP files bypass local disk entirely and stream
+                # into R2. HTML/media pages continue through yt-dlp.
+                if (
+                    urlparse(url).scheme in {"http", "https"}
+                    and not extract_gdrive_id(url)
+                ):
+                    direct_result = await stream_direct_url_to_r2(
+                        url,
+                        msg,
+                        start_t,
+                        custom_name,
+                        target_folder,
+                        task_code,
+                    )
+                    if direct_result:
+                        r2_url, r2_code, direct_filename = direct_result
+                        await msg.edit(
+                            f"✅ **Downloaded & Uploaded Directly to R2!**\n\n"
+                            f"🎬 `{direct_filename}`\n"
+                            f"🔗 `{r2_url}`",
+                            buttons=[[Button.inline("🗑️ Delete from R2", data=f"delr2_{r2_code}")]],
+                            link_preview=False,
+                        )
+                        continue
+
                 final_path = await download_any_url(
                     url,
                     workspace,
@@ -2983,7 +3336,7 @@ async def on_callback(event):
 
         async with global_semaphore:
             task_code, _ = new_task("telegram-r2")
-            workspace = f"dl_{uuid.uuid4().hex[:10]}"
+            workspace = os.path.join(DOWNLOAD_ROOT, f"dl_{uuid.uuid4().hex[:10]}")
             os.makedirs(workspace, exist_ok=True)
             status = await event.respond(
                 "⬇️ **Downloading from Telegram...**",
@@ -3093,8 +3446,11 @@ async def upload_to_r2(
 
 async def main():
     validate_startup_config()
-    cleanup_stale_temp_storage()
-    ensure_disk_space(1.0)
+    cleanup_stale_temp_storage(max_age_seconds=0)
+    ensure_disk_space()
+    os.makedirs(DOWNLOAD_ROOT, exist_ok=True)
+    os.makedirs(GDOWN_CACHE_DIR, exist_ok=True)
+    os.makedirs(os.path.expanduser("~/.cache/gdown"), exist_ok=True)
 
     app = web.Application(client_max_size=0)
     app.add_routes(routes)
