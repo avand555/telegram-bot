@@ -23,7 +23,7 @@ from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import quote, unquote, urlparse
-
+from aiohttp import web, ClientSession, ClientTimeout, ClientResponseError, FormData
 # ============================================
 # --- 0. RUNTIME / LOGGING ---
 # ============================================
@@ -103,7 +103,12 @@ def parse_admin_ids(value: str) -> set[int]:
 
 
 ADMIN_IDS = parse_admin_ids(os.environ.get("ADMIN_IDS", ""))
-
+VIDMOLY_API_KEY = os.getenv("VIDMOLY_API_KEY", "").strip()
+VIDMOLY_API_BASE = os.getenv("VIDMOLY_API_BASE", "https://vidmoly.me").strip().rstrip("/")
+VIDMOLY_UPLOAD_URL = os.getenv("VIDMOLY_UPLOAD_URL", "").strip()  # optional: skip server lookup
+VIDMOLY_EMBED_BASE = os.getenv("VIDMOLY_EMBED_BASE", "https://vidmoly.org").strip().rstrip("/")
+# Defaults to ADMIN_IDS. Set VIDMOLY_ALLOWED_IDS to restrict to specific users.
+VIDMOLY_ALLOWED_IDS = parse_admin_ids(os.getenv("VIDMOLY_ALLOWED_IDS", "")) or ADMIN_IDS
 R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID", "").strip()
 R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID", "").strip()
 R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY", "").strip()
@@ -2870,7 +2875,8 @@ def task_cancel_button(task_code: str):
 )
 async def master_handler(event):
     purge_expired_link_storage()
-
+    if is_up_command(event.raw_text):
+        return
     pending_key = (
         event.chat_id,
         event.sender_id,
@@ -3190,6 +3196,238 @@ async def download_telegram_to_file(
     filename = clean_double_extension(
         sanitize_filename(tg_msg.file.name, "video.mp4")
     )
+    # ============================================
+# --- VIDMOLY UPLOAD (/up) ---
+# ============================================
+
+VIDEO_EXTENSIONS = {".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v", ".ts", ".flv", ".wmv"}
+
+
+def is_up_command(text: str | None) -> bool:
+    return bool(re.match(r"^/up(@\w+)?(\s|$)", (text or "").strip(), re.IGNORECASE))
+
+
+def redact_key(text: str) -> str:
+    if VIDMOLY_API_KEY:
+        text = text.replace(VIDMOLY_API_KEY, "***")
+    return text
+
+
+class ProgressReader(io.BufferedReader):
+    """File reader that counts bytes read so upload progress can be shown."""
+
+    def __init__(self, path: str):
+        super().__init__(io.FileIO(path, "rb"), buffer_size=1024 * 1024)
+        self.sent = 0
+
+    def read(self, size: int = -1):
+        data = super().read(size)
+        self.sent += len(data)
+        return data
+
+
+def find_vidmoly_code(obj) -> str | None:
+    if isinstance(obj, dict):
+        for key in ("filecode", "file_code", "code"):
+            value = obj.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        for value in obj.values():
+            found = find_vidmoly_code(value)
+            if found:
+                return found
+    elif isinstance(obj, list):
+        for value in obj:
+            found = find_vidmoly_code(value)
+            if found:
+                return found
+    return None
+
+
+async def vidmoly_get_upload_url(session: ClientSession) -> str:
+    if VIDMOLY_UPLOAD_URL:
+        return VIDMOLY_UPLOAD_URL
+
+    async with session.get(
+        f"{VIDMOLY_API_BASE}/api/upload/server",
+        params={"key": VIDMOLY_API_KEY},
+    ) as response:
+        text = await response.text()
+        status = response.status
+
+    try:
+        data = json.loads(text)
+    except ValueError:
+        raise ValueError(
+            f"Vidmoly server lookup returned non-JSON (HTTP {status}): "
+            f"{redact_key(text)[:300]}"
+        )
+
+    url = data.get("result") if isinstance(data, dict) else None
+    if isinstance(url, dict):
+        url = url.get("url")
+    if not isinstance(url, str) or not url.startswith("http"):
+        raise ValueError(
+            f"Vidmoly did not return an upload server: {redact_key(text)[:300]}"
+        )
+    return url
+
+
+async def vidmoly_post_file(
+    upload_url: str,
+    reader: ProgressReader,
+    filename: str,
+    mime_type: str,
+) -> str:
+    timeout = ClientTimeout(total=None, connect=30, sock_read=900)
+    form = FormData()
+    form.add_field("key", VIDMOLY_API_KEY)
+    form.add_field("file", reader, filename=filename, content_type=mime_type)
+
+    async with ClientSession(timeout=timeout) as session:
+        async with session.post(upload_url, data=form) as response:
+            text = await response.text()
+            status = response.status
+
+    if status >= 400:
+        raise ValueError(f"Vidmoly upload failed (HTTP {status}): {redact_key(text)[:300]}")
+
+    code = None
+    try:
+        code = find_vidmoly_code(json.loads(text))
+    except ValueError:
+        pass
+    if not code:
+        match = re.search(r"embed-([a-z0-9]+)\.html", text, re.IGNORECASE)
+        code = match.group(1) if match else None
+    if not code:
+        raise ValueError(f"Upload finished but no file code found: {redact_key(text)[:300]}")
+    return code
+
+
+async def upload_file_to_vidmoly(file_path: str, status_msg, task_code: str) -> str:
+    filename = os.path.basename(file_path)
+    total = os.path.getsize(file_path)
+    mime_type = mimetypes.guess_type(filename)[0] or "video/mp4"
+    start_t = time.time()
+
+    async with ClientSession(timeout=ClientTimeout(total=60)) as session:
+        upload_url = await vidmoly_get_upload_url(session)
+
+    reader = ProgressReader(file_path)
+    upload_task = asyncio.create_task(
+        vidmoly_post_file(upload_url, reader, filename, mime_type)
+    )
+
+    try:
+        while not upload_task.done():
+            await asyncio.wait({upload_task}, timeout=PROGRESS_UPDATE_SECONDS)
+
+            if task_cancelled(task_code):
+                upload_task.cancel()
+                raise asyncio.CancelledError()
+            if upload_task.done():
+                break
+
+            try:
+                await status_msg.edit(
+                    get_status_text(
+                        "Vidmoly Uploading",
+                        filename,
+                        min(reader.sent, total),
+                        total,
+                        start_t,
+                    ),
+                    buttons=task_cancel_button(task_code),
+                )
+            except Exception:
+                pass
+
+        return upload_task.result()
+    finally:
+        reader.close()
+
+
+@client.on(
+    events.NewMessage(
+        incoming=True,
+        func=lambda e: e.sender_id in ADMIN_IDS,
+    )
+)
+async def vidmoly_up_handler(event):
+    if not is_up_command(event.raw_text):
+        return
+
+    if event.sender_id not in VIDMOLY_ALLOWED_IDS:
+        await event.reply("⛔ You are not allowed to use /up.")
+        return
+
+    if not VIDMOLY_API_KEY:
+        await event.reply("❌ `VIDMOLY_API_KEY` is not set on the server.")
+        return
+
+    # Works as a reply to a forwarded video, or as a caption on a sent file.
+    target = event if event.file else (
+        await event.get_reply_message() if event.is_reply else None
+    )
+
+    if not target or not target.file:
+        await event.reply(
+            "↩️ **Reply to a video with** `/up`\n"
+            "(or send a video with `/up` as the caption)."
+        )
+        return
+
+    name = target.file.name or ""
+    ext = os.path.splitext(name)[1].lower()
+    mime = (target.file.mime_type or "").lower()
+    if not (mime.startswith("video/") or ext in VIDEO_EXTENSIONS):
+        await event.reply("❌ That file doesn't look like a video.")
+        return
+
+    async with global_semaphore:
+        task_code, _ = new_task("vidmoly")
+        workspace = os.path.join(DOWNLOAD_ROOT, f"dl_{uuid.uuid4().hex[:10]}")
+        os.makedirs(workspace, exist_ok=True)
+
+        status = await event.reply(
+            "⬇️ **Downloading from Telegram...**",
+            buttons=task_cancel_button(task_code),
+        )
+        start_t = time.time()
+
+        try:
+            ensure_file_space(int(target.file.size or 0))
+
+            file_path = await download_telegram_to_file(
+                target, workspace, status, start_t, task_code
+            )
+
+            # Forwarded videos often have no filename/extension.
+            if not os.path.splitext(file_path)[1]:
+                new_path = file_path + (target.file.ext or ".mp4")
+                os.replace(file_path, new_path)
+                file_path = new_path
+
+            code = await upload_file_to_vidmoly(file_path, status, task_code)
+            embed = f"{VIDMOLY_EMBED_BASE}/embed-{code}.html"
+
+            await status.edit(
+                f"✅ **Uploaded to Vidmoly!**\n\n"
+                f"🎬 `{os.path.basename(file_path)}`\n"
+                f"🔗 **Embed:** `{embed}`",
+                link_preview=False,
+            )
+
+        except asyncio.CancelledError:
+            await status.edit("🛑 **Task cancelled.**")
+        except Exception as exc:
+            logger.exception("Vidmoly upload failed")
+            await status.edit(f"❌ **Vidmoly Error:**\n`{redact_key(str(exc))[:1500]}`")
+        finally:
+            remove_task(task_code)
+            shutil.rmtree(workspace, ignore_errors=True)
+            free_memory()
     file_path = os.path.join(workspace, filename)
 
     total = int(tg_msg.file.size or 0)
