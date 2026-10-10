@@ -1,6 +1,8 @@
 import os
 import re
 import gc
+import io
+import glob
 import math
 import time
 import stat
@@ -19,12 +21,11 @@ import threading
 import subprocess
 import logging
 import hmac
-import io
 from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import quote, unquote, urlparse
-from aiohttp import web, ClientSession, ClientTimeout, ClientResponseError, FormData
+
 # ============================================
 # --- 0. RUNTIME / LOGGING ---
 # ============================================
@@ -42,7 +43,7 @@ mimetypes.add_type("video/mp2t", ".ts")
 # ============================================
 from telethon import TelegramClient, events, Button
 from telethon.network import ConnectionTcpFull
-from aiohttp import web, ClientSession, ClientTimeout, ClientResponseError
+from aiohttp import web, ClientSession, ClientTimeout, ClientResponseError, FormData
 import boto3
 from boto3.s3.transfer import TransferConfig
 from botocore.config import Config
@@ -84,9 +85,6 @@ def env_float(name: str, default: float) -> float:
         raise RuntimeError(f"Environment variable {name} must be a number.") from exc
 
 
-API_ID = env_int("API_ID", 0)
-API_HASH = os.getenv("API_HASH", "").strip()
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 def parse_admin_ids(value: str) -> set[int]:
     ids: set[int] = set()
     for raw in value.split(","):
@@ -97,19 +95,26 @@ def parse_admin_ids(value: str) -> set[int]:
             ids.add(int(raw))
         except ValueError as exc:
             raise RuntimeError(
-                f"Invalid ADMIN_IDS value: {raw!r}. "
+                f"Invalid ID value: {raw!r}. "
                 "Use comma-separated numeric Telegram user IDs."
             ) from exc
     return ids
 
 
+API_ID = env_int("API_ID", 0)
+API_HASH = os.getenv("API_HASH", "").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = parse_admin_ids(os.environ.get("ADMIN_IDS", ""))
+
+# --- Vidmoly ---
 VIDMOLY_API_KEY = os.getenv("VIDMOLY_API_KEY", "").strip()
 VIDMOLY_API_BASE = os.getenv("VIDMOLY_API_BASE", "https://vidmoly.me").strip().rstrip("/")
-VIDMOLY_UPLOAD_URL = os.getenv("VIDMOLY_UPLOAD_URL", "").strip()  # optional: skip server lookup
+VIDMOLY_UPLOAD_URL = os.getenv("VIDMOLY_UPLOAD_URL", "").strip()  # optional: skips server lookup
 VIDMOLY_EMBED_BASE = os.getenv("VIDMOLY_EMBED_BASE", "https://vidmoly.org").strip().rstrip("/")
-# Defaults to ADMIN_IDS. Set VIDMOLY_ALLOWED_IDS to restrict to specific users.
+# Defaults to ADMIN_IDS. Set VIDMOLY_ALLOWED_IDS to restrict /up to specific users.
 VIDMOLY_ALLOWED_IDS = parse_admin_ids(os.getenv("VIDMOLY_ALLOWED_IDS", "")) or ADMIN_IDS
+
+# --- Cloudflare R2 ---
 R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID", "").strip()
 R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID", "").strip()
 R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY", "").strip()
@@ -184,6 +189,11 @@ def validate_startup_config() -> None:
     if not DASHBOARD_PASS:
         logger.warning(
             "DASHBOARD_PASS is not set. The R2 dashboard will remain locked."
+        )
+
+    if not VIDMOLY_API_KEY:
+        logger.warning(
+            "VIDMOLY_API_KEY is not set. The /up command will be unavailable."
         )
 
 
@@ -374,7 +384,7 @@ def cleanup_stale_temp_storage(max_age_seconds: int = 6 * 3600) -> None:
 
     # Remove old temporary torrent/DHT files produced by older versions.
     for pattern in ("/tmp/meta_*.torrent", "/tmp/dht_*.dat", "/tmp/*.torrent"):
-        for path in __import__("glob").glob(pattern):
+        for path in glob.glob(pattern):
             try:
                 if os.path.isfile(path):
                     age = now - os.path.getmtime(path)
@@ -540,6 +550,7 @@ def get_r2_client():
         connect_timeout=30,
         read_timeout=120,
         retries={"max_attempts": 4, "mode": "standard"},
+        max_pool_connections=64,
     )
 
     return boto3.client(
@@ -981,7 +992,8 @@ async def download_google_drive(
     if not file_id:
         raise ValueError("Invalid or unsupported Google Drive file URL.")
 
-    cleanup_stale_temp_storage(max_age_seconds=0)
+    # NOTE: do not run an aggressive cleanup here; it would delete the
+    # workspaces of other running jobs and pending torrent selections.
     ensure_disk_space()
     os.makedirs(workspace, exist_ok=True)
     os.makedirs(GDOWN_CACHE_DIR, exist_ok=True)
@@ -999,13 +1011,15 @@ async def download_google_drive(
     }
 
     last_error = None
+    result = None
 
     for attempt in range(2):
         try:
             result = await asyncio.to_thread(
                 gdown.download,
                 id=file_id,
-                output=output_dir,
+                # Trailing separator makes gdown treat this as a directory.
+                output=output_dir + os.sep,
                 quiet=True,
                 resume=True,
             )
@@ -1035,7 +1049,7 @@ async def download_google_drive(
                 exc,
             )
             if "No space left on device" in str(exc):
-                cleanup_stale_temp_storage(max_age_seconds=0)
+                cleanup_stale_temp_storage(max_age_seconds=6 * 3600)
                 continue
             break
 
@@ -1189,12 +1203,13 @@ async def stream_direct_url_to_r2(
     uploaded_parts = []
     part_number = 0
     transferred = 0
+    last_progress_edit = 0.0
     total = int(probe.get("content_length") or 0)
     chunk_size = max(5, R2_MULTIPART_CHUNK_MB) * 1024 * 1024
     buffer = bytearray()
 
     async def upload_part(part: bytes):
-        nonlocal part_number, transferred
+        nonlocal part_number, transferred, last_progress_edit
         part_number += 1
         response = await asyncio.to_thread(
             s3.upload_part,
@@ -1209,6 +1224,12 @@ async def stream_direct_url_to_r2(
             "PartNumber": part_number,
         })
         transferred += len(part)
+
+        # Throttle edits to avoid Telegram FloodWait on fast links.
+        now_t = time.time()
+        if now_t - last_progress_edit < PROGRESS_UPDATE_SECONDS:
+            return
+        last_progress_edit = now_t
 
         percent = (transferred / total * 100.0) if total else 0.0
         text = (
@@ -1423,7 +1444,7 @@ async def download_direct(
                                 os.remove(file_path)
                         except OSError:
                             pass
-                        cleanup_stale_temp_storage(max_age_seconds=0)
+                        cleanup_stale_temp_storage(max_age_seconds=6 * 3600)
                         raise RuntimeError(
                             "No space left on the Koyeb local disk while downloading this file. "
                             f"Free space after cleanup: {human_size(disk_status('/')['free'])}."
@@ -1435,7 +1456,7 @@ async def download_direct(
                 f"HTTP {exc.status} while downloading the direct link."
             ) from exc
 
-    if not os.path.exists(file_path) or os.path.getsize(file_path) <= 0:
+    if not file_path or not os.path.exists(file_path) or os.path.getsize(file_path) <= 0:
         raise ValueError("Direct download produced no file.")
 
     return file_path
@@ -1546,7 +1567,6 @@ async def sync_yt_dlp_download(
     return result_path
 
 
-
 # ============================================
 # --- TORRENT METADATA / MANUAL FILE SELECTOR ---
 # ============================================
@@ -1631,6 +1651,7 @@ def fetch_torrent_metadata_sync(source: str, workdir: str) -> str:
             "--summary-interval=0",
             "--console-log-level=warn",
             "--seed-time=0",
+            "--bt-tracker=" + PUBLIC_TRACKERS,
             "--dir", workdir,
             source,
         ]
@@ -1783,11 +1804,9 @@ def find_downloaded_selected_files(
     results = []
 
     for item in selected_items:
-        target = (
-            item["path"]
-            .replace("\\", "/")
-            .lstrip("./")
-        )
+        target = item["path"].replace("\\", "/")
+        while target.startswith("./"):
+            target = target[2:]
 
         if target in normalized:
             results.append(normalized[target])
@@ -1928,6 +1947,7 @@ async def download_selected_torrent(
         "--continue=true",
         "--split=8",
         "--min-split-size=1M",
+        "--bt-tracker=" + PUBLIC_TRACKERS,
         f"--select-file={selection}",
         "--dir", workspace,
         "-T", torrent_path,
@@ -1945,7 +1965,8 @@ async def download_selected_torrent(
         stderr=asyncio.subprocess.STDOUT,
     )
 
-    active_tasks[task_code]["process"] = process
+    if task_code in active_tasks:
+        active_tasks[task_code]["process"] = process
     last_update = 0.0
 
     try:
@@ -1964,14 +1985,14 @@ async def download_selected_torrent(
             now = time.time()
 
             if now - last_update >= PROGRESS_UPDATE_SECONDS:
-                last_update = now
-
                 line_text = line.decode(
                     "utf-8",
                     errors="replace",
                 ).strip()
 
-                if line_text:
+                # Only show real progress lines, not "***" separators.
+                if line_text and "%" in line_text:
+                    last_update = now
                     try:
                         await msg.edit(
                             f"⬇️ **Torrent Download**\n\n"
@@ -1986,6 +2007,9 @@ async def download_selected_torrent(
 
         return_code = await process.wait()
 
+        if task_cancelled(task_code):
+            raise asyncio.CancelledError()
+
         if return_code != 0:
             raise RuntimeError(
                 f"aria2c exited with code {return_code}."
@@ -1996,6 +2020,10 @@ async def download_selected_torrent(
             try:
                 process.terminate()
             except ProcessLookupError:
+                pass
+            try:
+                await process.wait()
+            except Exception:
                 pass
 
 
@@ -2082,13 +2110,18 @@ async def finish_selected_torrent_to_r2(
                     base_folder,
                     "uploads",
                 )
+                s3_key = f"{r2_folder}/{rel_path}"
             else:
-                r2_folder = sanitize_prefix(
-                    pending["torrent_name"],
-                    "torrent",
-                )
-
-            s3_key = f"{r2_folder}/{rel_path}"
+                # rel_path already begins with the torrent's own top folder
+                # for multi-file torrents, so avoid doubling it.
+                if "/" in rel_path:
+                    s3_key = sanitize_prefix(rel_path, "torrent")
+                else:
+                    r2_folder = sanitize_prefix(
+                        pending["torrent_name"],
+                        "torrent",
+                    )
+                    s3_key = f"{r2_folder}/{rel_path}"
 
             await status.edit(
                 f"📤 **Uploading to R2...**\n"
@@ -2148,7 +2181,8 @@ async def finish_selected_torrent_to_r2(
 
     except asyncio.CancelledError:
         await status.edit(
-            "🛑 **Torrent task cancelled.**"
+            "🛑 **Torrent task cancelled.**",
+            buttons=[],
         )
 
     except Exception as exc:
@@ -2157,7 +2191,8 @@ async def finish_selected_torrent_to_r2(
         )
         await status.edit(
             f"❌ **Torrent/R2 Error:**\n"
-            f"`{str(exc)[:1800]}`"
+            f"`{str(exc)[:1800]}`",
+            buttons=[],
         )
 
     finally:
@@ -2351,9 +2386,13 @@ def check_dashboard_auth(request: web.Request) -> bool:
     except Exception:
         return False
 
-    return hmac.compare_digest(user, DASHBOARD_USER) and hmac.compare_digest(
-        password,
-        DASHBOARD_PASS,
+    # Compare as bytes so non-ASCII credentials never raise TypeError.
+    return hmac.compare_digest(
+        user.encode("utf-8"),
+        DASHBOARD_USER.encode("utf-8"),
+    ) and hmac.compare_digest(
+        password.encode("utf-8"),
+        DASHBOARD_PASS.encode("utf-8"),
     )
 
 
@@ -2528,6 +2567,12 @@ async def dashboard_handler(request: web.Request):
             date_str = date.strftime("%Y-%m-%d %H:%M") if date else "-"
             url = build_r2_public_url(item["url_key"])
 
+            # JSON-encode, then HTML-escape, so quotes in file names cannot
+            # break out of the onclick attribute.
+            url_attr = html.escape(json.dumps(url), quote=True)
+            name_attr = html.escape(json.dumps(name), quote=True)
+            href_attr = html.escape(url, quote=True)
+
             if item["type"] == "HLS":
                 rows.append(
                     f"""
@@ -2536,9 +2581,9 @@ async def dashboard_handler(request: web.Request):
                       <td>{html.escape(size_str)}</td>
                       <td>{html.escape(date_str)}</td>
                       <td><div class='actions'>
-                        <button class='btn btn-copy' onclick='copyText({json.dumps(url)})'>🔗 Copy Master</button>
-                        <a class='btn btn-view' href='{html.escape(url, quote=True)}' target='_blank' rel='noopener'>▶️ Play</a>
-                        <button class='btn btn-delete' onclick='deleteItem({json.dumps(name)}, true)'>🗑️ Delete</button>
+                        <button class='btn btn-copy' onclick="copyText({url_attr})">🔗 Copy Master</button>
+                        <a class='btn btn-view' href="{href_attr}" target='_blank' rel='noopener'>▶️ Play</a>
+                        <button class='btn btn-delete' onclick="deleteItem({name_attr}, true)">🗑️ Delete</button>
                       </div></td>
                     </tr>
                     """
@@ -2551,9 +2596,9 @@ async def dashboard_handler(request: web.Request):
                       <td>{html.escape(size_str)}</td>
                       <td>{html.escape(date_str)}</td>
                       <td><div class='actions'>
-                        <button class='btn btn-copy' onclick='copyText({json.dumps(url)})'>🔗 Copy</button>
-                        <a class='btn btn-view' href='{html.escape(url, quote=True)}' target='_blank' rel='noopener'>▶️ Open</a>
-                        <button class='btn btn-delete' onclick='deleteItem({json.dumps(name)}, false)'>🗑️ Delete</button>
+                        <button class='btn btn-copy' onclick="copyText({url_attr})">🔗 Copy</button>
+                        <a class='btn btn-view' href="{href_attr}" target='_blank' rel='noopener'>▶️ Open</a>
+                        <button class='btn btn-delete' onclick="deleteItem({name_attr}, false)">🗑️ Delete</button>
                       </div></td>
                     </tr>
                     """
@@ -2788,23 +2833,34 @@ async def stream_handler(request: web.Request):
     await response.prepare(request)
 
     chunk_size = TELEGRAM_STREAM_CHUNK_KB * 1024
-    limit = math.ceil(content_length / chunk_size)
+
+    # Telegram requires aligned offsets: start at the chunk boundary at or
+    # before the requested byte, then discard the leading bytes.
+    aligned_start = start - (start % chunk_size)
+    skip = start - aligned_start
+    limit = math.ceil((skip + content_length) / chunk_size)
     sent = 0
 
     try:
         async for chunk in client.iter_download(
             telegram_message.media,
-            offset=start,
+            offset=aligned_start,
             request_size=chunk_size,
             chunk_size=chunk_size,
             limit=limit,
             file_size=file_size,
         ):
-            if sent >= content_length:
-                break
+            data = bytes(chunk)
+
+            if skip:
+                if skip >= len(data):
+                    skip -= len(data)
+                    continue
+                data = data[skip:]
+                skip = 0
 
             remaining = content_length - sent
-            data = bytes(chunk[:remaining])
+            data = data[:remaining]
             if not data:
                 break
 
@@ -2868,6 +2924,14 @@ def task_cancel_button(task_code: str):
     return [[Button.inline("🛑 Cancel", data=f"cancel_{task_code}")]]
 
 
+# ---------------------------------------------------------------------------
+# /up command helpers (used by master_handler to skip, and by the Vidmoly handler)
+# ---------------------------------------------------------------------------
+
+def is_up_command(text: str | None) -> bool:
+    return bool(re.match(r"^/up(@\w+)?(\s|$)", (text or "").strip(), re.IGNORECASE))
+
+
 @client.on(
     events.NewMessage(
         incoming=True,
@@ -2876,8 +2940,12 @@ def task_cancel_button(task_code: str):
 )
 async def master_handler(event):
     purge_expired_link_storage()
+
+    # /up is handled by vidmoly_up_handler; never treat it as a link,
+    # a torrent selection reply, or a "File Detected" prompt.
     if is_up_command(event.raw_text):
         return
+
     pending_key = (
         event.chat_id,
         event.sender_id,
@@ -2889,6 +2957,15 @@ async def master_handler(event):
     pending = pending_torrent_selections.get(
         pending_key
     )
+
+    if pending and event.text:
+        selection_text = event.text.strip()
+
+        # A new link while a selection is pending cancels the old selection.
+        if re.match(r"^(https?://|magnet:\?)", selection_text, re.IGNORECASE):
+            pending_torrent_selections.pop(pending_key, None)
+            shutil.rmtree(pending.get("workdir", ""), ignore_errors=True)
+            pending = None
 
     if pending and event.text:
         selection_text = event.text.strip()
@@ -2935,11 +3012,12 @@ async def master_handler(event):
             None,
         )
 
-        await finish_selected_torrent_to_r2(
-            event,
-            pending,
-            selected,
-        )
+        async with global_semaphore:
+            await finish_selected_torrent_to_r2(
+                event,
+                pending,
+                selected,
+            )
 
         shutil.rmtree(
             pending.get("workdir", ""),
@@ -3155,7 +3233,8 @@ async def master_handler(event):
             except asyncio.CancelledError:
                 try:
                     await msg.edit(
-                        "🛑 **Task cancelled.**"
+                        "🛑 **Task cancelled.**",
+                        buttons=[],
                     )
                 except Exception:
                     pass
@@ -3171,7 +3250,8 @@ async def master_handler(event):
                         f"❌ **Error**\n"
                         f"`{url[:120]}`\n\n"
                         f"**Reason:** "
-                        f"`{str(exc)[:1500]}`"
+                        f"`{str(exc)[:1500]}`",
+                        buttons=[],
                     )
                 except Exception:
                     pass
@@ -3235,249 +3315,19 @@ async def download_telegram_to_file(
     if not os.path.isfile(file_path) or os.path.getsize(file_path) <= 0:
         raise ValueError("Telegram download produced an empty file.")
 
-    # ============================================
-# --- VIDMOLY UPLOAD (/up) ---
-# ============================================
-
-VIDEO_EXTENSIONS = {".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v", ".ts", ".flv", ".wmv"}
-
-
-def is_up_command(text: str | None) -> bool:
-    return bool(re.match(r"^/up(@\w+)?(\s|$)", (text or "").strip(), re.IGNORECASE))
-
-
-def redact_key(text: str) -> str:
-    if VIDMOLY_API_KEY:
-        text = text.replace(VIDMOLY_API_KEY, "***")
-    return text
-
-
-class ProgressReader(io.BufferedReader):
-    """File reader that counts bytes read so upload progress can be shown."""
-
-    def __init__(self, path: str):
-        super().__init__(io.FileIO(path, "rb"), buffer_size=1024 * 1024)
-        self.sent = 0
-
-    def read(self, size: int = -1):
-        data = super().read(size)
-        self.sent += len(data)
-        return data
-
-
-def find_vidmoly_code(obj) -> str | None:
-    if isinstance(obj, dict):
-        for key in ("filecode", "file_code", "code"):
-            value = obj.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-        for value in obj.values():
-            found = find_vidmoly_code(value)
-            if found:
-                return found
-    elif isinstance(obj, list):
-        for value in obj:
-            found = find_vidmoly_code(value)
-            if found:
-                return found
-    return None
-
-
-async def vidmoly_get_upload_url(session: ClientSession) -> str:
-    if VIDMOLY_UPLOAD_URL:
-        return VIDMOLY_UPLOAD_URL
-
-    async with session.get(
-        f"{VIDMOLY_API_BASE}/api/upload/server",
-        params={"key": VIDMOLY_API_KEY},
-    ) as response:
-        text = await response.text()
-        status = response.status
-
-    try:
-        data = json.loads(text)
-    except ValueError:
-        raise ValueError(
-            f"Vidmoly server lookup returned non-JSON (HTTP {status}): "
-            f"{redact_key(text)[:300]}"
-        )
-
-    url = data.get("result") if isinstance(data, dict) else None
-    if isinstance(url, dict):
-        url = url.get("url")
-    if not isinstance(url, str) or not url.startswith("http"):
-        raise ValueError(
-            f"Vidmoly did not return an upload server: {redact_key(text)[:300]}"
-        )
-    return url
-
-
-async def vidmoly_post_file(
-    upload_url: str,
-    reader: ProgressReader,
-    filename: str,
-    mime_type: str,
-) -> str:
-    timeout = ClientTimeout(total=None, connect=30, sock_read=900)
-    form = FormData()
-    form.add_field("key", VIDMOLY_API_KEY)
-    form.add_field("file", reader, filename=filename, content_type=mime_type)
-
-    async with ClientSession(timeout=timeout) as session:
-        async with session.post(upload_url, data=form) as response:
-            text = await response.text()
-            status = response.status
-
-    if status >= 400:
-        raise ValueError(f"Vidmoly upload failed (HTTP {status}): {redact_key(text)[:300]}")
-
-    code = None
-    try:
-        code = find_vidmoly_code(json.loads(text))
-    except ValueError:
-        pass
-    if not code:
-        match = re.search(r"embed-([a-z0-9]+)\.html", text, re.IGNORECASE)
-        code = match.group(1) if match else None
-    if not code:
-        raise ValueError(f"Upload finished but no file code found: {redact_key(text)[:300]}")
-    return code
-
-
-async def upload_file_to_vidmoly(file_path: str, status_msg, task_code: str) -> str:
-    filename = os.path.basename(file_path)
-    total = os.path.getsize(file_path)
-    mime_type = mimetypes.guess_type(filename)[0] or "video/mp4"
-    start_t = time.time()
-
-    async with ClientSession(timeout=ClientTimeout(total=60)) as session:
-        upload_url = await vidmoly_get_upload_url(session)
-
-    reader = ProgressReader(file_path)
-    upload_task = asyncio.create_task(
-        vidmoly_post_file(upload_url, reader, filename, mime_type)
-    )
-
-    try:
-        while not upload_task.done():
-            await asyncio.wait({upload_task}, timeout=PROGRESS_UPDATE_SECONDS)
-
-            if task_cancelled(task_code):
-                upload_task.cancel()
-                raise asyncio.CancelledError()
-            if upload_task.done():
-                break
-
-            try:
-                await status_msg.edit(
-                    get_status_text(
-                        "Vidmoly Uploading",
-                        filename,
-                        min(reader.sent, total),
-                        total,
-                        start_t,
-                    ),
-                    buttons=task_cancel_button(task_code),
-                )
-            except Exception:
-                pass
-
-        return upload_task.result()
-    finally:
-        reader.close()
-
-
-@client.on(
-    events.NewMessage(
-        incoming=True,
-        func=lambda e: e.sender_id in ADMIN_IDS,
-    )
-)
-async def vidmoly_up_handler(event):
-    if not is_up_command(event.raw_text):
-        return
-
-    if event.sender_id not in VIDMOLY_ALLOWED_IDS:
-        await event.reply("⛔ You are not allowed to use /up.")
-        return
-
-    if not VIDMOLY_API_KEY:
-        await event.reply("❌ `VIDMOLY_API_KEY` is not set on the server.")
-        return
-
-    # Works as a reply to a forwarded video, or as a caption on a sent file.
-    target = event if event.file else (
-        await event.get_reply_message() if event.is_reply else None
-    )
-
-    if not target or not target.file:
-        await event.reply(
-            "↩️ **Reply to a video with** `/up`\n"
-            "(or send a video with `/up` as the caption)."
-        )
-        return
-
-    name = target.file.name or ""
-    ext = os.path.splitext(name)[1].lower()
-    mime = (target.file.mime_type or "").lower()
-    if not (mime.startswith("video/") or ext in VIDEO_EXTENSIONS):
-        await event.reply("❌ That file doesn't look like a video.")
-        return
-
-    async with global_semaphore:
-        task_code, _ = new_task("vidmoly")
-        workspace = os.path.join(DOWNLOAD_ROOT, f"dl_{uuid.uuid4().hex[:10]}")
-        os.makedirs(workspace, exist_ok=True)
-
-        status = await event.reply(
-            "⬇️ **Downloading from Telegram...**",
-            buttons=task_cancel_button(task_code),
-        )
-        start_t = time.time()
-
-        try:
-            ensure_file_space(int(target.file.size or 0))
-
-            file_path = await download_telegram_to_file(
-                target, workspace, status, start_t, task_code
-            )
-
-            # Forwarded videos often have no filename/extension.
-            if not os.path.splitext(file_path)[1]:
-                new_path = file_path + (target.file.ext or ".mp4")
-                os.replace(file_path, new_path)
-                file_path = new_path
-
-            code = await upload_file_to_vidmoly(file_path, status, task_code)
-            embed = f"{VIDMOLY_EMBED_BASE}/embed-{code}.html"
-
-            await status.edit(
-                f"✅ **Uploaded to Vidmoly!**\n\n"
-                f"🎬 `{os.path.basename(file_path)}`\n"
-                f"🔗 **Embed:** `{embed}`",
-                link_preview=False,
-            )
-
-        except asyncio.CancelledError:
-            await status.edit("🛑 **Task cancelled.**")
-        except Exception as exc:
-            logger.exception("Vidmoly upload failed")
-            await status.edit(f"❌ **Vidmoly Error:**\n`{redact_key(str(exc))[:1500]}`")
-        finally:
-            remove_task(task_code)
-            shutil.rmtree(workspace, ignore_errors=True)
-            free_memory()
     return file_path
-    
+
+
 # ============================================
-# --- VIDMOLY UPLOAD (/up) ---
+# --- 9b. VIDMOLY UPLOAD (/up) ---
 # ============================================
 
-VIDEO_EXTENSIONS = {".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v", ".ts", ".flv", ".wmv"}
+VIDEO_EXTENSIONS = {
+    ".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v", ".ts", ".flv", ".wmv",
+}
 
-
-def is_up_command(text: str | None) -> bool:
-    return bool(re.match(r"^/up(@\w+)?(\s|$)", (text or "").strip(), re.IGNORECASE))
+# Message IDs already handled, so a message is never processed twice.
+_handled_up: set[tuple[int, int]] = set()
 
 
 def redact_key(text: str) -> str:
@@ -3563,7 +3413,9 @@ async def vidmoly_post_file(
             status = response.status
 
     if status >= 400:
-        raise ValueError(f"Vidmoly upload failed (HTTP {status}): {redact_key(text)[:300]}")
+        raise ValueError(
+            f"Vidmoly upload failed (HTTP {status}): {redact_key(text)[:300]}"
+        )
 
     code = None
     try:
@@ -3574,7 +3426,9 @@ async def vidmoly_post_file(
         match = re.search(r"embed-([a-z0-9]+)\.html", text, re.IGNORECASE)
         code = match.group(1) if match else None
     if not code:
-        raise ValueError(f"Upload finished but no file code found: {redact_key(text)[:300]}")
+        raise ValueError(
+            f"Upload finished but no file code found: {redact_key(text)[:300]}"
+        )
     return code
 
 
@@ -3618,6 +3472,8 @@ async def upload_file_to_vidmoly(file_path: str, status_msg, task_code: str) -> 
 
         return upload_task.result()
     finally:
+        if not upload_task.done():
+            upload_task.cancel()
         reader.close()
 
 
@@ -3631,6 +3487,13 @@ async def vidmoly_up_handler(event):
     if not is_up_command(event.raw_text):
         return
 
+    key = (event.chat_id, event.id)
+    if key in _handled_up:
+        return
+    _handled_up.add(key)
+    if len(_handled_up) > 5000:
+        _handled_up.clear()
+
     if event.sender_id not in VIDMOLY_ALLOWED_IDS:
         await event.reply("⛔ You are not allowed to use /up.")
         return
@@ -3640,9 +3503,12 @@ async def vidmoly_up_handler(event):
         return
 
     # Works as a reply to a forwarded video, or as a caption on a sent file.
-    target = event if event.file else (
-        await event.get_reply_message() if event.is_reply else None
-    )
+    if event.file:
+        target = event
+    elif event.is_reply:
+        target = await event.get_reply_message()
+    else:
+        target = None
 
     if not target or not target.file:
         await event.reply(
@@ -3675,6 +3541,8 @@ async def vidmoly_up_handler(event):
             file_path = await download_telegram_to_file(
                 target, workspace, status, start_t, task_code
             )
+            if not file_path:
+                raise RuntimeError("Telegram download returned no file path.")
 
             # Forwarded videos often have no filename/extension.
             if not os.path.splitext(file_path)[1]:
@@ -3689,18 +3557,27 @@ async def vidmoly_up_handler(event):
                 f"✅ **Uploaded to Vidmoly!**\n\n"
                 f"🎬 `{os.path.basename(file_path)}`\n"
                 f"🔗 **Embed:** `{embed}`",
+                buttons=[],
                 link_preview=False,
             )
 
         except asyncio.CancelledError:
-            await status.edit("🛑 **Task cancelled.**")
+            await status.edit("🛑 **Task cancelled.**", buttons=[])
         except Exception as exc:
             logger.exception("Vidmoly upload failed")
-            await status.edit(f"❌ **Vidmoly Error:**\n`{redact_key(str(exc))[:1500]}`")
+            await status.edit(
+                f"❌ **Vidmoly Error:**\n`{redact_key(str(exc))[:1500]}`",
+                buttons=[],
+            )
         finally:
             remove_task(task_code)
             shutil.rmtree(workspace, ignore_errors=True)
             free_memory()
+
+
+# ============================================
+# --- 9c. CALLBACK BUTTONS ---
+# ============================================
 
 @client.on(events.CallbackQuery)
 async def on_callback(event):
@@ -3856,10 +3733,13 @@ async def on_callback(event):
                     )
 
             except asyncio.CancelledError:
-                await status.edit("🛑 **Task cancelled.**")
+                await status.edit("🛑 **Task cancelled.**", buttons=[])
             except Exception as exc:
                 logger.exception("Telegram → R2 failed")
-                await status.edit(f"❌ **Error:** `{str(exc)[:1500]}`")
+                await status.edit(
+                    f"❌ **Error:** `{str(exc)[:1500]}`",
+                    buttons=[],
+                )
             finally:
                 remove_task(task_code)
                 shutil.rmtree(workspace, ignore_errors=True)
@@ -3917,6 +3797,7 @@ async def upload_to_r2(
 
 async def main():
     validate_startup_config()
+    os.makedirs(DOWNLOAD_ROOT, exist_ok=True)
     cleanup_stale_temp_storage(max_age_seconds=0)
     ensure_disk_space()
     os.makedirs(DOWNLOAD_ROOT, exist_ok=True)
