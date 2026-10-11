@@ -3326,6 +3326,23 @@ VIDEO_EXTENSIONS = {
     ".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v", ".ts", ".flv", ".wmv",
 }
 
+# VIDMOLY_MODE:
+#   auto   = remote upload (Vidmoly pulls the video from this bot's stream link)
+#            when a public base URL is configured; falls back to direct upload.
+#   remote = remote upload only.
+#   upload = always download locally and POST the file to Vidmoly.
+VIDMOLY_MODE = os.getenv("VIDMOLY_MODE", "auto").strip().lower()
+
+# Browser-like headers: Vidmoly sits behind Cloudflare, which can stall or block
+# the default aiohttp user agent.
+VIDMOLY_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+}
+
 # Message IDs already handled, so a message is never processed twice.
 _handled_up: set[tuple[int, int]] = set()
 
@@ -3334,6 +3351,13 @@ def redact_key(text: str) -> str:
     if VIDMOLY_API_KEY:
         text = text.replace(VIDMOLY_API_KEY, "***")
     return text
+
+
+def describe_error(exc: BaseException) -> str:
+    """Never return an empty message (e.g. for TimeoutError)."""
+    message = str(exc).strip()
+    name = type(exc).__name__
+    return f"{name}: {message}" if message else name
 
 
 class ProgressReader(io.BufferedReader):
@@ -3345,6 +3369,11 @@ class ProgressReader(io.BufferedReader):
 
     def read(self, size: int = -1):
         data = super().read(size)
+        self.sent += len(data)
+        return data
+
+    def read1(self, size: int = -1):
+        data = super().read1(size)
         self.sent += len(data)
         return data
 
@@ -3367,31 +3396,60 @@ def find_vidmoly_code(obj) -> str | None:
     return None
 
 
-async def vidmoly_get_upload_url(session: ClientSession) -> str:
-    if VIDMOLY_UPLOAD_URL:
-        return VIDMOLY_UPLOAD_URL
+async def vidmoly_api_get(path: str, params: dict | None = None, timeout_s: int = 60):
+    """GET a Vidmoly API endpoint and return the parsed JSON."""
+    query = dict(params or {})
+    query["key"] = VIDMOLY_API_KEY
 
-    async with session.get(
-        f"{VIDMOLY_API_BASE}/api/upload/server",
-        params={"key": VIDMOLY_API_KEY},
-    ) as response:
-        text = await response.text()
-        status = response.status
+    timeout = ClientTimeout(total=timeout_s, connect=20)
+    async with ClientSession(timeout=timeout, headers=VIDMOLY_HEADERS) as session:
+        async with session.get(f"{VIDMOLY_API_BASE}{path}", params=query) as response:
+            text = await response.text()
+            status = response.status
 
     try:
         data = json.loads(text)
     except ValueError:
         raise ValueError(
-            f"Vidmoly server lookup returned non-JSON (HTTP {status}): "
+            f"Vidmoly returned non-JSON from {path} (HTTP {status}): "
             f"{redact_key(text)[:300]}"
         )
 
+    api_status = data.get("status") if isinstance(data, dict) else None
+    if status >= 400 or (
+        api_status is not None and str(api_status) not in ("200", "OK", "ok")
+    ):
+        raise ValueError(
+            f"Vidmoly API error on {path} (HTTP {status}): "
+            f"{redact_key(text)[:300]}"
+        )
+    return data
+
+
+async def vidmoly_remote_upload(source_url: str) -> str:
+    """Queue a remote URL on Vidmoly (/api/upload/url) and return the file code."""
+    data = await vidmoly_api_get("/api/upload/url", {"url": source_url})
+    code = find_vidmoly_code(data)
+    if not code:
+        raise ValueError(
+            "Vidmoly accepted the URL but returned no file code: "
+            f"{redact_key(json.dumps(data))[:300]}"
+        )
+    return code
+
+
+async def vidmoly_get_upload_url() -> str:
+    if VIDMOLY_UPLOAD_URL:
+        return VIDMOLY_UPLOAD_URL
+
+    data = await vidmoly_api_get("/api/upload/server")
     url = data.get("result") if isinstance(data, dict) else None
     if isinstance(url, dict):
         url = url.get("url")
     if not isinstance(url, str) or not url.startswith("http"):
         raise ValueError(
-            f"Vidmoly did not return an upload server: {redact_key(text)[:300]}"
+            f"Vidmoly did not return an upload server: "
+            f"{redact_key(json.dumps(data))[:300]}"
         )
     return url
 
@@ -3407,7 +3465,7 @@ async def vidmoly_post_file(
     form.add_field("key", VIDMOLY_API_KEY)
     form.add_field("file", reader, filename=filename, content_type=mime_type)
 
-    async with ClientSession(timeout=timeout) as session:
+    async with ClientSession(timeout=timeout, headers=VIDMOLY_HEADERS) as session:
         async with session.post(upload_url, data=form) as response:
             text = await response.text()
             status = response.status
@@ -3438,13 +3496,26 @@ async def upload_file_to_vidmoly(file_path: str, status_msg, task_code: str) -> 
     mime_type = mimetypes.guess_type(filename)[0] or "video/mp4"
     start_t = time.time()
 
-    async with ClientSession(timeout=ClientTimeout(total=60)) as session:
-        upload_url = await vidmoly_get_upload_url(session)
+    await status_msg.edit(
+        "🔎 **Contacting Vidmoly...**\n"
+        f"🎬 `{filename}`",
+        buttons=task_cancel_button(task_code),
+    )
+    logger.info("Vidmoly: requesting upload server")
+    upload_url = await vidmoly_get_upload_url()
+    logger.info("Vidmoly: uploading %s (%d bytes) to %s", filename, total, upload_url)
+
+    await status_msg.edit(
+        "⬆️ **Uploading to Vidmoly...**\n"
+        f"🎬 `{filename}`",
+        buttons=task_cancel_button(task_code),
+    )
 
     reader = ProgressReader(file_path)
     upload_task = asyncio.create_task(
         vidmoly_post_file(upload_url, reader, filename, mime_type)
     )
+    finished_sending_at = None
 
     try:
         while not upload_task.done():
@@ -3455,6 +3526,17 @@ async def upload_file_to_vidmoly(file_path: str, status_msg, task_code: str) -> 
                 raise asyncio.CancelledError()
             if upload_task.done():
                 break
+
+            # All bytes sent but no answer: don't wait forever.
+            if reader.sent >= total:
+                if finished_sending_at is None:
+                    finished_sending_at = time.time()
+                elif time.time() - finished_sending_at > 300:
+                    upload_task.cancel()
+                    raise TimeoutError(
+                        "Vidmoly did not answer within 5 minutes after the "
+                        "upload finished."
+                    )
 
             try:
                 await status_msg.edit(
@@ -3524,6 +3606,79 @@ async def vidmoly_up_handler(event):
         await event.reply("❌ That file doesn't look like a video.")
         return
 
+    base = build_public_base_url()
+    if VIDMOLY_MODE == "remote" and not base:
+        await event.reply(
+            "❌ Remote mode needs `PUBLIC_BASE_URL` "
+            "(e.g. `https://your-app.koyeb.app`)."
+        )
+        return
+
+    use_remote = VIDMOLY_MODE in ("auto", "remote") and bool(base)
+
+    # =====================================================
+    # Remote upload: Vidmoly pulls the video from our stream link.
+    # No local download, no local upload.
+    # =====================================================
+    if use_remote:
+        link_filename = clean_double_extension(
+            sanitize_filename(target.file.name, "video.mp4")
+        )
+        if not os.path.splitext(link_filename)[1]:
+            link_filename += target.file.ext or ".mp4"
+
+        status = await event.reply(
+            "🔗 **Sending to Vidmoly (remote upload)...**\n"
+            f"🎬 `{link_filename}`"
+        )
+
+        try:
+            purge_expired_link_storage()
+            link_code = secrets.token_urlsafe(10)
+            link_storage[link_code] = {
+                "kind": "telegram",
+                "chat_id": event.chat_id,
+                "message_id": target.id,
+                "created_at": time.time(),
+            }
+            stream_url = (
+                f"{base}/stream/{link_code}/{quote(link_filename, safe='')}"
+            )
+
+            logger.info("Vidmoly remote upload: %s", stream_url)
+            code = await vidmoly_remote_upload(stream_url)
+            embed = f"{VIDMOLY_EMBED_BASE}/embed-{code}.html"
+
+            await status.edit(
+                f"✅ **Sent to Vidmoly!**\n\n"
+                f"🎬 `{link_filename}`\n"
+                f"🔗 **Embed:** `{embed}`\n\n"
+                f"⏳ Vidmoly fetches the file in the background. "
+                f"The embed works once it finishes processing "
+                f"(see your Remote Upload page).",
+                buttons=[],
+                link_preview=False,
+            )
+            return
+
+        except Exception as exc:
+            logger.exception("Vidmoly remote upload failed")
+            if VIDMOLY_MODE == "remote":
+                await status.edit(
+                    f"❌ **Vidmoly Error:**\n`{redact_key(describe_error(exc))[:1500]}`",
+                    buttons=[],
+                )
+                return
+            await status.edit(
+                f"⚠️ **Remote upload failed:**\n"
+                f"`{redact_key(describe_error(exc))[:800]}`\n\n"
+                f"Falling back to direct upload...",
+                buttons=[],
+            )
+
+    # =====================================================
+    # Direct upload: download from Telegram, POST the file.
+    # =====================================================
     async with global_semaphore:
         task_code, _ = new_task("vidmoly")
         workspace = os.path.join(DOWNLOAD_ROOT, f"dl_{uuid.uuid4().hex[:10]}")
@@ -3543,6 +3698,7 @@ async def vidmoly_up_handler(event):
             )
             if not file_path:
                 raise RuntimeError("Telegram download returned no file path.")
+            logger.info("Vidmoly: telegram download finished: %s", file_path)
 
             # Forwarded videos often have no filename/extension.
             if not os.path.splitext(file_path)[1]:
@@ -3566,7 +3722,7 @@ async def vidmoly_up_handler(event):
         except Exception as exc:
             logger.exception("Vidmoly upload failed")
             await status.edit(
-                f"❌ **Vidmoly Error:**\n`{redact_key(str(exc))[:1500]}`",
+                f"❌ **Vidmoly Error:**\n`{redact_key(describe_error(exc))[:1500]}`",
                 buttons=[],
             )
         finally:
