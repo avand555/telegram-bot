@@ -2832,6 +2832,13 @@ async def stream_handler(request: web.Request):
     response = web.StreamResponse(status=status, headers=headers)
     await response.prepare(request)
 
+    # HEAD probes must not start a Telegram download or count as served bytes.
+    if request.method == "HEAD":
+        await response.write_eof()
+        return response
+
+    item["active"] = int(item.get("active", 0)) + 1
+
     chunk_size = TELEGRAM_STREAM_CHUNK_KB * 1024
 
     # Telegram requires aligned offsets: start at the chunk boundary at or
@@ -2867,6 +2874,12 @@ async def stream_handler(request: web.Request):
             await response.write(data)
             sent += len(data)
 
+            # Progress tracking for /up remote uploads.
+            now_t = time.time()
+            item["served"] = int(item.get("served", 0)) + len(data)
+            item.setdefault("first_byte_at", now_t)
+            item["last_byte_at"] = now_t
+
             if sent >= content_length:
                 break
 
@@ -2874,6 +2887,8 @@ async def stream_handler(request: web.Request):
         pass
     except Exception:
         logger.exception("Telegram stream failed")
+    finally:
+        item["active"] = max(0, int(item.get("active", 1)) - 1)
 
     try:
         await response.write_eof()
@@ -3559,6 +3574,117 @@ async def upload_file_to_vidmoly(file_path: str, status_msg, task_code: str) -> 
         reader.close()
 
 
+async def monitor_remote_fetch(
+    status,
+    link_code: str,
+    filename: str,
+    size: int,
+    embed: str,
+    task_code: str,
+) -> None:
+    """Show live progress while Vidmoly pulls the file from our stream link."""
+    queued_at = time.time()
+    last_served = 0
+    last_change = queued_at
+    last_text = ""
+
+    async def finish(elapsed: float) -> None:
+        await status.edit(
+            f"✅ **Upload Complete!**\n\n"
+            f"🎬 `{filename}`\n"
+            f"📦 **Size:** `{human_size(size)}`\n"
+            f"⏱️ **Time:** `{get_readable_time(elapsed)}`\n\n"
+            f"🔗 **Embed Link:**\n`{embed}`\n\n"
+            f"ℹ️ Vidmoly may need a moment to process the video before it plays.",
+            buttons=[],
+            link_preview=False,
+        )
+
+    if size <= 0:
+        await finish(0)
+        return
+
+    while True:
+        await asyncio.sleep(PROGRESS_UPDATE_SECONDS)
+
+        if task_cancelled(task_code):
+            link_storage.pop(link_code, None)
+            await status.edit(
+                "🛑 **Cancelled.** The stream link was revoked, so Vidmoly "
+                "can no longer fetch the file.\n"
+                "If it is listed on your Vidmoly Remote Upload page, remove it there.",
+                buttons=[],
+            )
+            return
+
+        item = link_storage.get(link_code)
+        if not item:
+            await status.edit(
+                "⌛ **The stream link expired before Vidmoly finished.**\n"
+                "Run `/up` again.",
+                buttons=[],
+            )
+            return
+
+        now = time.time()
+        served = min(int(item.get("served", 0)), size)
+        active = int(item.get("active", 0))
+
+        if served != last_served:
+            last_served = served
+            last_change = now
+
+        # Everything was served and no connection is still open: done.
+        if served >= size and active == 0:
+            started = float(item.get("first_byte_at", queued_at))
+            await finish(now - started)
+            return
+
+        if served == 0:
+            if now - queued_at > 900:
+                await status.edit(
+                    "⚠️ **Vidmoly has not started fetching the file after 15 minutes.**\n"
+                    "It may still be queued. Check your Vidmoly Remote Upload page.\n\n"
+                    f"🔗 **Embed Link:**\n`{embed}`",
+                    buttons=[],
+                    link_preview=False,
+                )
+                return
+            text = (
+                "⏳ **Queued on Vidmoly**\n"
+                f"📦 `{filename}`\n\n"
+                "Waiting for Vidmoly to start fetching the file...\n\n"
+                f"🔗 **Embed Link:** `{embed}`"
+            )
+        else:
+            if now - last_change > 300 and served < size:
+                await status.edit(
+                    f"⚠️ **Vidmoly stopped fetching at "
+                    f"{served / size * 100:.1f}%.**\n"
+                    "It may retry on its own. Check your Vidmoly Remote Upload page.\n\n"
+                    f"🔗 **Embed Link:**\n`{embed}`",
+                    buttons=[],
+                    link_preview=False,
+                )
+                return
+            first = float(item.get("first_byte_at", now))
+            text = (
+                get_status_text("Vidmoly Fetching", filename, served, size, first)
+                + f"\n\n🔗 **Embed Link:** `{embed}`"
+            )
+
+        if text != last_text:
+            last_text = text
+            try:
+                await status.edit(
+                    text,
+                    buttons=task_cancel_button(task_code),
+                    link_preview=False,
+                )
+            except Exception:
+                pass
+
+
 @client.on(
     events.NewMessage(
         incoming=True,
@@ -3627,19 +3753,25 @@ async def vidmoly_up_handler(event):
         if not os.path.splitext(link_filename)[1]:
             link_filename += target.file.ext or ".mp4"
 
+        file_size = int(target.file.size or 0)
+        task_code, _ = new_task("vidmoly-remote")
+        link_code = secrets.token_urlsafe(10)
+
         status = await event.reply(
             "🔗 **Sending to Vidmoly (remote upload)...**\n"
-            f"🎬 `{link_filename}`"
+            f"🎬 `{link_filename}`",
+            buttons=task_cancel_button(task_code),
         )
 
         try:
             purge_expired_link_storage()
-            link_code = secrets.token_urlsafe(10)
             link_storage[link_code] = {
                 "kind": "telegram",
                 "chat_id": event.chat_id,
                 "message_id": target.id,
                 "created_at": time.time(),
+                "served": 0,
+                "active": 0,
             }
             stream_url = (
                 f"{base}/stream/{link_code}/{quote(link_filename, safe='')}"
@@ -3649,20 +3781,19 @@ async def vidmoly_up_handler(event):
             code = await vidmoly_remote_upload(stream_url)
             embed = f"{VIDMOLY_EMBED_BASE}/embed-{code}.html"
 
-            await status.edit(
-                f"✅ **Sent to Vidmoly!**\n\n"
-                f"🎬 `{link_filename}`\n"
-                f"🔗 **Embed:** `{embed}`\n\n"
-                f"⏳ Vidmoly fetches the file in the background. "
-                f"The embed works once it finishes processing "
-                f"(see your Remote Upload page).",
-                buttons=[],
-                link_preview=False,
+            await monitor_remote_fetch(
+                status,
+                link_code,
+                link_filename,
+                file_size,
+                embed,
+                task_code,
             )
             return
 
         except Exception as exc:
             logger.exception("Vidmoly remote upload failed")
+            link_storage.pop(link_code, None)
             if VIDMOLY_MODE == "remote":
                 await status.edit(
                     f"❌ **Vidmoly Error:**\n`{redact_key(describe_error(exc))[:1500]}`",
@@ -3675,6 +3806,8 @@ async def vidmoly_up_handler(event):
                 f"Falling back to direct upload...",
                 buttons=[],
             )
+        finally:
+            remove_task(task_code)
 
     # =====================================================
     # Direct upload: download from Telegram, POST the file.
